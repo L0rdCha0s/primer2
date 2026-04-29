@@ -59,6 +59,27 @@ export type PrimerLesson = {
   model?: string;
 };
 
+export type StudentBookEntry = {
+  entryId: string;
+  kind: "lesson" | "infographic" | "stagegate" | string;
+  topic?: string;
+  stageLevel?: string;
+  position: number;
+  payload: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type StudentBookState = {
+  studentId: string;
+  bookId: string;
+  entries: StudentBookEntry[];
+  activeLesson?: unknown;
+  latestInfographic?: unknown;
+  latestStagegate?: unknown;
+  latestAnswer?: string;
+  hasPassedStagegate: boolean;
+};
+
 type BackendMemory = {
   assertionId?: string;
   memory_type?: unknown;
@@ -111,6 +132,7 @@ export type StudentMemoryGraph = {
 
 export type LessonStartPayload = {
   aiMode?: string;
+  book?: unknown;
   error?: string;
   lesson?: unknown;
   student?: AuthenticatedStudent;
@@ -149,13 +171,13 @@ export const initialLesson: PrimerLesson = {
   stageLevel: "intuition",
   communicationStyle: "Preparing a profile-aware story path.",
   storyScene:
-    "The Primer is reading the student profile and preparing the first page.",
+    "Profile interests and biography details will shape the first learning path.",
   plainExplanation:
     "A starting lesson will appear here after the backend chooses a topic from the student's signup biography and interests.",
   analogy:
     "The first path is selected from the learner's own profile instead of a prewritten demo script.",
   checkForUnderstanding:
-    "Once the opening lesson is ready, the Primer will ask a check-for-understanding question here.",
+    "Once the opening lesson is ready, a check-for-understanding question will appear here.",
   suggestedTopics: [],
   stagegatePrompt:
     "Explain the most important idea in your own words, then connect it to one example from your life.",
@@ -402,9 +424,59 @@ export function normalizeStagegateResult(value: unknown): StagegateResult {
     gaps: stringArrayField(record, "gaps") ?? [],
     feedbackToStudent:
       stringField(record, "feedbackToStudent") ??
-      "The Primer could not grade this answer yet.",
+      "The answer could not be graded yet.",
     nextLevelUnlocked: nextLevelField(record, "nextLevelUnlocked"),
     newMemories: normalizeMemories(record.newMemories) ?? [],
+  };
+}
+
+export function normalizeBookState(value: unknown): StudentBookState | null {
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  const studentId = stringField(record, "studentId");
+  const bookId = stringField(record, "bookId");
+  if (!studentId || !bookId) {
+    return null;
+  }
+
+  const entries = Array.isArray(record.entries)
+    ? record.entries
+        .map(normalizeBookEntry)
+        .filter((entry): entry is StudentBookEntry => entry !== null)
+    : [];
+
+  return {
+    studentId,
+    bookId,
+    entries,
+    activeLesson: record.activeLesson,
+    latestInfographic: record.latestInfographic,
+    latestStagegate: record.latestStagegate,
+    latestAnswer: stringField(record, "latestAnswer"),
+    hasPassedStagegate: booleanField(record, "hasPassedStagegate") ?? false,
+  };
+}
+
+function normalizeBookEntry(value: unknown): StudentBookEntry | null {
+  const record = asRecord(value);
+  const entryId = stringField(record, "entryId");
+  const kind = stringField(record, "kind");
+  const position = numberField(record, "position");
+  if (!entryId || !kind || typeof position !== "number") {
+    return null;
+  }
+
+  return {
+    entryId,
+    kind,
+    topic: stringField(record, "topic"),
+    stageLevel: stringField(record, "stageLevel"),
+    position,
+    payload: asRecord(record?.payload) ?? {},
+    createdAt: stringField(record, "createdAt") ?? "",
   };
 }
 

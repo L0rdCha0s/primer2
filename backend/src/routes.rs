@@ -21,6 +21,7 @@ pub fn api_routes() -> Route {
         .at("/api/auth/login", post(login))
         .at("/api/students", get(list_students))
         .at("/api/students/:student_id", get(get_student))
+        .at("/api/book/:student_id", get(get_book))
         .at("/api/lesson/start", post(start_lesson))
         .at("/api/tutor/respond", post(tutor_respond))
         .at("/api/artifact/infographic", post(infographic))
@@ -98,6 +99,18 @@ async fn list_students(Data(state): Data<&AppState>) -> Json<Value> {
 }
 
 #[handler]
+async fn get_book(Path(student_id): Path<String>, Data(state): Data<&AppState>) -> Json<Value> {
+    match db::book_state_for_student(&state.db, &student_id).await {
+        Ok(book) => Json(json!({ "studentId": student_id, "book": book })),
+        Err(error) => Json(json!({
+            "studentId": student_id,
+            "book": null,
+            "error": error.to_string(),
+        })),
+    }
+}
+
+#[handler]
 async fn start_lesson(
     Data(state): Data<&AppState>,
     Json(request): Json<LessonStartRequest>,
@@ -164,11 +177,29 @@ async fn start_lesson_impl(state: &AppState, request: LessonStartRequest) -> Val
             Ok(student) => student,
             Err(_) => student,
         };
+    let book = match db::append_lesson_book_entry(
+        &state.db,
+        &student_id,
+        lesson_topic,
+        &request,
+        &lesson,
+    )
+    .await
+    {
+        Ok(book) => Some(book),
+        Err(error) => {
+            println!(
+                "[primerlab-api] book lesson persistence failed for student={student_id}: {error}"
+            );
+            None
+        }
+    };
 
     json!({
         "studentId": student_id,
         "lesson": lesson,
-        "student": updated_student
+        "student": updated_student,
+        "book": book
     })
 }
 
@@ -195,10 +226,22 @@ async fn infographic(
             "prompt": build_infographic_prompt(&student, &request)
         }),
     };
+    let book = match db::append_infographic_book_entry(&state.db, &student_id, &request, &result)
+        .await
+    {
+        Ok(book) => Some(book),
+        Err(error) => {
+            println!(
+                "[primerlab-api] book infographic persistence failed for student={student_id}: {error}"
+            );
+            None
+        }
+    };
 
     Json(json!({
         "studentId": student_id,
-        "artifact": result
+        "artifact": result,
+        "book": book
     }))
 }
 
@@ -242,12 +285,43 @@ async fn stagegate(
     let result = match state.openai.grade_stagegate(&student, &request).await {
         Ok(result) => result,
         Err(error) => {
+            let fallback_result = json!({
+                "passed": false,
+                "score": 0.0,
+                "rubric": {
+                    "accuracy": 0.0,
+                    "causalReasoning": 0.0,
+                    "vocabulary": 0.0,
+                    "transfer": 0.0
+                },
+                "masteryEvidence": [],
+                "gaps": ["The backend stagegate assessor was unavailable."],
+                "feedbackToStudent": error,
+                "newMemories": []
+            });
+            let book = match db::append_stagegate_book_entry(
+                &state.db,
+                &student_id,
+                &request,
+                &fallback_result,
+            )
+            .await
+            {
+                Ok(book) => Some(book),
+                Err(error) => {
+                    println!(
+                        "[primerlab-api] book stagegate persistence failed for student={student_id}: {error}"
+                    );
+                    None
+                }
+            };
             return Json(json!({
                 "studentId": student_id,
                 "result": null,
                 "student": student,
                 "aiMode": "openai_unavailable",
-                "error": error,
+                "error": fallback_result["feedbackToStudent"].clone(),
+                "book": book,
             }));
         }
     };
@@ -263,11 +337,23 @@ async fn stagegate(
         Ok(student) => student,
         Err(_) => student,
     };
+    let book = match db::append_stagegate_book_entry(&state.db, &student_id, &request, &result)
+        .await
+    {
+        Ok(book) => Some(book),
+        Err(error) => {
+            println!(
+                "[primerlab-api] book stagegate persistence failed for student={student_id}: {error}"
+            );
+            None
+        }
+    };
 
     Json(json!({
         "studentId": student_id,
         "result": result,
-        "student": updated_student
+        "student": updated_student,
+        "book": book
     }))
 }
 
@@ -337,7 +423,9 @@ mod tests {
     #[tokio::test]
     async fn health_route_returns_schema_stable_service_metadata() {
         let state = AppState {
-            db: MockDatabase::new(DbBackend::Postgres).into_connection(),
+            db: MockDatabase::new(DbBackend::Postgres)
+                .into_connection()
+                .into(),
             openai: OpenAiClient::for_tests(None),
         };
         let app = api_routes().data(state);

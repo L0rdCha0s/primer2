@@ -55,6 +55,8 @@ import {
   type PrimerLesson,
   type Stage,
   type StagegateResult,
+  type StudentBookEntry,
+  type StudentBookState,
   type StudentMemory,
   type StudentMemoryGraph,
   buildLessonStartBody,
@@ -62,6 +64,7 @@ import {
   firstTopicHint,
   initialLesson,
   mergeMemoryGraph,
+  normalizeBookState,
   normalizeLesson,
   normalizeMemoryGraph,
   normalizeMemories,
@@ -75,6 +78,7 @@ import {
   type ReactNode,
   type TouchEvent as ReactTouchEvent,
   forwardRef,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -101,6 +105,7 @@ type PageFlipEvent<T> = {
 
 type InfographicArtifact = {
   aiMode?: string;
+  error?: string;
   generated?: boolean;
   imageDataUrl?: string | null;
   imageUrl?: string | null;
@@ -206,6 +211,20 @@ async function requestLessonStart(
   return (await response.json()) as LessonStartPayload;
 }
 
+async function fetchStudentBookState(
+  learner: AuthenticatedStudent,
+  session: AuthSession | null,
+  signal?: AbortSignal,
+): Promise<StudentBookState | null> {
+  const response = await fetch(`${apiBaseUrl}/api/book/${learner.studentId}`, {
+    method: "GET",
+    headers: authHeaders(session),
+    signal,
+  });
+  const payload = (await response.json()) as { book?: unknown };
+  return normalizeBookState(payload.book);
+}
+
 async function fetchStudentMemoryGraph(
   learner: AuthenticatedStudent,
   session: AuthSession | null,
@@ -239,6 +258,7 @@ export function PrimerBook() {
   const [currentPage, setCurrentPage] = useState(0);
   const [topic, setTopic] = useState("");
   const [lesson, setLesson] = useState<PrimerLesson>(initialLesson);
+  const [bookEntries, setBookEntries] = useState<StudentBookEntry[]>([]);
   const [remoteMemories, setRemoteMemories] = useState<StudentMemory[] | null>(
     null,
   );
@@ -256,7 +276,7 @@ export function PrimerBook() {
   const [hasGeneratedInfographic, setHasGeneratedInfographic] = useState(false);
   const [hasPassedStagegate, setHasPassedStagegate] = useState(false);
   const [lessonStatus, setLessonStatus] = useState(
-    "The Primer will choose a starting point from the student profile.",
+    "A starting point will be chosen from the student profile.",
   );
   const [infographicStatus, setInfographicStatus] = useState(
     "No generated infographic yet.",
@@ -270,6 +290,54 @@ export function PrimerBook() {
   const [isNarrationLoading, setIsNarrationLoading] = useState(false);
   const [narrationStatus, setNarrationStatus] = useState(
     "OpenAI narration is ready.",
+  );
+
+  const hydratePersistedBook = useCallback(
+    (book: StudentBookState | null, learner: AuthenticatedStudent) => {
+      if (!book) {
+        return false;
+      }
+
+      setBookEntries(book.entries);
+
+      if (book.activeLesson) {
+        const savedLesson = normalizeLesson(
+          book.activeLesson,
+          firstTopicHint(learner),
+        );
+        setLesson(savedLesson);
+        setTopic(savedLesson.topic);
+        setHasAsked(true);
+      }
+
+      const infographic = book.latestInfographic as
+        | InfographicArtifact
+        | undefined;
+      setInfographicArtifact(infographic ?? null);
+      setHasGeneratedInfographic(Boolean(infographic?.generated));
+      setInfographicStatus(
+        infographic
+          ? infographic.generated
+            ? `Generated with ${infographic.model ?? "gpt-image-2"}.`
+            : (infographic.message ??
+              infographic.prompt ??
+              "Infographic fallback was saved.")
+          : "No generated infographic yet.",
+      );
+
+      if (book.latestStagegate) {
+        const savedStagegate = normalizeStagegateResult(book.latestStagegate);
+        setStagegateResult(savedStagegate);
+        setHasPassedStagegate(book.hasPassedStagegate || savedStagegate.passed);
+      } else {
+        setStagegateResult(emptyStagegateResult);
+        setHasPassedStagegate(false);
+      }
+      setAnswer(book.latestAnswer ?? "");
+
+      return Boolean(book.activeLesson);
+    },
+    [],
   );
 
   useEffect(() => {
@@ -322,18 +390,32 @@ export function PrimerBook() {
     setInfographicArtifact(null);
     setStagegateResult(emptyStagegateResult);
     setAnswer("");
-    setLessonStatus("Asking OpenAI Responses to choose the opening path...");
+    setBookEntries([]);
+    setLessonStatus("Loading the saved Primer book...");
 
-    void requestLessonStart(learner, session, undefined, controller.signal)
-      .then((payload) => {
+    void fetchStudentBookState(learner, session, controller.signal)
+      .then((savedBook) => {
         if (cancelled) {
+          return null;
+        }
+
+        if (hydratePersistedBook(savedBook, learner)) {
+          setLessonStatus("Restored the saved Primer book from the database.");
+          return null;
+        }
+
+        setLessonStatus("Asking OpenAI Responses to choose the opening path...");
+        return requestLessonStart(learner, session, undefined, controller.signal);
+      })
+      .then((payload) => {
+        if (cancelled || !payload) {
           return;
         }
 
         setRemoteMemories(normalizeMemories(payload.student?.memories));
         if (payload.error || !payload.lesson) {
           setLessonStatus(
-            payload.error ?? "The Primer could not generate an opening lesson yet.",
+            payload.error ?? "The opening lesson could not be generated yet.",
           );
           return;
         }
@@ -344,6 +426,7 @@ export function PrimerBook() {
         );
         setLesson(normalizedLesson);
         setTopic(normalizedLesson.topic);
+        hydratePersistedBook(normalizeBookState(payload.book), learner);
         setLessonStatus(
           normalizedLesson.aiMode === "openai_responses"
             ? "Opening path generated by OpenAI Responses."
@@ -364,7 +447,7 @@ export function PrimerBook() {
       cancelled = true;
       controller.abort();
     };
-  }, [authenticatedStudent, session]);
+  }, [authenticatedStudent, hydratePersistedBook, session]);
 
   useEffect(() => {
     return () => {
@@ -440,7 +523,7 @@ export function PrimerBook() {
     return stagesForStagegate(hasPassedStagegate);
   }, [hasPassedStagegate]);
 
-  const pageCount = 10;
+  const pageCount = 10 + bookEntries.length;
 
   function flipNext() {
     bookRef.current?.pageFlip()?.flipNext("bottom");
@@ -583,7 +666,7 @@ export function PrimerBook() {
       if (payload.error || !payload.lesson) {
         setRemoteMemories(normalizeMemories(payload.student?.memories));
         setLessonStatus(
-          payload.error ?? "The Primer could not generate this lesson yet.",
+          payload.error ?? "This lesson could not be generated yet.",
         );
         if (isMemoryOpen) {
           void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
@@ -598,10 +681,11 @@ export function PrimerBook() {
       setLesson(normalizedLesson);
       setTopic(normalizedLesson.topic);
       setRemoteMemories(normalizeMemories(payload.student?.memories));
+      hydratePersistedBook(normalizeBookState(payload.book), authenticatedStudent);
       setLessonStatus(
         normalizedLesson.aiMode === "openai_responses"
           ? "Guided by OpenAI Responses."
-          : "Guided by the Primer.",
+          : "Guided by the student profile.",
       );
       if (isMemoryOpen) {
         void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
@@ -634,6 +718,7 @@ export function PrimerBook() {
       const payload = await response.json();
       setInfographicArtifact(payload.artifact);
       setHasGeneratedInfographic(Boolean(payload.artifact?.generated));
+      hydratePersistedBook(normalizeBookState(payload.book), authenticatedStudent);
       setInfographicStatus(
         payload.artifact?.generated
           ? `Generated with ${payload.artifact.model ?? "gpt-image-2"}.`
@@ -664,6 +749,7 @@ export function PrimerBook() {
       const payload = await response.json();
       if (payload.error || !payload.result) {
         setRemoteMemories(normalizeMemories(payload.student?.memories));
+        hydratePersistedBook(normalizeBookState(payload.book), authenticatedStudent);
         setHasPassedStagegate(false);
         setStagegateResult({
           ...emptyStagegateResult,
@@ -678,7 +764,7 @@ export function PrimerBook() {
           masteryEvidence: [],
           gaps: ["The backend stagegate assessor was unavailable."],
           feedbackToStudent:
-            payload.error ?? "The Primer could not grade this answer yet.",
+            payload.error ?? "The answer could not be graded yet.",
         });
         if (isMemoryOpen) {
           void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
@@ -690,6 +776,7 @@ export function PrimerBook() {
       setStagegateResult(normalizeStagegateResult(payload.result));
       setRemoteMemories(normalizeMemories(payload.student?.memories));
       setHasPassedStagegate(Boolean(payload.result?.passed));
+      hydratePersistedBook(normalizeBookState(payload.book), authenticatedStudent);
       if (isMemoryOpen) {
         void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
       }
@@ -750,13 +837,14 @@ export function PrimerBook() {
     setCurrentPage(0);
     setTopic("");
     setLesson(initialLesson);
+    setBookEntries([]);
     setHasAsked(false);
     setHasGeneratedInfographic(false);
     setHasPassedStagegate(false);
     setInfographicArtifact(null);
     setStagegateResult(emptyStagegateResult);
     setAnswer("");
-    setLessonStatus("The Primer will choose a starting point from the student profile.");
+    setLessonStatus("A starting point will be chosen from the student profile.");
     setInfographicStatus("No generated infographic yet.");
   }
 
@@ -904,6 +992,12 @@ export function PrimerBook() {
                     hasPassed={hasPassedStagegate}
                   />
                 </BookPage>
+
+                {bookEntries.map((entry, index) => (
+                  <BookPage key={entry.entryId} pageNumber={10 + index}>
+                    <SavedBookEntryPage entry={entry} />
+                  </BookPage>
+                ))}
           </HTMLFlipBook>
 
           <div className="relative z-20 mt-3 flex flex-wrap items-center justify-center gap-2 sm:mt-4 sm:gap-3">
@@ -961,8 +1055,7 @@ function CoverPage({
           Primer
         </h2>
         <p className="mt-5 max-w-xs text-base leading-7 text-cyan-50/78">
-          A living lesson book for {learner.displayName}, opening on{" "}
-          {lesson.topic}.
+          A guided lesson for {learner.displayName}, focused on {lesson.topic}.
         </p>
       </div>
 
@@ -999,7 +1092,7 @@ function WelcomePage({
         Welcome back, {learner.displayName}.
       </h2>
       <p className="mt-4 text-lg leading-8 text-stone-700">
-        The Primer remembers what you care about: {interestText}.
+        Your profile highlights these interests: {interestText}.
       </p>
 
       <div className="mt-7 space-y-3">
@@ -1121,7 +1214,7 @@ function AskPage({
 
   return (
     <div className="flex h-full flex-col">
-      <Kicker icon={Mic}>Ask Primer</Kicker>
+      <Kicker icon={Mic}>Choose topic</Kicker>
       <h2 className="mt-4 text-3xl font-semibold text-stone-950">
         Choose the next thing to explore.
       </h2>
@@ -1150,7 +1243,7 @@ function AskPage({
           className="inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#1e6f73] px-5 text-sm font-semibold text-white transition hover:bg-[#195e61]"
         >
           <Volume2 className="h-4 w-4" />
-          {hasAsked ? "Guide this topic again" : "Ask Primer to guide me"}
+          {hasAsked ? "Guide this topic again" : "Guide this topic"}
         </button>
       </div>
 
@@ -1306,7 +1399,7 @@ function VoiceoverPage({
     <div className="flex h-full flex-col">
       <Kicker icon={Volume2}>Voice-over</Kicker>
       <h2 className="mt-4 text-3xl font-semibold text-stone-950">
-        The book reads the diagram aloud.
+        Listen for the main idea in {lesson.topic}.
       </h2>
       <p className="mt-4 text-base leading-7 text-stone-700">
         {lesson.plainExplanation}
@@ -1360,7 +1453,7 @@ function FollowUpPage({ lesson }: { lesson: PrimerLesson }) {
     <div className="flex h-full flex-col">
       <Kicker icon={Waves}>Adaptive follow-up</Kicker>
       <h2 className="mt-4 text-3xl font-semibold text-stone-950">
-        The Primer adjusts its voice.
+        Connect {lesson.topic} to a familiar pattern.
       </h2>
       <p className="mt-5 text-lg leading-8 text-stone-800">
         {lesson.analogy}
@@ -1483,7 +1576,7 @@ function UnlockPage({
         <p className="mt-2 text-sm leading-6">
           {hasPassed
             ? (result.newMemories?.[0]?.content ??
-              "Primer recorded this learning step in memory.")
+              "This learning step was recorded in memory.")
             : "No new mastery memory has been added yet."}
         </p>
       </div>
@@ -1493,6 +1586,114 @@ function UnlockPage({
         <p className="mt-1 text-lg font-semibold">
           {hasPassed ? "Level 2: Mechanism" : "Pass Level 1 first"}
         </p>
+      </div>
+    </div>
+  );
+}
+
+function SavedBookEntryPage({ entry }: { entry: StudentBookEntry }) {
+  const createdAt = entry.createdAt
+    ? new Date(entry.createdAt).toLocaleString()
+    : "Saved in the book";
+
+  if (entry.kind === "lesson") {
+    const savedLesson = normalizeLesson(
+      entry.payload.lesson,
+      entry.topic ?? "saved lesson",
+    );
+
+    return (
+      <div className="flex h-full flex-col">
+        <Kicker icon={BookOpen}>Saved lesson</Kicker>
+        <h2 className="mt-4 text-3xl font-semibold leading-tight text-stone-950">
+          {savedLesson.topic}
+        </h2>
+        <p className="mt-2 text-xs uppercase text-stone-500">{createdAt}</p>
+        <p className="mt-5 text-base leading-7 text-stone-800">
+          {savedLesson.storyScene}
+        </p>
+        <div className="mt-5 border-l-2 border-[#1e6f73] bg-white/55 px-4 py-3">
+          <p className="text-xs uppercase text-stone-500">Explanation</p>
+          <p className="mt-2 text-sm leading-6 text-stone-800">
+            {savedLesson.plainExplanation}
+          </p>
+        </div>
+        <div className="mt-auto flex flex-wrap gap-2">
+          {savedLesson.keyTerms.slice(0, 4).map((term) => (
+            <span
+              key={term.term}
+              className="rounded-full border border-stone-300 bg-white/62 px-3 py-1.5 text-xs font-semibold text-stone-700"
+            >
+              {term.term}
+            </span>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (entry.kind === "infographic") {
+    const artifact = entry.payload.artifact as InfographicArtifact | undefined;
+    const imageSrc = artifact?.imageDataUrl ?? artifact?.imageUrl ?? null;
+
+    return (
+      <div className="flex h-full flex-col">
+        <Kicker icon={Sparkles}>Saved diagram</Kicker>
+        <h2 className="mt-4 text-3xl font-semibold leading-tight text-stone-950">
+          {entry.topic ?? "Generated infographic"}
+        </h2>
+        <p className="mt-2 text-xs uppercase text-stone-500">{createdAt}</p>
+        {imageSrc ? (
+          <div className="mt-5 overflow-hidden rounded-[8px] border border-stone-300 bg-white">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={imageSrc}
+              alt={`Saved infographic for ${entry.topic ?? "this lesson"}`}
+              className="aspect-square w-full object-cover"
+            />
+          </div>
+        ) : (
+          <div className="mt-5 rounded-[8px] border border-stone-300 bg-white/70 p-4">
+            <p className="text-xs uppercase text-stone-500">Fallback artifact</p>
+            <p className="mt-2 text-sm leading-6 text-stone-800">
+              {artifact?.message ??
+                artifact?.error ??
+                artifact?.prompt ??
+                "No generated image was returned."}
+            </p>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  const stagegateResult = normalizeStagegateResult(entry.payload.result);
+  const request = recordValue(entry.payload.request);
+  const savedAnswer = stringValue(request?.answer);
+
+  return (
+    <div className="flex h-full flex-col">
+      <Kicker icon={Unlock}>Saved stagegate</Kicker>
+      <h2 className="mt-4 text-3xl font-semibold leading-tight text-stone-950">
+        {entry.topic ?? "Stagegate attempt"}
+      </h2>
+      <p className="mt-2 text-xs uppercase text-stone-500">{createdAt}</p>
+      <div className="mt-5 rounded-[8px] border border-stone-300 bg-white/70 p-4">
+        <p className="text-xs uppercase text-stone-500">Student answer</p>
+        <p className="mt-2 text-sm leading-6 text-stone-800">
+          {savedAnswer ?? "No answer text was stored."}
+        </p>
+      </div>
+      <div className="mt-5 rounded-[8px] bg-[#173b3b] p-4 text-stone-50">
+        <p className="text-xs uppercase text-cyan-100/75">
+          {stagegateResult.passed ? "Passed" : "Still practicing"}
+        </p>
+        <p className="mt-2 text-sm leading-6">
+          {stagegateResult.feedbackToStudent}
+        </p>
+      </div>
+      <div className="mt-auto">
+        <RubricBar label="score" value={stagegateResult.score} />
       </div>
     </div>
   );
@@ -1744,6 +1945,16 @@ function toMemoryFlowEdges(
       labelBgBorderRadius: 4,
     };
   });
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
 }
 
 function preserveDraggedPositions(

@@ -4,7 +4,9 @@ import {
   buildLessonStartBody,
   emptyStagegateResult,
   firstTopicHint,
+  initialLesson,
   mergeMemoryGraph,
+  normalizeBookState,
   normalizeLesson,
   normalizeMemories,
   normalizeMemoryGraph,
@@ -42,6 +44,18 @@ describe("lesson start flow", () => {
 });
 
 describe("lesson and stagegate normalization", () => {
+  test("initial lesson placeholder avoids product-personified page copy", () => {
+    const studentFacingText = [
+      initialLesson.communicationStyle,
+      initialLesson.storyScene,
+      initialLesson.plainExplanation,
+      initialLesson.analogy,
+      initialLesson.checkForUnderstanding,
+    ].join(" ");
+
+    expect(studentFacingText).not.toMatch(/the primer|the book|the page/i);
+  });
+
   test("preserves schema-stable lesson data and clamps unknown stages", () => {
     const lesson = normalizeLesson(
       {
@@ -234,6 +248,62 @@ describe("memory contract normalization", () => {
     expect(merged.nodes.find((node) => node.id === "entity-root")).toMatchObject({
       expanded: true,
       factCount: 4,
+    });
+  });
+});
+
+describe("persisted book contract normalization", () => {
+  test("normalizes persisted book entries and latest interaction state", () => {
+    const book = normalizeBookState({
+      studentId: "student-123",
+      bookId: "book-1",
+      activeLesson: {
+        topic: "reef currents",
+        stageLevel: "intuition",
+      },
+      latestInfographic: {
+        generated: true,
+        model: "gpt-image-2",
+      },
+      latestStagegate: {
+        passed: true,
+        score: 0.9,
+      },
+      latestAnswer: "Forces push water.",
+      hasPassedStagegate: true,
+      entries: [
+        {
+          entryId: "entry-1",
+          kind: "lesson",
+          topic: "reef currents",
+          stageLevel: "intuition",
+          position: 1,
+          payload: { lesson: { topic: "reef currents" } },
+          createdAt: "2026-04-29T00:00:00Z",
+        },
+        {
+          entryId: "entry-bad",
+          kind: "lesson",
+          position: "2",
+          payload: {},
+        },
+      ],
+    });
+
+    expect(book).toMatchObject({
+      studentId: "student-123",
+      bookId: "book-1",
+      hasPassedStagegate: true,
+      latestAnswer: "Forces push water.",
+      entries: [
+        {
+          entryId: "entry-1",
+          kind: "lesson",
+          topic: "reef currents",
+          stageLevel: "intuition",
+          position: 1,
+        },
+      ],
     });
   });
 });

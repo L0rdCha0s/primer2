@@ -1,11 +1,12 @@
 use crate::{
     domain::{
-        ConceptProgress, NarrativeCharacter, RegisterRequest, StagegateRequest, StudentMemory,
+        ConceptProgress, InfographicRequest, LessonStartRequest, NarrativeCharacter,
+        RegisterRequest, StagegateRequest, StudentBookEntryRecord, StudentBookState, StudentMemory,
         StudentRecord,
     },
     entities::{
         concept_progress, local_user, narrative_character, narrative_character_biography, student,
-        student_memory,
+        student_book, student_book_entry, student_memory,
     },
     memory,
 };
@@ -83,6 +84,29 @@ pub async fn init_database(db: &DatabaseConnection) -> Result<(), DbErr> {
             updated_at timestamptz NOT NULL,
             UNIQUE (student_id, topic, level)
         )"#,
+        r#"CREATE TABLE IF NOT EXISTS student_books (
+            id uuid PRIMARY KEY,
+            student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+            title text NOT NULL,
+            status text NOT NULL DEFAULT 'active',
+            created_at timestamptz NOT NULL,
+            updated_at timestamptz NOT NULL,
+            UNIQUE (student_id)
+        )"#,
+        r#"CREATE TABLE IF NOT EXISTS student_book_entries (
+            id uuid PRIMARY KEY,
+            book_id uuid NOT NULL REFERENCES student_books(id) ON DELETE CASCADE,
+            student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+            entry_kind text NOT NULL,
+            topic text,
+            stage_level text,
+            position integer NOT NULL,
+            payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+            created_at timestamptz NOT NULL,
+            UNIQUE (book_id, position)
+        )"#,
+        "CREATE INDEX IF NOT EXISTS idx_student_book_entries_student_position ON student_book_entries (student_id, position)",
+        "CREATE INDEX IF NOT EXISTS idx_student_book_entries_book_kind_created ON student_book_entries (book_id, entry_kind, created_at DESC)",
         r#"CREATE TABLE IF NOT EXISTS narrative_characters (
             id uuid PRIMARY KEY,
             student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
@@ -432,6 +456,117 @@ pub async fn update_progress_after_stagegate(
     student_record(db, &student).await
 }
 
+pub async fn book_state_for_student(
+    db: &DatabaseConnection,
+    public_id: &str,
+) -> Result<Option<StudentBookState>, DbErr> {
+    let Some(student) = student::Entity::find()
+        .filter(student::Column::PublicId.eq(public_id))
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(book) = student_book::Entity::find()
+        .filter(student_book::Column::StudentId.eq(student.id))
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    book_state_for_book(db, &student, &book).await.map(Some)
+}
+
+pub async fn append_lesson_book_entry(
+    db: &DatabaseConnection,
+    public_id: &str,
+    topic: &str,
+    request: &LessonStartRequest,
+    lesson: &Value,
+) -> Result<StudentBookState, DbErr> {
+    let student = get_or_seed_student_row(db, public_id).await?;
+    let book = get_or_create_student_book(db, &student).await?;
+    append_book_entry(
+        db,
+        &book,
+        &student,
+        "lesson",
+        Some(topic),
+        lesson.get("stageLevel").and_then(Value::as_str),
+        json!({
+            "lesson": lesson.clone(),
+            "request": {
+                "topic": request.topic.clone(),
+                "question": request.question.clone()
+            }
+        }),
+    )
+    .await?;
+
+    book_state_for_book(db, &student, &book).await
+}
+
+pub async fn append_infographic_book_entry(
+    db: &DatabaseConnection,
+    public_id: &str,
+    request: &InfographicRequest,
+    artifact: &Value,
+) -> Result<StudentBookState, DbErr> {
+    let student = get_or_seed_student_row(db, public_id).await?;
+    let book = get_or_create_student_book(db, &student).await?;
+    append_book_entry(
+        db,
+        &book,
+        &student,
+        "infographic",
+        Some(&request.topic),
+        None,
+        json!({
+            "artifact": artifact.clone(),
+            "request": {
+                "topic": request.topic.clone(),
+                "lessonSummary": request.lesson_summary.clone(),
+                "infographicPrompt": request.infographic_prompt.clone(),
+                "size": request.size.clone()
+            }
+        }),
+    )
+    .await?;
+
+    book_state_for_book(db, &student, &book).await
+}
+
+pub async fn append_stagegate_book_entry(
+    db: &DatabaseConnection,
+    public_id: &str,
+    request: &StagegateRequest,
+    result: &Value,
+) -> Result<StudentBookState, DbErr> {
+    let student = get_or_seed_student_row(db, public_id).await?;
+    let book = get_or_create_student_book(db, &student).await?;
+    let stage_level = request.stage_level.as_deref().unwrap_or("intuition");
+    append_book_entry(
+        db,
+        &book,
+        &student,
+        "stagegate",
+        Some(&request.topic),
+        Some(stage_level),
+        json!({
+            "result": result.clone(),
+            "request": {
+                "topic": request.topic.clone(),
+                "stageLevel": stage_level,
+                "answer": request.answer.clone()
+            }
+        }),
+    )
+    .await?;
+
+    book_state_for_book(db, &student, &book).await
+}
+
 pub async fn relevant_narrative_characters(
     db: &DatabaseConnection,
     public_id: &str,
@@ -648,6 +783,167 @@ async fn insert_character_biography(
     .await?;
 
     Ok(())
+}
+
+async fn book_state_for_book(
+    db: &DatabaseConnection,
+    student: &student::Model,
+    book: &student_book::Model,
+) -> Result<StudentBookState, DbErr> {
+    let rows = student_book_entry::Entity::find()
+        .filter(student_book_entry::Column::BookId.eq(book.id))
+        .order_by_asc(student_book_entry::Column::Position)
+        .all(db)
+        .await?;
+
+    Ok(book_state_from_rows(student, book, rows))
+}
+
+async fn get_or_create_student_book(
+    db: &DatabaseConnection,
+    student: &student::Model,
+) -> Result<student_book::Model, DbErr> {
+    if let Some(book) = student_book::Entity::find()
+        .filter(student_book::Column::StudentId.eq(student.id))
+        .one(db)
+        .await?
+    {
+        return Ok(book);
+    }
+
+    let observed_at = now();
+    student_book::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        student_id: Set(student.id),
+        title: Set(format!("{}'s Primer", student.display_name)),
+        status: Set("active".to_string()),
+        created_at: Set(observed_at),
+        updated_at: Set(observed_at),
+    }
+    .insert(db)
+    .await
+}
+
+async fn append_book_entry(
+    db: &DatabaseConnection,
+    book: &student_book::Model,
+    student: &student::Model,
+    entry_kind: &str,
+    topic: Option<&str>,
+    stage_level: Option<&str>,
+    payload: Value,
+) -> Result<student_book_entry::Model, DbErr> {
+    let observed_at = now();
+    let position = next_book_position(db, book.id).await?;
+    let entry = student_book_entry::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        book_id: Set(book.id),
+        student_id: Set(student.id),
+        entry_kind: Set(entry_kind.to_string()),
+        topic: Set(topic.map(ToString::to_string)),
+        stage_level: Set(stage_level.map(ToString::to_string)),
+        position: Set(position),
+        payload: Set(payload),
+        created_at: Set(observed_at),
+    }
+    .insert(db)
+    .await?;
+
+    let mut active_book: student_book::ActiveModel = book.clone().into();
+    active_book.updated_at = Set(observed_at);
+    active_book.update(db).await?;
+
+    Ok(entry)
+}
+
+async fn next_book_position(db: &DatabaseConnection, book_id: Uuid) -> Result<i32, DbErr> {
+    let latest = student_book_entry::Entity::find()
+        .filter(student_book_entry::Column::BookId.eq(book_id))
+        .order_by_desc(student_book_entry::Column::Position)
+        .one(db)
+        .await?;
+
+    Ok(latest.map(|entry| entry.position + 1).unwrap_or(1))
+}
+
+fn book_state_from_rows(
+    student: &student::Model,
+    book: &student_book::Model,
+    rows: Vec<student_book_entry::Model>,
+) -> StudentBookState {
+    let entries = rows
+        .into_iter()
+        .map(student_book_entry_record)
+        .collect::<Vec<_>>();
+    let mut active_lesson = None;
+    let mut latest_infographic = None;
+    let mut latest_stagegate = None;
+    let mut latest_answer = None;
+
+    for entry in &entries {
+        match entry.kind.as_str() {
+            "lesson" => {
+                active_lesson = entry
+                    .payload
+                    .get("lesson")
+                    .cloned()
+                    .or_else(|| Some(entry.payload.clone()));
+                latest_infographic = None;
+                latest_stagegate = None;
+                latest_answer = None;
+            }
+            "infographic" => {
+                latest_infographic = entry
+                    .payload
+                    .get("artifact")
+                    .cloned()
+                    .or_else(|| Some(entry.payload.clone()));
+            }
+            "stagegate" => {
+                latest_stagegate = entry
+                    .payload
+                    .get("result")
+                    .cloned()
+                    .or_else(|| Some(entry.payload.clone()));
+                latest_answer = entry
+                    .payload
+                    .get("request")
+                    .and_then(|request| request.get("answer"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+            }
+            _ => {}
+        }
+    }
+
+    let has_passed_stagegate = latest_stagegate
+        .as_ref()
+        .and_then(|stagegate| stagegate.get("passed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    StudentBookState {
+        student_id: student.public_id.clone(),
+        book_id: book.id.to_string(),
+        entries,
+        active_lesson,
+        latest_infographic,
+        latest_stagegate,
+        latest_answer,
+        has_passed_stagegate,
+    }
+}
+
+fn student_book_entry_record(row: student_book_entry::Model) -> StudentBookEntryRecord {
+    StudentBookEntryRecord {
+        entry_id: row.id.to_string(),
+        kind: row.entry_kind,
+        topic: row.topic,
+        stage_level: row.stage_level,
+        position: row.position,
+        payload: row.payload,
+        created_at: row.created_at.to_rfc3339(),
+    }
 }
 
 async fn get_or_create_student(
@@ -1182,11 +1478,112 @@ mod tests {
             vec!["Tala", "Storm guide"]
         );
         assert_eq!(
-            merge_character_arrays(json!(["Tala", "Reef guide"]), vec![
-                "tala".to_string(),
-                "Storm guide".to_string(),
-            ], 3),
+            merge_character_arrays(
+                json!(["Tala", "Reef guide"]),
+                vec!["tala".to_string(), "Storm guide".to_string(),],
+                3
+            ),
             vec!["Tala", "Reef guide", "Storm guide"]
+        );
+    }
+
+    #[test]
+    fn book_state_from_rows_exposes_latest_persisted_book_content() {
+        let observed_at = now();
+        let student_id = Uuid::new_v4();
+        let book_id = Uuid::new_v4();
+        let student = student::Model {
+            id: student_id,
+            public_id: "student-123".to_string(),
+            display_name: "Mina".to_string(),
+            age_years: Some(11),
+            age_band: "11-13".to_string(),
+            biography: Some("Loves tide pools.".to_string()),
+            interests: json!(["marine biology"]),
+            preferred_explanation_style: "visual".to_string(),
+            level_context: "middle school".to_string(),
+            suggested_topics: json!([]),
+            created_at: observed_at,
+            updated_at: observed_at,
+        };
+        let book = student_book::Model {
+            id: book_id,
+            student_id,
+            title: "Mina's Primer".to_string(),
+            status: "active".to_string(),
+            created_at: observed_at,
+            updated_at: observed_at,
+        };
+        let rows = vec![
+            student_book_entry::Model {
+                id: Uuid::new_v4(),
+                book_id,
+                student_id,
+                entry_kind: "lesson".to_string(),
+                topic: Some("reef currents".to_string()),
+                stage_level: Some("intuition".to_string()),
+                position: 1,
+                payload: json!({
+                    "lesson": {
+                        "topic": "reef currents",
+                        "stageLevel": "intuition"
+                    }
+                }),
+                created_at: observed_at,
+            },
+            student_book_entry::Model {
+                id: Uuid::new_v4(),
+                book_id,
+                student_id,
+                entry_kind: "infographic".to_string(),
+                topic: Some("reef currents".to_string()),
+                stage_level: None,
+                position: 2,
+                payload: json!({
+                    "artifact": {
+                        "generated": true,
+                        "model": "gpt-image-2"
+                    }
+                }),
+                created_at: observed_at,
+            },
+            student_book_entry::Model {
+                id: Uuid::new_v4(),
+                book_id,
+                student_id,
+                entry_kind: "stagegate".to_string(),
+                topic: Some("reef currents".to_string()),
+                stage_level: Some("intuition".to_string()),
+                position: 3,
+                payload: json!({
+                    "request": {
+                        "answer": "Currents move when forces push water."
+                    },
+                    "result": {
+                        "passed": true,
+                        "score": 0.88
+                    }
+                }),
+                created_at: observed_at,
+            },
+        ];
+
+        let state = book_state_from_rows(&student, &book, rows);
+
+        assert_eq!(state.student_id, "student-123");
+        assert_eq!(state.entries.len(), 3);
+        assert_eq!(
+            state.active_lesson.unwrap()["topic"],
+            json!("reef currents")
+        );
+        assert_eq!(
+            state.latest_infographic.unwrap()["model"],
+            json!("gpt-image-2")
+        );
+        assert!(state.has_passed_stagegate);
+        assert_eq!(
+            state.latest_answer.as_deref(),
+            Some("Currents move when forces push water.")
         );
     }
 }

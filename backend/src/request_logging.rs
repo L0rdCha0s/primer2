@@ -3,11 +3,9 @@ use poem::{
     http::{Method, Uri},
 };
 use serde_json::{Map, Value, json};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -47,9 +45,7 @@ fn function_name_for_request(method: &Method, path: &str) -> String {
         ("POST", "/api/tutor/stagegate") => "stagegate".to_string(),
         ("POST", "/api/memory/profile") => "memory_profile".to_string(),
         ("POST", "/api/memory/graph") => "memory_graph".to_string(),
-        ("GET", path) if path.strip_prefix("/api/students/").is_some() => {
-            "get_student".to_string()
-        }
+        ("GET", path) if path.strip_prefix("/api/students/").is_some() => "get_student".to_string(),
         _ => format!("unmatched_route {} {}", method.as_str(), path),
     }
 }

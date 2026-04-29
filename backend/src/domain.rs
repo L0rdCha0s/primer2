@@ -61,6 +61,31 @@ pub struct ConceptProgress {
     pub evidence: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudentBookEntryRecord {
+    pub entry_id: String,
+    pub kind: String,
+    pub topic: Option<String>,
+    pub stage_level: Option<String>,
+    pub position: i32,
+    pub payload: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudentBookState {
+    pub student_id: String,
+    pub book_id: String,
+    pub entries: Vec<StudentBookEntryRecord>,
+    pub active_lesson: Option<Value>,
+    pub latest_infographic: Option<Value>,
+    pub latest_stagegate: Option<Value>,
+    pub latest_answer: Option<String>,
+    pub has_passed_stagegate: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterRequest {

@@ -90,6 +90,9 @@ Keep the lesson age-appropriate, accurate, concise, and stage-gated.
 If the user did not request a concrete topic, choose the most engaging starting point from the signup biography, interests, age band, memories, and progress.
 If this is the learner's first lesson, use the signup biography as the primary personalization source for the opening topic, examples, story motif, communication style, and stagegate prompt.
 When you choose the opening topic, set `topic` to a concrete concept or question that can be taught now; do not return a vague label like "personalized lesson".
+Write student-facing text in a natural tutor voice, not as app narration. Do not say that Primer, the book, the page, the lesson, or the system performs an action.
+For storyScene, plainExplanation, analogy, checkForUnderstanding, communicationStyle, stagegatePrompt, and infographicPrompt, make the concept, learner, evidence, diagram, or story character the grammatical actor.
+Avoid meta headings or labels such as "the Primer adjusts", "the book reads", "the page chooses", "AI follow-up", or "generated path". If a phrase sounds like product UI copy, rewrite it as topic guidance for the student.
 Use supplied narrativeCharacters when they fit the topic. Preserve their names, roles, biography facts, voice, relationships, and visual motifs exactly unless the lesson itself adds a new compatible detail.
 Prefer reusing a relevant existing character over introducing a new one. Only introduce or update characters that appear in storyScene.
 Return narrativeCharacters as the complete list of characters used or materially updated by this lesson. Do not include the learner as a narrative character.
@@ -404,15 +407,20 @@ fn profile_bootstrap_lesson(
     let character_scene = narrative_characters
         .first()
         .map(|character| {
+            let role = character
+                .role
+                .as_deref()
+                .unwrap_or("recurring story guide");
             format!(
-                "{character_name} returns with the same role and biography already established for this learner: {biography}",
+                "{character_name}, the established {role}, brings a familiar cause-map approach: {biography}",
                 character_name = character.name.as_str(),
+                role = role,
                 biography = character.current_biography.as_str()
             )
         })
         .unwrap_or_else(|| {
             format!(
-                "{name} opens the Primer to a page built from their signup profile.",
+                "{name}'s signup profile points toward a starting idea they already care about.",
                 name = student.display_name
             )
         });
@@ -439,10 +447,10 @@ fn profile_bootstrap_lesson(
             "Visual, story-first explanations anchored in {anchor}, with short checks before adding detail."
         ),
         "storyScene": format!(
-            "{character_scene} The page chooses {anchor} as the doorway, then turns one visible pattern from that profile detail into a question that can be tested, sketched, and explained."
+            "{character_scene} Start with {anchor}, then turn one visible pattern from that profile detail into a question that can be tested, sketched, and explained."
         ),
         "plainExplanation": format!(
-            "A useful first lesson starts with something the learner already cares about. From the biography: {biography}. The Primer turns that into a concrete concept, asks what changes, what stays the same, and what cause might explain the pattern."
+            "A useful first lesson starts with something the learner already cares about. From the biography: {biography}. The core move is to notice what changes, what stays the same, and what cause might explain the pattern."
         ),
         "analogy": format!(
             "Treat {anchor} like a map: first notice landmarks, then draw arrows between causes and effects, then test whether the arrows explain what happens next."
@@ -771,6 +779,21 @@ mod tests {
         }
     }
 
+    fn narrative_characters() -> Vec<NarrativeCharacter> {
+        vec![NarrativeCharacter {
+            character_id: "character-1".to_string(),
+            name: "Tala".to_string(),
+            role: Some("reef guide".to_string()),
+            current_biography: "Tala is a calm reef guide who helps Mina draw careful cause maps."
+                .to_string(),
+            topic_affinities: vec!["marine biology".to_string(), "systems".to_string()],
+            consistency_notes: vec!["Keep Tala calm and precise.".to_string()],
+            introduced_at: "2026-04-29T00:00:00Z".to_string(),
+            last_seen_at: "2026-04-29T00:00:00Z".to_string(),
+            last_seen_topic: Some("reef systems".to_string()),
+        }]
+    }
+
     #[test]
     fn infographic_prompt_uses_profile_and_memory_context() {
         let student = student_record();
@@ -796,9 +819,11 @@ mod tests {
     async fn guide_lesson_without_key_returns_profile_bootstrap_lesson() {
         let client = OpenAiClient::for_tests(None);
         let student = student_record();
+        let characters = narrative_characters();
         let lesson = client
             .guide_lesson(
                 &student,
+                &characters,
                 &LessonStartRequest {
                     student_id: Some(student.student_id.clone()),
                     topic: None,
@@ -812,6 +837,24 @@ mod tests {
         assert_eq!(lesson["stageLevel"], "intuition");
         assert_eq!(lesson["topic"], "patterns and causes in marine biology");
         assert_eq!(lesson["keyTerms"].as_array().unwrap().len(), 3);
+        assert_eq!(lesson["narrativeCharacters"][0]["name"], "Tala");
+        for field in [
+            "communicationStyle",
+            "storyScene",
+            "plainExplanation",
+            "analogy",
+            "checkForUnderstanding",
+        ] {
+            let text = lesson[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} should be a string"));
+            assert!(!text.contains("The Primer"), "{field}: {text}");
+            assert!(!text.contains("the Primer"), "{field}: {text}");
+            assert!(!text.contains("The book"), "{field}: {text}");
+            assert!(!text.contains("the book"), "{field}: {text}");
+            assert!(!text.contains("The page"), "{field}: {text}");
+            assert!(!text.contains("the page"), "{field}: {text}");
+        }
         assert!(
             lesson["stagegatePrompt"]
                 .as_str()
@@ -827,6 +870,7 @@ mod tests {
         let lesson = client
             .guide_lesson(
                 &student,
+                &[],
                 &LessonStartRequest {
                     student_id: Some(student.student_id.clone()),
                     topic: Some(" lightning ".to_string()),
