@@ -326,3 +326,45 @@ async fn memory_graph(
         })),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openai::OpenAiClient;
+    use poem::{EndpointExt, test::TestClient};
+    use sea_orm::{DbBackend, MockDatabase};
+
+    #[tokio::test]
+    async fn health_route_returns_schema_stable_service_metadata() {
+        let state = AppState {
+            db: MockDatabase::new(DbBackend::Postgres).into_connection(),
+            openai: OpenAiClient::for_tests(None),
+        };
+        let app = api_routes().data(state);
+        let client = TestClient::new(app);
+
+        let response = client.get("/health").send().await;
+        response.assert_status_is_ok();
+        let payload = response.json().await;
+        let body = payload.value().object();
+
+        body.get("ok").assert_bool(true);
+        body.get("service").assert_string("primerlab-api");
+        body.get("textModel").assert_string("gpt-5.5");
+        body.get("imageModel").assert_string("gpt-image-2");
+        body.get("speechModel").assert_string("gpt-4o-mini-tts");
+        body.get("speechVoice").assert_string("fable");
+        body.get("hasOpenAiKey").assert_bool(false);
+    }
+
+    #[test]
+    fn local_demo_session_tokens_are_stable_and_student_scoped() {
+        assert_eq!(
+            session_for_student("student-123"),
+            json!({
+                "token": "local-demo:student-123",
+                "type": "local-demo"
+            })
+        );
+    }
+}
