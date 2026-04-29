@@ -46,6 +46,9 @@ fn function_name_for_request(method: &Method, path: &str) -> String {
         ("POST", "/api/tutor/stagegate") => "stagegate".to_string(),
         ("POST", "/api/memory/profile") => "memory_profile".to_string(),
         ("POST", "/api/memory/graph") => "memory_graph".to_string(),
+        ("GET", path) if report_card_student_path_param(path).is_some() => {
+            "get_report_card".to_string()
+        }
         ("POST", path) if reset_student_path_param(path).is_some() => "reset_student".to_string(),
         ("GET", path) if path_param(path, "/api/students/").is_some() => "get_student".to_string(),
         ("GET", path) if path_param(path, "/api/book/").is_some() => "get_book".to_string(),
@@ -75,8 +78,15 @@ fn format_inputs(body: &[u8], content_type: Option<&str>, uri: &Uri) -> String {
 
 fn request_student_id(path: &str) -> Option<&str> {
     reset_student_path_param(path)
+        .or_else(|| report_card_student_path_param(path))
         .or_else(|| path_param(path, "/api/students/"))
         .or_else(|| path_param(path, "/api/book/"))
+}
+
+fn report_card_student_path_param(path: &str) -> Option<&str> {
+    path.strip_prefix("/api/students/")
+        .and_then(|value| value.strip_suffix("/report-card"))
+        .filter(|value| !value.is_empty() && !value.contains('/'))
 }
 
 fn reset_student_path_param(path: &str) -> Option<&str> {
@@ -209,6 +219,14 @@ mod tests {
     }
 
     #[test]
+    fn classifies_student_report_card_route() {
+        assert_eq!(
+            function_name_for_request(&Method::GET, "/api/students/student-123/report-card"),
+            "get_report_card"
+        );
+    }
+
+    #[test]
     fn classifies_infographic_explanation_route() {
         assert_eq!(
             function_name_for_request(&Method::POST, "/api/artifact/infographic/explain"),
@@ -237,6 +255,17 @@ mod tests {
     #[test]
     fn formats_reset_student_id_inputs() {
         let uri = "/api/students/student-123/reset".parse::<Uri>().unwrap();
+        let inputs = format_inputs(&[], None, &uri);
+        let value = serde_json::from_str::<Value>(&inputs).unwrap();
+
+        assert_eq!(value["studentId"], json!("student-123"));
+    }
+
+    #[test]
+    fn formats_report_card_student_id_inputs() {
+        let uri = "/api/students/student-123/report-card"
+            .parse::<Uri>()
+            .unwrap();
         let inputs = format_inputs(&[], None, &uri);
         let value = serde_json::from_str::<Value>(&inputs).unwrap();
 

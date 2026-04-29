@@ -7,6 +7,7 @@ use crate::{
     },
     memory,
     openai::build_infographic_prompt,
+    report_card,
 };
 use poem::{
     Route, get, handler, post,
@@ -20,6 +21,10 @@ pub fn api_routes() -> Route {
         .at("/api/auth/register", post(register))
         .at("/api/auth/login", post(login))
         .at("/api/students", get(list_students))
+        .at(
+            "/api/students/:student_id/report-card",
+            get(get_report_card),
+        )
         .at("/api/students/:student_id", get(get_student))
         .at("/api/students/:student_id/reset", post(reset_student))
         .at("/api/book/:student_id", get(get_book))
@@ -109,7 +114,8 @@ async fn reset_student(
                 "booksDeleted": true,
                 "bookEntriesDeleted": true,
                 "memoriesDeleted": true,
-                "progressDeleted": true
+                "progressDeleted": true,
+                "xpDeleted": true
             }
         })),
         Err(error) => Json(json!({
@@ -121,7 +127,8 @@ async fn reset_student(
                 "booksDeleted": false,
                 "bookEntriesDeleted": false,
                 "memoriesDeleted": false,
-                "progressDeleted": false
+                "progressDeleted": false,
+                "xpDeleted": false
             }
         })),
     }
@@ -136,11 +143,40 @@ async fn list_students(Data(state): Data<&AppState>) -> Json<Value> {
 }
 
 #[handler]
-async fn get_book(Path(student_id): Path<String>, Data(state): Data<&AppState>) -> Json<Value> {
-    match db::book_state_for_student(&state.db, &student_id).await {
-        Ok(book) => Json(json!({ "studentId": student_id, "book": book })),
+async fn get_report_card(
+    Path(student_id): Path<String>,
+    Data(state): Data<&AppState>,
+) -> Json<Value> {
+    match report_card::report_card_for_student(&state.db, &student_id, &state.openai).await {
+        Ok(Some(report_card)) => Json(json!({
+            "studentId": student_id,
+            "reportCard": report_card,
+        })),
+        Ok(None) => Json(json!({
+            "studentId": student_id,
+            "reportCard": null,
+            "error": "Student report card was not found.",
+        })),
         Err(error) => Json(json!({
             "studentId": student_id,
+            "reportCard": null,
+            "error": error.to_string(),
+        })),
+    }
+}
+
+#[handler]
+async fn get_book(Path(student_id): Path<String>, Data(state): Data<&AppState>) -> Json<Value> {
+    let student = db::find_student(&state.db, &student_id)
+        .await
+        .ok()
+        .flatten();
+
+    match db::book_state_for_student(&state.db, &student_id).await {
+        Ok(book) => Json(json!({ "studentId": student_id, "student": student, "book": book })),
+        Err(error) => Json(json!({
+            "studentId": student_id,
+            "student": student,
             "book": null,
             "error": error.to_string(),
         })),
@@ -214,6 +250,7 @@ async fn start_lesson_impl(state: &AppState, request: LessonStartRequest) -> Val
             Ok(student) => student,
             Err(_) => student,
         };
+    let mut response_student = updated_student;
     let book = match db::append_lesson_book_entry(
         &state.db,
         &student_id,
@@ -223,7 +260,12 @@ async fn start_lesson_impl(state: &AppState, request: LessonStartRequest) -> Val
     )
     .await
     {
-        Ok(book) => Some(book),
+        Ok(book) => {
+            if let Ok(Some(student)) = db::find_student(&state.db, &student_id).await {
+                response_student = student;
+            }
+            Some(book)
+        }
         Err(error) => {
             println!(
                 "[primerlab-api] book lesson persistence failed for student={student_id}: {error}"
@@ -235,7 +277,7 @@ async fn start_lesson_impl(state: &AppState, request: LessonStartRequest) -> Val
     json!({
         "studentId": student_id,
         "lesson": lesson,
-        "student": updated_student,
+        "student": response_student,
         "book": book
     })
 }
@@ -513,6 +555,32 @@ mod tests {
         body.get("speechModel").assert_string("gpt-4o-mini-tts");
         body.get("speechVoice").assert_string("fable");
         body.get("hasOpenAiKey").assert_bool(false);
+    }
+
+    #[tokio::test]
+    async fn report_card_route_returns_schema_stable_missing_student_payload() {
+        let state = AppState {
+            db: MockDatabase::new(DbBackend::Postgres)
+                .append_query_results([Vec::<crate::entities::student::Model>::new()])
+                .into_connection()
+                .into(),
+            openai: OpenAiClient::for_tests(None),
+        };
+        let app = api_routes().data(state);
+        let client = TestClient::new(app);
+
+        let response = client
+            .get("/api/students/student-missing/report-card")
+            .send()
+            .await;
+        response.assert_status_is_ok();
+        let payload = response.json().await;
+        let body = payload.value().object();
+
+        body.get("studentId").assert_string("student-missing");
+        body.get("reportCard").assert_null();
+        body.get("error")
+            .assert_string("Student report card was not found.");
     }
 
     #[test]

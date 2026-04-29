@@ -3,6 +3,7 @@ mod domain;
 mod entities;
 mod memory;
 mod openai;
+mod report_card;
 mod request_logging;
 mod routes;
 

@@ -6,7 +6,7 @@ use crate::{
     },
     entities::{
         concept_progress, local_user, narrative_character, narrative_character_biography, student,
-        student_book, student_book_entry, student_memory,
+        student_book, student_book_entry, student_memory, student_xp_event,
     },
     memory,
 };
@@ -21,6 +21,10 @@ use sea_orm::{
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+const LESSON_STARTED_XP: i32 = 10;
+const STAGEGATE_SUBMITTED_XP: i32 = 10;
+const STAGEGATE_PASSED_XP: i32 = 40;
 
 pub async fn connect_database() -> Result<DatabaseConnection, DbErr> {
     let url = std::env::var("DATABASE_URL")
@@ -50,11 +54,13 @@ pub async fn init_database(db: &DatabaseConnection) -> Result<(), DbErr> {
             preferred_explanation_style text NOT NULL,
             level_context text NOT NULL,
             suggested_topics jsonb NOT NULL DEFAULT '[]'::jsonb,
+            xp_total integer NOT NULL DEFAULT 0,
             created_at timestamptz NOT NULL,
             updated_at timestamptz NOT NULL
         )"#,
         "ALTER TABLE students ADD COLUMN IF NOT EXISTS age_years integer",
         "ALTER TABLE students ADD COLUMN IF NOT EXISTS biography text",
+        "ALTER TABLE students ADD COLUMN IF NOT EXISTS xp_total integer NOT NULL DEFAULT 0",
         r#"CREATE TABLE IF NOT EXISTS local_users (
             id uuid PRIMARY KEY,
             username text NOT NULL UNIQUE,
@@ -84,6 +90,18 @@ pub async fn init_database(db: &DatabaseConnection) -> Result<(), DbErr> {
             updated_at timestamptz NOT NULL,
             UNIQUE (student_id, topic, level)
         )"#,
+        r#"CREATE TABLE IF NOT EXISTS student_xp_events (
+            id uuid PRIMARY KEY,
+            student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+            event_key text NOT NULL UNIQUE,
+            points integer NOT NULL,
+            source_type text NOT NULL,
+            topic text,
+            stage_level text,
+            metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+            created_at timestamptz NOT NULL
+        )"#,
+        "CREATE INDEX IF NOT EXISTS idx_student_xp_events_student_created ON student_xp_events (student_id, created_at DESC)",
         r#"CREATE TABLE IF NOT EXISTS student_books (
             id uuid PRIMARY KEY,
             student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
@@ -453,7 +471,26 @@ pub async fn update_progress_after_stagegate(
         }
     }
 
-    student_record(db, &student).await
+    for award in stagegate_xp_awards(result) {
+        award_xp_event(
+            db,
+            &student,
+            &stagegate_xp_event_key(student.id, award.source_type, &request.topic, stage_level),
+            award.points,
+            award.source_type,
+            Some(&request.topic),
+            Some(stage_level),
+            json!({
+                "score": score,
+                "passed": passed,
+                "stageLevel": stage_level
+            }),
+        )
+        .await?;
+    }
+
+    let refreshed_student = get_or_seed_student_row(db, public_id).await?;
+    student_record(db, &refreshed_student).await
 }
 
 pub async fn book_state_for_student(
@@ -487,7 +524,7 @@ pub async fn append_lesson_book_entry(
 ) -> Result<StudentBookState, DbErr> {
     let student = get_or_seed_student_row(db, public_id).await?;
     let book = get_or_create_student_book(db, &student).await?;
-    append_book_entry(
+    let entry = append_book_entry(
         db,
         &book,
         &student,
@@ -500,6 +537,21 @@ pub async fn append_lesson_book_entry(
                 "topic": request.topic.clone(),
                 "question": request.question.clone()
             }
+        }),
+    )
+    .await?;
+    award_xp_event(
+        db,
+        &student,
+        &lesson_xp_event_key(entry.id),
+        LESSON_STARTED_XP,
+        "lesson_started",
+        Some(topic),
+        lesson.get("stageLevel").and_then(Value::as_str),
+        json!({
+            "bookId": book.id,
+            "bookEntryId": entry.id,
+            "position": entry.position
         }),
     )
     .await?;
@@ -596,6 +648,10 @@ pub async fn reset_student_learning_state(
         .filter(concept_progress::Column::StudentId.eq(student_id))
         .exec(&tx)
         .await?;
+    student_xp_event::Entity::delete_many()
+        .filter(student_xp_event::Column::StudentId.eq(student_id))
+        .exec(&tx)
+        .await?;
     student_memory::Entity::delete_many()
         .filter(student_memory::Column::StudentId.eq(student_id))
         .exec(&tx)
@@ -630,6 +686,7 @@ pub async fn reset_student_learning_state(
     let interests = string_array(student.interests.clone());
     let mut active: student::ActiveModel = student.into();
     active.suggested_topics = Set(json!(suggested_topics_for_interests(&interests)));
+    active.xp_total = Set(0);
     active.updated_at = Set(now());
     active.update(&tx).await?;
 
@@ -942,6 +999,137 @@ async fn next_book_position(db: &DatabaseConnection, book_id: Uuid) -> Result<i3
     Ok(latest.map(|entry| entry.position + 1).unwrap_or(1))
 }
 
+async fn award_xp_event(
+    db: &DatabaseConnection,
+    student: &student::Model,
+    event_key: &str,
+    points: i32,
+    source_type: &str,
+    topic: Option<&str>,
+    stage_level: Option<&str>,
+    metadata: Value,
+) -> Result<i32, DbErr> {
+    if points <= 0 {
+        return Ok(0);
+    }
+
+    let observed_at = now();
+    let tx = db.begin().await?;
+    let inserted = tx
+        .query_one(sql_statement(
+            r#"
+            INSERT INTO student_xp_events (
+                id, student_id, event_key, points, source_type, topic,
+                stage_level, metadata, created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
+            ON CONFLICT (event_key) DO NOTHING
+            RETURNING points
+            "#,
+            vec![
+                Uuid::new_v4().into(),
+                student.id.into(),
+                event_key.to_string().into(),
+                points.into(),
+                source_type.to_string().into(),
+                topic.map(ToString::to_string).into(),
+                stage_level.map(ToString::to_string).into(),
+                metadata.to_string().into(),
+                observed_at.into(),
+            ],
+        ))
+        .await?;
+
+    if inserted.is_some() {
+        tx.execute(sql_statement(
+            "UPDATE students SET xp_total = xp_total + $1, updated_at = $2 WHERE id = $3",
+            vec![points.into(), observed_at.into(), student.id.into()],
+        ))
+        .await?;
+        tx.commit().await?;
+        return Ok(points);
+    }
+
+    tx.commit().await?;
+    Ok(0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct XpAward {
+    source_type: &'static str,
+    points: i32,
+}
+
+fn stagegate_xp_awards(result: &Value) -> Vec<XpAward> {
+    let score = result
+        .get("score")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let passed = result
+        .get("passed")
+        .and_then(Value::as_bool)
+        .unwrap_or(score >= 0.75);
+    let mut awards = vec![XpAward {
+        source_type: "stagegate_submitted",
+        points: STAGEGATE_SUBMITTED_XP,
+    }];
+
+    if passed {
+        awards.push(XpAward {
+            source_type: "stagegate_passed",
+            points: STAGEGATE_PASSED_XP,
+        });
+    }
+
+    awards
+}
+
+fn lesson_xp_event_key(entry_id: Uuid) -> String {
+    format!("lesson_started:{entry_id}")
+}
+
+fn stagegate_xp_event_key(
+    student_id: Uuid,
+    source_type: &str,
+    topic: &str,
+    stage_level: &str,
+) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        source_type,
+        student_id,
+        xp_key_component(topic),
+        xp_key_component(stage_level)
+    )
+}
+
+fn xp_key_component(value: &str) -> String {
+    let mut output = String::new();
+    let mut last_was_separator = false;
+
+    for character in value.trim().chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            output.push(character);
+            last_was_separator = false;
+        } else if !last_was_separator && !output.is_empty() {
+            output.push('-');
+            last_was_separator = true;
+        }
+
+        if output.len() >= 96 {
+            break;
+        }
+    }
+
+    let normalized = output.trim_matches('-').to_string();
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        normalized
+    }
+}
+
 fn book_state_from_rows(
     student: &student::Model,
     book: &student_book::Model,
@@ -1063,6 +1251,7 @@ async fn get_or_create_student(
         preferred_explanation_style: Set(preferred_explanation_style),
         level_context: Set(level_context),
         suggested_topics: Set(json!(suggested_topics)),
+        xp_total: Set(0),
         created_at: Set(now()),
         updated_at: Set(now()),
     }
@@ -1139,6 +1328,7 @@ async fn student_record(
         memories,
         progress,
         suggested_topics: string_array(student.suggested_topics.clone()),
+        xp_total: student.xp_total,
     })
 }
 
@@ -1531,6 +1721,69 @@ mod tests {
     }
 
     #[test]
+    fn stagegate_xp_awards_attempts_and_passes_separately() {
+        assert_eq!(
+            stagegate_xp_awards(&json!({ "passed": false, "score": 0.4 })),
+            vec![XpAward {
+                source_type: "stagegate_submitted",
+                points: STAGEGATE_SUBMITTED_XP,
+            }]
+        );
+
+        assert_eq!(
+            stagegate_xp_awards(&json!({ "passed": true, "score": 0.9 })),
+            vec![
+                XpAward {
+                    source_type: "stagegate_submitted",
+                    points: STAGEGATE_SUBMITTED_XP,
+                },
+                XpAward {
+                    source_type: "stagegate_passed",
+                    points: STAGEGATE_PASSED_XP,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn stagegate_xp_event_keys_are_student_topic_and_level_scoped() {
+        let student_id = Uuid::parse_str("7854c3af-b0ff-42c8-9854-5bb14a37ea65").unwrap();
+
+        assert_eq!(
+            stagegate_xp_event_key(
+                student_id,
+                "stagegate_passed",
+                "  Reef Currents! ",
+                "Intuition",
+            ),
+            "stagegate_passed:7854c3af-b0ff-42c8-9854-5bb14a37ea65:reef-currents:intuition"
+        );
+        assert_eq!(xp_key_component("!!!"), "unknown");
+    }
+
+    #[test]
+    fn student_record_serializes_xp_total_as_camel_case() {
+        let record = StudentRecord {
+            student_id: "student-123".to_string(),
+            display_name: "Mina".to_string(),
+            age: Some(12),
+            age_band: "11-13".to_string(),
+            biography: None,
+            interests: vec![],
+            preferred_explanation_style: "visual".to_string(),
+            level_context: "middle school".to_string(),
+            memories: vec![],
+            progress: vec![],
+            suggested_topics: vec![],
+            xp_total: 60,
+        };
+
+        let value = serde_json::to_value(record).unwrap();
+
+        assert_eq!(value["xpTotal"], json!(60));
+    }
+
+    #[test]
     fn password_hashes_verify_only_the_original_secret() {
         let hash = hash_password("correct horse battery staple").unwrap();
 
@@ -1583,6 +1836,7 @@ mod tests {
             preferred_explanation_style: "visual".to_string(),
             level_context: "middle school".to_string(),
             suggested_topics: json!([]),
+            xp_total: 50,
             created_at: observed_at,
             updated_at: observed_at,
         };

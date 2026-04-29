@@ -6,3 +6,4 @@ pub mod student;
 pub mod student_book;
 pub mod student_book_entry;
 pub mod student_memory;
+pub mod student_xp_event;

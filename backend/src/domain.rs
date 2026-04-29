@@ -18,6 +18,7 @@ pub struct StudentRecord {
     pub memories: Vec<StudentMemory>,
     pub progress: Vec<ConceptProgress>,
     pub suggested_topics: Vec<String>,
+    pub xp_total: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

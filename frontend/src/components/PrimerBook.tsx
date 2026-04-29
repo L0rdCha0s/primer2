@@ -49,6 +49,7 @@ import {
   authHeaders,
   apiBaseUrl,
   clearStoredAuth,
+  normalizeAuthenticatedStudent,
   readStoredAuth,
   storeAuth,
 } from "@/lib/auth";
@@ -178,6 +179,11 @@ type ResetStudentPayload = {
   error?: string;
   student?: AuthenticatedStudent | null;
   studentId?: string;
+};
+
+type StudentBookPayload = {
+  book: StudentBookState | null;
+  student: AuthenticatedStudent | null;
 };
 
 type MemoryNodeData = Record<string, unknown> & {
@@ -320,14 +326,20 @@ async function fetchStudentBookState(
   learner: AuthenticatedStudent,
   session: AuthSession | null,
   signal?: AbortSignal,
-): Promise<StudentBookState | null> {
+): Promise<StudentBookPayload> {
   const response = await fetch(`${apiBaseUrl}/api/book/${learner.studentId}`, {
     method: "GET",
     headers: authHeaders(session),
     signal,
   });
-  const payload = (await response.json()) as { book?: unknown };
-  return normalizeBookState(payload.book);
+  const payload = (await response.json()) as {
+    book?: unknown;
+    student?: unknown;
+  };
+  return {
+    book: normalizeBookState(payload.book),
+    student: normalizeAuthenticatedStudent(payload.student),
+  };
 }
 
 async function resetStudentRecord(
@@ -438,6 +450,20 @@ export function PrimerBook() {
   const [narrationStatus, setNarrationStatus] = useState(
     "OpenAI narration is ready.",
   );
+
+  const syncAuthenticatedStudentSnapshot = useCallback((
+    student: unknown,
+    nextSession: AuthSession | null = session,
+  ): AuthenticatedStudent | null => {
+    const normalizedStudent = normalizeAuthenticatedStudent(student);
+    if (!normalizedStudent) {
+      return null;
+    }
+
+    setAuthenticatedStudent(normalizedStudent);
+    storeAuth({ student: normalizedStudent, session: nextSession });
+    return normalizedStudent;
+  }, [session]);
 
   const hydratePersistedBook = useCallback(
     (
@@ -552,25 +578,39 @@ export function PrimerBook() {
     setLessonStatus("Loading the saved Primer book...");
 
     void fetchStudentBookState(learner, session, controller.signal)
-      .then((savedBook) => {
+      .then((savedPayload) => {
         if (cancelled) {
           return null;
         }
 
-        if (hydratePersistedBook(savedBook, learner, { turnToEnd: true })) {
+        const restoredStudent =
+          syncAuthenticatedStudentSnapshot(savedPayload.student) ?? learner;
+
+        if (
+          hydratePersistedBook(savedPayload.book, restoredStudent, {
+            turnToEnd: true,
+          })
+        ) {
           setLessonStatus("Restored the saved Primer book from the database.");
           return null;
         }
 
         setLessonStatus("Asking OpenAI Responses to choose the opening path...");
-        return requestLessonStart(learner, session, undefined, controller.signal);
+        return requestLessonStart(
+          restoredStudent,
+          session,
+          undefined,
+          controller.signal,
+        );
       })
       .then((payload) => {
         if (cancelled || !payload) {
           return;
         }
 
-        setRemoteMemories(normalizeMemories(payload.student?.memories));
+        const responseStudent =
+          syncAuthenticatedStudentSnapshot(payload.student) ?? learner;
+        setRemoteMemories(normalizeMemories(responseStudent.memories));
         if (payload.error || !payload.lesson) {
           setLessonStatus(
             payload.error ?? "The opening lesson could not be generated yet.",
@@ -580,11 +620,11 @@ export function PrimerBook() {
 
         const normalizedLesson = normalizeLesson(
           payload.lesson,
-          firstTopicHint(learner),
+          firstTopicHint(responseStudent),
         );
         setLesson(normalizedLesson);
         setTopic(normalizedLesson.topic);
-        hydratePersistedBook(normalizeBookState(payload.book), learner, {
+        hydratePersistedBook(normalizeBookState(payload.book), responseStudent, {
           turnToEnd: true,
         });
         setLessonStatus(
@@ -607,7 +647,12 @@ export function PrimerBook() {
       cancelled = true;
       controller.abort();
     };
-  }, [authenticatedStudent, hydratePersistedBook, session]);
+  }, [
+    authenticatedStudent,
+    hydratePersistedBook,
+    session,
+    syncAuthenticatedStudentSnapshot,
+  ]);
 
   useEffect(() => {
     return () => {
@@ -1183,8 +1228,10 @@ export function PrimerBook() {
         session,
         cleanTopic || undefined,
       );
+      const responseStudent =
+        syncAuthenticatedStudentSnapshot(payload.student) ?? authenticatedStudent;
       if (payload.error || !payload.lesson) {
-        setRemoteMemories(normalizeMemories(payload.student?.memories));
+        setRemoteMemories(normalizeMemories(responseStudent.memories));
         setLessonStatus(
           payload.error ?? "This lesson could not be generated yet.",
         );
@@ -1196,15 +1243,15 @@ export function PrimerBook() {
 
       const normalizedLesson = normalizeLesson(
         payload.lesson,
-        cleanTopic || firstTopicHint(authenticatedStudent),
+        cleanTopic || firstTopicHint(responseStudent),
       );
       setHasPassedStagegate(false);
       setStagegateResult(emptyStagegateResult);
       setAnswer("");
       setLesson(normalizedLesson);
       setTopic(normalizedLesson.topic);
-      setRemoteMemories(normalizeMemories(payload.student?.memories));
-      hydratePersistedBook(normalizeBookState(payload.book), authenticatedStudent);
+      setRemoteMemories(normalizeMemories(responseStudent.memories));
+      hydratePersistedBook(normalizeBookState(payload.book), responseStudent);
       setLessonStatus(
         normalizedLesson.aiMode === "openai_responses"
           ? "Guided by OpenAI Responses."
@@ -1288,9 +1335,11 @@ export function PrimerBook() {
         }),
       });
       const payload = await response.json();
+      const responseStudent =
+        syncAuthenticatedStudentSnapshot(payload.student) ?? authenticatedStudent;
       if (payload.error || !payload.result) {
-        setRemoteMemories(normalizeMemories(payload.student?.memories));
-        hydratePersistedBook(normalizeBookState(payload.book), authenticatedStudent);
+        setRemoteMemories(normalizeMemories(responseStudent.memories));
+        hydratePersistedBook(normalizeBookState(payload.book), responseStudent);
         setHasPassedStagegate(false);
         setStagegateResult({
           ...emptyStagegateResult,
@@ -1315,9 +1364,9 @@ export function PrimerBook() {
 
       const normalizedResult = normalizeStagegateResult(payload.result);
       setStagegateResult(normalizedResult);
-      setRemoteMemories(normalizeMemories(payload.student?.memories));
+      setRemoteMemories(normalizeMemories(responseStudent.memories));
       setHasPassedStagegate(normalizedResult.passed);
-      hydratePersistedBook(normalizeBookState(payload.book), authenticatedStudent);
+      hydratePersistedBook(normalizeBookState(payload.book), responseStudent);
       shouldTurnToUnlock = normalizedResult.passed;
       if (isMemoryOpen) {
         void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
@@ -1373,11 +1422,18 @@ export function PrimerBook() {
         return;
       }
 
-      const resetStudent = resetPayload.student;
+      const resetStudent = syncAuthenticatedStudentSnapshot(
+        resetPayload.student,
+        currentSession,
+      );
+      if (!resetStudent) {
+        const message = "The reset response did not include a valid student.";
+        setResetError(message);
+        setLessonStatus(message);
+        return;
+      }
       bootstrappedStudentIdRef.current = resetStudent.studentId;
       pendingBookEndPageRef.current = null;
-      storeAuth({ student: resetStudent, session: currentSession });
-      setAuthenticatedStudent(resetStudent);
       setSession(currentSession);
       setRemoteMemories(normalizeMemories(resetStudent.memories));
       setMemoryGraph(null);
@@ -1415,11 +1471,10 @@ export function PrimerBook() {
         resetStudent,
         currentSession,
       );
-      setRemoteMemories(normalizeMemories(lessonPayload.student?.memories));
-      if (lessonPayload.student) {
-        storeAuth({ student: lessonPayload.student, session: currentSession });
-        setAuthenticatedStudent(lessonPayload.student);
-      }
+      const lessonStudent =
+        syncAuthenticatedStudentSnapshot(lessonPayload.student, currentSession) ??
+        resetStudent;
+      setRemoteMemories(normalizeMemories(lessonStudent.memories));
       if (lessonPayload.error || !lessonPayload.lesson) {
         setLessonStatus(
           lessonPayload.error ??
@@ -1430,13 +1485,17 @@ export function PrimerBook() {
 
       const normalizedLesson = normalizeLesson(
         lessonPayload.lesson,
-        firstTopicHint(resetStudent),
+        firstTopicHint(lessonStudent),
       );
       setLesson(normalizedLesson);
       setTopic(normalizedLesson.topic);
-      hydratePersistedBook(normalizeBookState(lessonPayload.book), resetStudent, {
-        turnToEnd: true,
-      });
+      hydratePersistedBook(
+        normalizeBookState(lessonPayload.book),
+        lessonStudent,
+        {
+          turnToEnd: true,
+        },
+      );
       setLessonStatus(
         normalizedLesson.aiMode === "openai_responses"
           ? "Fresh opening path generated by OpenAI Responses."
@@ -1452,13 +1511,15 @@ export function PrimerBook() {
   }
 
   function handleAuthenticated(payload: AuthPayload) {
-    if (!payload.student) {
+    const nextSession = payload.session ?? null;
+    const studentProfile = syncAuthenticatedStudentSnapshot(
+      payload.student,
+      nextSession,
+    );
+    if (!studentProfile) {
       return;
     }
 
-    const studentProfile = payload.student;
-    const nextSession = payload.session ?? null;
-    setAuthenticatedStudent(studentProfile);
     setSession(nextSession);
     setRemoteMemories(normalizeMemories(studentProfile.memories));
     if (studentProfile.suggestedTopics.length > 0) {
@@ -1470,7 +1531,6 @@ export function PrimerBook() {
     if (studentProfile.interests.length > 0) {
       setTopic(studentProfile.interests[0]);
     }
-    storeAuth({ student: studentProfile, session: nextSession });
   }
 
   function handleLogout() {
@@ -1539,34 +1599,38 @@ export function PrimerBook() {
           <BookOpen className="h-4 w-4" />
           <span>{learner.displayName}&apos;s Primer</span>
         </div>
-        <div className="absolute right-3 top-3 z-30 flex items-center gap-2">
+        <div className="absolute left-2 right-2 top-3 z-30 flex items-center justify-end gap-1.5 sm:left-auto sm:right-3 sm:gap-2">
+          <XpBadge xpTotal={learner.xpTotal} />
           <button
             type="button"
+            aria-label="Open memory graph"
             onClick={openMemoryGraph}
-            className="inline-flex h-10 items-center gap-2 rounded-full border border-cyan-100/15 bg-black/28 px-3 text-sm text-cyan-50/78 shadow-2xl shadow-black/20 transition hover:text-cyan-50"
+            className="inline-flex h-10 items-center gap-2 rounded-full border border-cyan-100/15 bg-black/28 px-2.5 text-sm text-cyan-50/78 shadow-2xl shadow-black/20 transition hover:text-cyan-50 sm:px-3"
           >
             <Brain className="h-4 w-4" />
-            Memory
+            <span className="hidden sm:inline">Memory</span>
           </button>
           <button
             type="button"
+            aria-label="Reset student record"
             onClick={() => {
               setResetError(null);
               setIsResetDialogOpen(true);
             }}
             disabled={isResettingStudent}
-            className="inline-flex h-10 items-center gap-2 rounded-full border border-amber-200/20 bg-black/28 px-3 text-sm text-amber-50/82 shadow-2xl shadow-black/20 transition hover:text-amber-50 disabled:cursor-wait disabled:opacity-60"
+            className="inline-flex h-10 items-center gap-2 rounded-full border border-amber-200/20 bg-black/28 px-2.5 text-sm text-amber-50/82 shadow-2xl shadow-black/20 transition hover:text-amber-50 disabled:cursor-wait disabled:opacity-60 sm:px-3"
           >
             <RotateCcw className="h-4 w-4" />
-            Reset
+            <span className="hidden sm:inline">Reset</span>
           </button>
           <button
             type="button"
+            aria-label="Sign out"
             onClick={handleLogout}
-            className="inline-flex h-10 items-center gap-2 rounded-full border border-cyan-100/15 bg-black/28 px-3 text-sm text-cyan-50/78 shadow-2xl shadow-black/20 transition hover:text-cyan-50"
+            className="inline-flex h-10 items-center gap-2 rounded-full border border-cyan-100/15 bg-black/28 px-2.5 text-sm text-cyan-50/78 shadow-2xl shadow-black/20 transition hover:text-cyan-50 sm:px-3"
           >
             <LogOut className="h-4 w-4" />
-            Sign out
+            <span className="hidden sm:inline">Sign out</span>
           </button>
         </div>
 
@@ -1843,6 +1907,20 @@ export function PrimerBook() {
         />
       ) : null}
     </main>
+  );
+}
+
+function XpBadge({ xpTotal }: { xpTotal: number }) {
+  const safeXp = Number.isFinite(xpTotal)
+    ? Math.max(0, Math.floor(xpTotal))
+    : 0;
+
+  return (
+    <div className="inline-flex h-10 min-w-[82px] items-center justify-center gap-2 rounded-[8px] border border-[#d8b86a]/45 bg-[#d8b86a] px-3 text-[#17201d] shadow-2xl shadow-black/20">
+      <Sparkles className="h-4 w-4" />
+      <span className="text-xs font-semibold uppercase leading-none">XP</span>
+      <span className="text-sm font-bold leading-none tabular-nums">{safeXp}</span>
+    </div>
   );
 }
 

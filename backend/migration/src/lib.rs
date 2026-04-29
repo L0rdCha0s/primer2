@@ -3,6 +3,7 @@ pub use sea_orm_migration::prelude::*;
 mod m20260429_000001_create_learning_tables;
 mod m20260429_000002_create_narrative_characters;
 mod m20260429_000003_create_student_books;
+mod m20260429_000004_add_student_xp;
 
 pub struct Migrator;
 
@@ -13,6 +14,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260429_000001_create_learning_tables::Migration),
             Box::new(m20260429_000002_create_narrative_characters::Migration),
             Box::new(m20260429_000003_create_student_books::Migration),
+            Box::new(m20260429_000004_add_student_xp::Migration),
         ]
     }
 }

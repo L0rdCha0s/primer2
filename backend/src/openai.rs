@@ -2,6 +2,7 @@ use crate::domain::{
     InfographicExplanationRequest, InfographicRequest, LessonStartRequest, NarrationRequest,
     NarrativeCharacter, StagegateRequest, StudentRecord,
 };
+use crate::report_card::{ReportCardNarrative, StudentReportCard};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
 
@@ -179,6 +180,43 @@ Return only JSON that matches the provided schema."#;
             result["model"] = json!(self.text_model);
             result
         })
+    }
+
+    pub async fn rewrite_report_card_narrative(
+        &self,
+        report: &StudentReportCard,
+    ) -> Result<ReportCardNarrative, String> {
+        let Some(api_key) = self.api_key.as_deref() else {
+            return Err("OpenAI API key is required to rewrite report-card narrative.".to_string());
+        };
+
+        let system_prompt = r#"You are Primer's report-card narrative writer.
+
+Rewrite only the narrative fields for a student-and-parent report card.
+Use the supplied deterministic report as the source of truth.
+Do not invent curriculum references, scores, stagegate attempts, topics, grades, evidence, or diagnoses.
+Keep the studentSummary encouraging and student-facing.
+Keep the parentSummary concise, evidence-based, and explicit that this is not an official school grade.
+Keep strengths, growthAreas, and nextSteps grounded in supplied evidence.
+Return only JSON that matches the provided schema."#;
+
+        let user_payload = json!({
+            "reportCard": report,
+            "task": "Rewrite the narrative comments and recommendation bullets only. Keep all claims tied to supplied report-card data."
+        });
+
+        let narrative = self
+            .responses_json(
+                api_key,
+                system_prompt,
+                user_payload,
+                "report_card_narrative",
+                report_card_narrative_schema(),
+            )
+            .await?;
+
+        serde_json::from_value(narrative)
+            .map_err(|error| format!("OpenAI report-card narrative was not valid JSON: {error}"))
     }
 
     pub async fn generate_infographic(
@@ -901,6 +939,42 @@ fn infographic_explanation_schema() -> Value {
     })
 }
 
+fn report_card_narrative_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "studentSummary",
+            "parentSummary",
+            "strengths",
+            "growthAreas",
+            "nextSteps"
+        ],
+        "properties": {
+            "studentSummary": { "type": "string" },
+            "parentSummary": { "type": "string" },
+            "strengths": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": { "type": "string" }
+            },
+            "growthAreas": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": { "type": "string" }
+            },
+            "nextSteps": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": { "type": "string" }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,6 +1014,7 @@ mod tests {
                 evidence: vec!["Passed Energy: Intuition.".to_string()],
             }],
             suggested_topics: vec!["coral reef systems".to_string()],
+            xp_total: 50,
         }
     }
 
