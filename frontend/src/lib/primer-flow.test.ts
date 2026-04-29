@@ -72,6 +72,7 @@ describe("lesson and stagegate normalization", () => {
       initialLesson.plainExplanation,
       initialLesson.analogy,
       initialLesson.checkForUnderstanding,
+      initialLesson.stagegatePrompt,
     ].join(" ");
 
     expect(studentFacingText).not.toMatch(/the primer|the book|the page/i);
@@ -107,6 +108,24 @@ describe("lesson and stagegate normalization", () => {
       keyTerms: [{ term: "Current", definition: "Moving water." }],
       aiMode: "missing_openai_api_key",
     });
+  });
+
+  test("replaces generic stagegate instructions with the lesson question", () => {
+    const lesson = normalizeLesson(
+      {
+        topic: "basketball arcs",
+        stageLevel: "intuition",
+        checkForUnderstanding:
+          "Why does a basketball shot keep moving forward while gravity pulls it down?",
+        stagegatePrompt:
+          "Answer the check-for-understanding question in one or two sentences. If your answer shows the main idea, the next step can add simple numbers to predict a shot's path.",
+      },
+      "fallback",
+    );
+
+    expect(lesson.stagegatePrompt).toBe(
+      "Why does a basketball shot keep moving forward while gravity pulls it down? Use one or two sentences and include one clue from the lesson.",
+    );
   });
 
   test("normalizes stagegate pass results and unlocks mechanism stage", () => {

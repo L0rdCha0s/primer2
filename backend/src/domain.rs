@@ -169,6 +169,8 @@ pub struct StagegateRequest {
     pub topic: String,
     pub answer: String,
     pub stage_level: Option<String>,
+    pub stagegate_prompt: Option<String>,
+    pub check_for_understanding: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

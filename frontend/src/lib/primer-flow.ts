@@ -259,7 +259,7 @@ export const initialLesson: PrimerLesson = {
     "Once the opening lesson is ready, a check-for-understanding question will appear here.",
   suggestedTopics: [],
   stagegatePrompt:
-    "Explain the most important idea in your own words, then connect it to one example from your life.",
+    "What is the most important idea in this lesson, and how does it connect to one example from your life?",
   infographicPrompt:
     "Create an age-appropriate infographic for the student's generated starter lesson.",
   keyTerms: [],
@@ -476,9 +476,15 @@ export function normalizeLesson(
     stageLevel === "mechanism" || stageLevel === "transfer"
       ? stageLevel
       : "intuition";
+  const topic = stringField(record, "topic") ?? fallbackTopic;
+  const checkForUnderstanding =
+    stringField(record, "checkForUnderstanding") ??
+    initialLesson.checkForUnderstanding;
+  const rawStagegatePrompt =
+    stringField(record, "stagegatePrompt") ?? initialLesson.stagegatePrompt;
 
   return {
-    topic: stringField(record, "topic") ?? fallbackTopic,
+    topic,
     stageLevel: normalizedStage,
     communicationStyle:
       stringField(record, "communicationStyle") ??
@@ -487,14 +493,15 @@ export function normalizeLesson(
     plainExplanation:
       stringField(record, "plainExplanation") ?? initialLesson.plainExplanation,
     analogy: stringField(record, "analogy") ?? initialLesson.analogy,
-    checkForUnderstanding:
-      stringField(record, "checkForUnderstanding") ??
-      initialLesson.checkForUnderstanding,
+    checkForUnderstanding,
     suggestedTopics:
       stringArrayField(record, "suggestedTopics") ??
       initialLesson.suggestedTopics,
-    stagegatePrompt:
-      stringField(record, "stagegatePrompt") ?? initialLesson.stagegatePrompt,
+    stagegatePrompt: normalizeStagegatePrompt(
+      rawStagegatePrompt,
+      topic,
+      checkForUnderstanding,
+    ),
     infographicPrompt:
       stringField(record, "infographicPrompt") ??
       initialLesson.infographicPrompt,
@@ -502,6 +509,61 @@ export function normalizeLesson(
     aiMode: stringField(record, "aiMode"),
     model: stringField(record, "model"),
   };
+}
+
+function normalizeStagegatePrompt(
+  prompt: string,
+  topic: string,
+  checkForUnderstanding: string,
+): string {
+  if (!needsStagegatePromptRewrite(prompt)) {
+    return prompt;
+  }
+
+  const cleanCheck = checkForUnderstanding.trim();
+  if (cleanCheck && !isPlaceholderQuestion(cleanCheck)) {
+    return `${asQuestion(cleanCheck)} Use one or two sentences and include one clue from the lesson.`;
+  }
+
+  const cleanTopic = topic.trim() || "this lesson";
+  return `What is the most important idea about ${cleanTopic}, and how would you explain it in your own words? Use one or two sentences and include one example or clue from the lesson.`;
+}
+
+function needsStagegatePromptRewrite(prompt: string): boolean {
+  const cleanPrompt = prompt.trim();
+  if (!cleanPrompt) {
+    return true;
+  }
+
+  const lowerPrompt = cleanPrompt.toLowerCase();
+  const referencesMissingQuestion =
+    !cleanPrompt.includes("?") &&
+    lowerPrompt.includes("question") &&
+    lowerPrompt.includes("answer");
+  return (
+    lowerPrompt.includes("check-for-understanding question") ||
+    lowerPrompt.includes("check for understanding question") ||
+    lowerPrompt.includes("understanding question will appear") ||
+    lowerPrompt.includes("answer the check") ||
+    referencesMissingQuestion
+  );
+}
+
+function isPlaceholderQuestion(value: string): boolean {
+  const lowerValue = value.toLowerCase();
+  return (
+    lowerValue.includes("will appear here") ||
+    lowerValue.includes("opening lesson is ready")
+  );
+}
+
+function asQuestion(value: string): string {
+  const cleanValue = value.trim();
+  if (cleanValue.endsWith("?")) {
+    return cleanValue;
+  }
+
+  return `${cleanValue.replace(/[.!]+$/, "")}?`;
 }
 
 export function normalizeStagegateResult(value: unknown): StagegateResult {

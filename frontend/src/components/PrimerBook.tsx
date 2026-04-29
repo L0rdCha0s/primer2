@@ -63,7 +63,6 @@ import {
   type PrimerLesson,
   type Stage,
   type StagegateResult,
-  type StudentBookLesson,
   type StudentBookState,
   type StudentMemory,
   type StudentMemoryGraph,
@@ -439,7 +438,6 @@ export function PrimerBook() {
   const [currentPage, setCurrentPage] = useState(0);
   const [topic, setTopic] = useState("");
   const [lesson, setLesson] = useState<PrimerLesson>(initialLesson);
-  const [bookLessons, setBookLessons] = useState<StudentBookLesson[]>([]);
   const [remoteMemories, setRemoteMemories] = useState<StudentMemory[] | null>(
     null,
   );
@@ -529,7 +527,6 @@ export function PrimerBook() {
       if (options?.turnToEnd) {
         pendingBookEndPageRef.current = restoredBookTargetPage(book);
       }
-      setBookLessons(book.lessons);
       if (book.currentLesson) {
         const savedLesson = normalizeLesson(
           book.currentLesson,
@@ -618,7 +615,6 @@ export function PrimerBook() {
     setIsLessonGenerating(false);
     setIsInfographicGenerating(false);
     setInfographicArtifact(null);
-    setBookLessons([]);
     setSelectionInfographics([]);
     setSelectedTextAction(null);
     setStagegateResult(emptyStagegateResult);
@@ -1452,7 +1448,7 @@ export function PrimerBook() {
       if (isMemoryOpen) {
         void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
       }
-      goToPage(storyPageIndex);
+      scheduleBookLayoutRefresh(storyPageIndex);
     } catch (error) {
       setLessonStatus(`Could not reach backend: ${String(error)}`);
     } finally {
@@ -1522,6 +1518,8 @@ export function PrimerBook() {
           topic: lesson.topic,
           answer: nextAnswer,
           stageLevel: lesson.stageLevel,
+          stagegatePrompt: lesson.stagegatePrompt,
+          checkForUnderstanding: lesson.checkForUnderstanding,
         }),
       });
       const payload = await response.json();
@@ -1635,7 +1633,6 @@ export function PrimerBook() {
       setCurrentPage(0);
       setTopic("");
       setLesson(initialLesson);
-      setBookLessons([]);
       setReportCard(null);
       setReportCardStatus("Report card not loaded.");
       setIsReportOpen(false);
@@ -1755,7 +1752,6 @@ export function PrimerBook() {
     setCurrentPage(0);
     setTopic("");
     setLesson(initialLesson);
-    setBookLessons([]);
     setHasAsked(false);
     setHasGeneratedInfographic(false);
     setHasPassedStagegate(false);

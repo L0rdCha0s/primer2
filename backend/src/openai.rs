@@ -98,6 +98,7 @@ Use supplied narrativeCharacters when they fit the topic. Preserve their names, 
 Prefer reusing a relevant existing character over introducing a new one. Only introduce or update characters that appear in storyScene.
 Return narrativeCharacters as the complete list of characters used or materially updated by this lesson. Do not include the learner as a narrative character.
 Prefer interaction context from the student's question over canned curriculum. Ask the next useful check-for-understanding question inside the lesson.
+Set stagegatePrompt to the actual end-of-lesson question the learner should answer. Do not write generic directions like "answer the check-for-understanding question"; include the question itself and make it answerable in one or two sentences.
 Do not invent memories. Do not store sensitive personal data.
 Return only JSON that matches the provided schema."#;
 
@@ -117,7 +118,7 @@ Return only JSON that matches the provided schema."#;
             "shouldChooseStartingPointFromProfile": should_choose_starting_point,
             "requestedTopic": requested_topic,
             "studentQuestion": request.question,
-            "task": "Create the student's opening engagement path. If requestedTopic is absent or this is the first lesson, select the best starting concept from the signup biography and interests. Teach through a coherent story frame, recommend next topics, create a stagegate prompt, and create an image-generation prompt for an infographic. Ground personalization in supplied profile facts only."
+            "task": "Create the student's opening engagement path. If requestedTopic is absent or this is the first lesson, select the best starting concept from the signup biography and interests. Teach through a coherent story frame, recommend next topics, create a direct stagegate question, and create an image-generation prompt for an infographic. Ground personalization in supplied profile facts only."
         });
 
         self.responses_json(
@@ -129,6 +130,7 @@ Return only JSON that matches the provided schema."#;
         )
         .await
         .map(|mut lesson| {
+            lesson = ensure_stagegate_question(lesson);
             lesson["aiMode"] = json!("openai_responses");
             lesson["model"] = json!(self.text_model);
             lesson
@@ -156,8 +158,11 @@ Return only JSON that matches the provided schema."#;
         let user_payload = json!({
             "student": student,
             "topic": request.topic,
+            "stagegatePrompt": request.stagegate_prompt,
+            "checkForUnderstanding": request.check_for_understanding,
             "stageLevel": request.stage_level.as_deref().unwrap_or("intuition"),
             "answer": request.answer,
+            "task": "Grade the learner's answer against the supplied stagegate prompt when present. If no prompt is present, grade whether the answer explains the topic at the requested stage level.",
             "rubric": {
                 "accuracy": "Does the answer state correct facts?",
                 "causalReasoning": "Does the answer explain why the process happens?",
@@ -546,6 +551,73 @@ fn clean_optional(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn ensure_stagegate_question(mut lesson: Value) -> Value {
+    let prompt = lesson
+        .get("stagegatePrompt")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    if needs_stagegate_question_rewrite(prompt) {
+        lesson["stagegatePrompt"] = json!(stagegate_question_from_lesson(&lesson));
+    }
+
+    lesson
+}
+
+fn needs_stagegate_question_rewrite(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let references_missing_question =
+        !trimmed.contains('?') && lower.contains("question") && lower.contains("answer");
+    lower.contains("check-for-understanding question")
+        || lower.contains("check for understanding question")
+        || lower.contains("understanding question will appear")
+        || lower.contains("answer the check")
+        || references_missing_question
+}
+
+fn stagegate_question_from_lesson(lesson: &Value) -> String {
+    if let Some(check) = lesson
+        .get("checkForUnderstanding")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|check| !check.is_empty() && !is_placeholder_question(check))
+    {
+        return format!(
+            "{} Use one or two sentences and include one clue from the lesson.",
+            as_question(check)
+        );
+    }
+
+    let topic = lesson
+        .get("topic")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|topic| !topic.is_empty())
+        .unwrap_or("this lesson");
+    format!(
+        "What is the most important idea about {topic}, and how would you explain it in your own words? Use one or two sentences and include one example or clue from the lesson."
+    )
+}
+
+fn is_placeholder_question(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("will appear here") || lower.contains("opening lesson is ready")
+}
+
+fn as_question(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.ends_with('?') {
+        trimmed.to_string()
+    } else {
+        format!("{}?", trimmed.trim_end_matches(|ch| ch == '.' || ch == '!'))
+    }
+}
+
 fn profile_bootstrap_lesson(
     student: &StudentRecord,
     narrative_characters: &[NarrativeCharacter],
@@ -618,7 +690,7 @@ fn profile_bootstrap_lesson(
         ),
         "suggestedTopics": suggestions,
         "stagegatePrompt": format!(
-            "Explain the core idea behind {anchor} in your own words, then connect it to one detail from your biography or interests."
+            "How does one pattern in {anchor} show a cause-and-effect idea? Explain it in your own words and connect it to one detail from your biography or interests."
         ),
         "infographicPrompt": format!(
             "Create an age-appropriate infographic for {name} about {anchor}. Use only profile-grounded motifs, clear labels, a simple cause-and-effect flow, and no tiny text.",
@@ -1083,6 +1155,7 @@ mod tests {
             "plainExplanation",
             "analogy",
             "checkForUnderstanding",
+            "stagegatePrompt",
         ] {
             let text = lesson[field]
                 .as_str()
@@ -1099,6 +1172,23 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("marine biology")
+        );
+        assert!(lesson["stagegatePrompt"].as_str().unwrap().contains('?'));
+    }
+
+    #[test]
+    fn generic_stagegate_instruction_is_replaced_with_lesson_question() {
+        let lesson = ensure_stagegate_question(json!({
+            "topic": "basketball arcs",
+            "checkForUnderstanding": "Why does a basketball shot keep moving forward while gravity pulls it down?",
+            "stagegatePrompt": "Answer the check-for-understanding question in one or two sentences. If your answer shows the main idea, the next step can add simple numbers to predict a shot's path."
+        }));
+
+        assert_eq!(
+            lesson["stagegatePrompt"],
+            json!(
+                "Why does a basketball shot keep moving forward while gravity pulls it down? Use one or two sentences and include one clue from the lesson."
+            )
         );
     }
 
@@ -1199,6 +1289,10 @@ mod tests {
                     topic: "lightning".to_string(),
                     answer: "Charges separate and then move.".to_string(),
                     stage_level: Some("intuition".to_string()),
+                    stagegate_prompt: Some("Why does lightning happen?".to_string()),
+                    check_for_understanding: Some(
+                        "What pattern shows charges separating?".to_string(),
+                    ),
                 },
             )
             .await

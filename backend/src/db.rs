@@ -964,7 +964,9 @@ pub async fn append_stagegate_book_entry(
             "request": {
                 "topic": request.topic.clone(),
                 "stageLevel": stage_level,
-                "answer": request.answer.clone()
+                "answer": request.answer.clone(),
+                "stagegatePrompt": request.stagegate_prompt.clone(),
+                "checkForUnderstanding": request.check_for_understanding.clone()
             }
         }),
     )
