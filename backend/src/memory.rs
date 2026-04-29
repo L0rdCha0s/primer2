@@ -441,6 +441,35 @@ pub async fn graph_for_student(
     }))
 }
 
+pub async fn delete_student_graph_projection(
+    conn: &impl ConnectionTrait,
+    student_id: Uuid,
+) -> Result<(), DbErr> {
+    prepare_age(conn).await?;
+    let query = delete_student_graph_projection_query(student_id);
+    let cypher = format!(
+        r#"
+        SELECT *
+        FROM ag_catalog.cypher({graph}, {query}) AS (deleted ag_catalog.agtype)
+        "#,
+        graph = sql_string(GRAPH_NAME),
+        query = sql_dollar_string(&query),
+    );
+    conn.execute(raw_statement(&cypher)).await?;
+    Ok(())
+}
+
+fn delete_student_graph_projection_query(student_id: Uuid) -> String {
+    format!(
+        r#"
+        MATCH (n)
+        WHERE n.student_id = {student_id}
+        DETACH DELETE n
+        "#,
+        student_id = cypher_string(&student_id.to_string()),
+    )
+}
+
 async fn ensure_student_entity(
     db: &DatabaseConnection,
     student: &student::Model,
@@ -1603,4 +1632,21 @@ pub fn memory_schema_sql() -> Vec<&'static str> {
              salience DESC,
              observed_at DESC"#,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_projection_delete_query_avoids_age_property_map_containment() {
+        let query = delete_student_graph_projection_query(
+            Uuid::parse_str("7854c3af-b0ff-42c8-9854-5bb14a37ea65").unwrap(),
+        );
+
+        assert!(query.contains("MATCH (n)"));
+        assert!(query.contains("WHERE n.student_id = '7854c3af-b0ff-42c8-9854-5bb14a37ea65'"));
+        assert!(query.contains("DETACH DELETE n"));
+        assert!(!query.contains("MATCH (n {"));
+    }
 }

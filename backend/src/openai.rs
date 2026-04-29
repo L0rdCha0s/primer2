@@ -1,6 +1,6 @@
 use crate::domain::{
-    InfographicRequest, LessonStartRequest, NarrationRequest, NarrativeCharacter, StagegateRequest,
-    StudentRecord,
+    InfographicExplanationRequest, InfographicRequest, LessonStartRequest, NarrationRequest,
+    NarrativeCharacter, StagegateRequest, StudentRecord,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
@@ -246,6 +246,104 @@ Return only JSON that matches the provided schema."#;
         }))
     }
 
+    pub async fn explain_infographic(
+        &self,
+        student: &StudentRecord,
+        request: &InfographicExplanationRequest,
+    ) -> Result<Value, String> {
+        let image_src = normalize_image_src(&request.image_src)?;
+        let Some(api_key) = self.api_key.as_deref() else {
+            return Ok(json!({
+                "aiMode": "missing_openai_api_key",
+                "model": self.text_model,
+                "speechModel": self.speech_model,
+                "voice": self.speech_voice,
+                "generated": false,
+                "speechGenerated": false,
+                "topic": request.topic,
+                "explanation": "Set OPENAI_API_KEY in backend/.env to let GPT-5.5 inspect the enlarged infographic and generate a spoken explanation.",
+                "spokenExplanation": "",
+                "keyObservations": [],
+                "message": "Set OPENAI_API_KEY in backend/.env to explain diagrams with vision and TTS."
+            }));
+        };
+
+        let system_prompt = r#"You are Primer, an adaptive story tutor explaining an educational diagram.
+
+Use the supplied image as vision input. Explain only what is visible or strongly implied by the diagram and topic context.
+If labels are hard to read, say that gently instead of inventing exact text.
+Write for a young learner in a calm, spoken-friendly style. Focus on what to look at first, how the arrows or regions connect, and the core idea the diagram teaches.
+Return only JSON that matches the provided schema."#;
+
+        let user_payload = json!({
+            "student": student,
+            "topic": request.topic,
+            "title": request.title,
+            "alt": request.alt,
+            "generationPrompt": request.prompt,
+            "task": "Explain this enlarged infographic so the learner can understand it while listening. Make the spoken explanation self-contained and avoid saying you are an AI or that you are looking at an image."
+        });
+
+        let explanation = self
+            .responses_json_with_user_content(
+                api_key,
+                system_prompt,
+                vec![
+                    json!({"type": "input_text", "text": user_payload.to_string()}),
+                    json!({"type": "input_image", "image_url": image_src}),
+                ],
+                "infographic_explanation",
+                infographic_explanation_schema(),
+            )
+            .await?;
+
+        let spoken_explanation = explanation
+            .get("spokenExplanation")
+            .and_then(Value::as_str)
+            .or_else(|| explanation.get("explanation").and_then(Value::as_str))
+            .unwrap_or("This diagram is ready, but no spoken explanation was returned.")
+            .to_string();
+
+        let speech = match self
+            .generate_narration(&NarrationRequest {
+                student_id: request.student_id.clone(),
+                topic: Some(request.topic.clone()),
+                text: spoken_explanation.clone(),
+                instructions: Some(
+                    "Explain the diagram like a calm tutor pointing at the parts in order. Use clear pacing and short pauses between visual steps."
+                        .to_string(),
+                ),
+            })
+            .await
+        {
+            Ok(speech) => speech,
+            Err(error) => json!({
+                "aiMode": "openai_tts_error",
+                "generated": false,
+                "error": error,
+                "model": self.speech_model,
+                "voice": self.speech_voice
+            }),
+        };
+
+        Ok(json!({
+            "aiMode": "openai_responses_vision",
+            "model": self.text_model,
+            "speechModel": self.speech_model,
+            "voice": self.speech_voice,
+            "generated": true,
+            "speechGenerated": speech.get("generated").and_then(Value::as_bool).unwrap_or(false),
+            "topic": request.topic,
+            "explanation": explanation
+                .get("explanation")
+                .cloned()
+                .unwrap_or_else(|| json!(spoken_explanation.clone())),
+            "spokenExplanation": spoken_explanation,
+            "keyObservations": explanation.get("keyObservations").cloned().unwrap_or(json!([])),
+            "speech": speech
+        }))
+    }
+
     pub async fn generate_narration(&self, request: &NarrationRequest) -> Result<Value, String> {
         let Some(api_key) = self.api_key.as_deref() else {
             return Ok(json!({
@@ -332,6 +430,24 @@ Return only JSON that matches the provided schema."#;
         schema_name: &str,
         schema: Value,
     ) -> Result<Value, String> {
+        self.responses_json_with_user_content(
+            api_key,
+            system_prompt,
+            vec![json!({"type": "input_text", "text": user_payload.to_string()})],
+            schema_name,
+            schema,
+        )
+        .await
+    }
+
+    async fn responses_json_with_user_content(
+        &self,
+        api_key: &str,
+        system_prompt: &str,
+        user_content: Vec<Value>,
+        schema_name: &str,
+        schema: Value,
+    ) -> Result<Value, String> {
         let body = json!({
             "model": self.text_model,
             "input": [
@@ -341,7 +457,7 @@ Return only JSON that matches the provided schema."#;
                 },
                 {
                     "role": "user",
-                    "content": [{"type": "input_text", "text": user_payload.to_string()}]
+                    "content": user_content
                 }
             ],
             "text": {
@@ -354,6 +470,10 @@ Return only JSON that matches the provided schema."#;
             }
         });
 
+        self.send_responses_json(api_key, body).await
+    }
+
+    async fn send_responses_json(&self, api_key: &str, body: Value) -> Result<Value, String> {
         let response = self
             .http
             .post("https://api.openai.com/v1/responses")
@@ -571,6 +691,22 @@ pub fn build_infographic_prompt(student: &StudentRecord, request: &InfographicRe
     )
 }
 
+fn normalize_image_src(image_src: &str) -> Result<String, String> {
+    let image_src = image_src.trim();
+    if image_src.is_empty() {
+        return Err("Infographic imageSrc is required.".to_string());
+    }
+
+    if image_src.starts_with("data:image/")
+        || image_src.starts_with("https://")
+        || image_src.starts_with("http://")
+    {
+        return Ok(image_src.to_string());
+    }
+
+    Err("Infographic imageSrc must be an http(s) URL or data:image URL.".to_string())
+}
+
 fn extract_response_text(payload: &Value) -> Option<String> {
     if let Some(text) = payload.get("output_text").and_then(Value::as_str) {
         return Some(text.to_string());
@@ -732,6 +868,34 @@ fn stagegate_schema() -> Value {
                         "tags": { "type": "array", "items": { "type": "string" } }
                     }
                 }
+            }
+        }
+    })
+}
+
+fn infographic_explanation_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "explanation",
+            "spokenExplanation",
+            "keyObservations"
+        ],
+        "properties": {
+            "explanation": {
+                "type": "string",
+                "description": "A concise student-facing explanation of the visible diagram."
+            },
+            "spokenExplanation": {
+                "type": "string",
+                "description": "A narration-ready version that can be read aloud naturally."
+            },
+            "keyObservations": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 5,
+                "items": { "type": "string" }
             }
         }
     })
@@ -916,6 +1080,20 @@ mod tests {
             })
             .await
             .expect("narration fallback should be successful");
+        let explanation = client
+            .explain_infographic(
+                &student,
+                &InfographicExplanationRequest {
+                    student_id: Some(student.student_id.clone()),
+                    topic: "reef currents".to_string(),
+                    image_src: "data:image/png;base64,abcdef".to_string(),
+                    title: Some("Reef currents infographic".to_string()),
+                    alt: None,
+                    prompt: Some("Show arrows and labels.".to_string()),
+                },
+            )
+            .await
+            .expect("diagram explanation fallback should be successful");
 
         assert_eq!(infographic["aiMode"], "missing_openai_api_key");
         assert_eq!(infographic["generated"], false);
@@ -928,6 +1106,10 @@ mod tests {
         assert_eq!(narration["aiMode"], "missing_openai_api_key");
         assert_eq!(narration["generated"], false);
         assert_eq!(narration["voice"], "fable");
+        assert_eq!(explanation["aiMode"], "missing_openai_api_key");
+        assert_eq!(explanation["generated"], false);
+        assert_eq!(explanation["speechGenerated"], false);
+        assert_eq!(explanation["model"], "gpt-5.5");
     }
 
     #[tokio::test]
@@ -978,5 +1160,18 @@ mod tests {
 
         assert_eq!(trimmed.chars().count(), OPENAI_SPEECH_INPUT_LIMIT);
         assert!(trimmed.chars().all(|ch| ch == 'a'));
+    }
+
+    #[test]
+    fn infographic_explanation_accepts_data_image_and_rejects_blob_urls() {
+        assert_eq!(
+            normalize_image_src(" data:image/png;base64,abcdef ").unwrap(),
+            "data:image/png;base64,abcdef"
+        );
+        assert_eq!(
+            normalize_image_src("https://example.com/diagram.png").unwrap(),
+            "https://example.com/diagram.png"
+        );
+        assert!(normalize_image_src("blob:http://local/diagram").is_err());
     }
 }

@@ -6,7 +6,7 @@ import {
   MiniMap,
   ReactFlow,
   type Edge,
-  type Node,
+  type Node as ReactFlowNode,
   type NodeMouseHandler,
   useEdgesState,
   useNodesState,
@@ -27,11 +27,14 @@ import {
   Lock,
   LogOut,
   Map as MapIcon,
+  Maximize2,
   Mic,
   Play,
+  RotateCcw,
   Search,
   Sparkles,
   Square,
+  TriangleAlert,
   Unlock,
   Volume2,
   Waves,
@@ -50,6 +53,11 @@ import {
   storeAuth,
 } from "@/lib/auth";
 import {
+  isPointerNearPageTurnEdge,
+  normalizeSelectedBookText,
+  selectedTextInfographicPrompt,
+} from "@/lib/book-selection";
+import {
   type LessonStartPayload,
   type MemoryGraphNodeRecord,
   type PrimerLesson,
@@ -60,9 +68,11 @@ import {
   type StudentMemory,
   type StudentMemoryGraph,
   buildLessonStartBody,
+  defaultBookPageIndex,
   emptyStagegateResult,
   firstTopicHint,
   initialLesson,
+  isBookContentEntry,
   mergeMemoryGraph,
   normalizeBookState,
   normalizeLesson,
@@ -70,6 +80,7 @@ import {
   normalizeMemories,
   normalizeStagegateResult,
   stagesForStagegate,
+  staticBookPageCount,
 } from "@/lib/primer-flow";
 import {
   type ComponentType,
@@ -91,6 +102,8 @@ type PageFlipApi = {
   flipNext: (corner?: FlipCorner) => void;
   flipPrev: (corner?: FlipCorner) => void;
   flip: (page: number, corner?: FlipCorner) => void;
+  turnToPage?: (page: number) => void;
+  update?: () => void;
   getPageCount: () => number;
   getCurrentPageIndex: () => number;
 };
@@ -114,6 +127,27 @@ type InfographicArtifact = {
   model?: string;
 };
 
+type SelectionInfographic = {
+  artifact: InfographicArtifact;
+  id: string;
+  pageIndex: number;
+  sourceText: string;
+  topic: string;
+};
+
+type SelectedTextAction = {
+  pageIndex: number;
+  text: string;
+  x: number;
+  y: number;
+};
+
+type EnlargedInfographic = {
+  alt: string;
+  src: string;
+  title?: string;
+};
+
 type NarrationPayload = {
   aiMode?: string;
   generated?: boolean;
@@ -123,6 +157,27 @@ type NarrationPayload = {
   message?: string;
   model?: string;
   voice?: string;
+};
+
+type InfographicExplanationPayload = {
+  aiMode?: string;
+  error?: string;
+  explanation?: string;
+  generated?: boolean;
+  keyObservations?: string[];
+  message?: string;
+  model?: string;
+  speech?: NarrationPayload | null;
+  speechGenerated?: boolean;
+  speechModel?: string;
+  spokenExplanation?: string;
+  voice?: string;
+};
+
+type ResetStudentPayload = {
+  error?: string;
+  student?: AuthenticatedStudent | null;
+  studentId?: string;
 };
 
 type MemoryNodeData = Record<string, unknown> & {
@@ -141,27 +196,53 @@ type MemoryEdgeData = Record<string, unknown> & {
   confidence: number;
 };
 
-type MemoryFlowNode = Node<MemoryNodeData>;
+type MemoryFlowNode = ReactFlowNode<MemoryNodeData>;
 type MemoryFlowEdge = Edge<MemoryEdgeData>;
 
 type BookPageProps = {
   children: ReactNode;
   density?: "hard" | "soft";
+  inlineInfographics?: SelectionInfographic[];
+  onLayoutChange?: () => void;
+  onOpenInfographic?: (image: EnlargedInfographic) => void;
+  pageIndex: number;
   pageNumber?: number;
   tone?: "cover" | "paper" | "deep";
 };
 
 const BookPage = forwardRef<HTMLDivElement, BookPageProps>(
-  ({ children, density = "soft", pageNumber, tone = "paper" }, ref) => {
+  (
+    {
+      children,
+      density = "soft",
+      inlineInfographics = [],
+      onLayoutChange,
+      onOpenInfographic,
+      pageIndex,
+      pageNumber,
+      tone = "paper",
+    },
+    ref,
+  ) => {
     return (
       <section
         ref={ref}
         data-density={density}
+        data-primer-page-index={pageIndex}
+        onMouseDownCapture={guardPageFlipGesture}
+        onTouchStartCapture={guardPageFlipGesture}
         className={`primer-page primer-page-${tone}`}
       >
         <div className="primer-page-grain" />
         <div className="relative z-10 flex h-full flex-col overflow-hidden px-7 py-7 sm:px-8 sm:py-8">
-          {children}
+          <div className="min-h-0 flex-1 overflow-hidden">{children}</div>
+          {inlineInfographics.length > 0 ? (
+            <InlineSelectionInfographics
+              infographics={inlineInfographics}
+              onLayoutChange={onLayoutChange}
+              onOpenInfographic={onOpenInfographic}
+            />
+          ) : null}
           {typeof pageNumber === "number" ? (
             <div className="mt-auto flex items-center justify-between border-t border-stone-300/70 pt-3 text-[11px] uppercase text-stone-500">
               <span>Primer</span>
@@ -179,6 +260,30 @@ BookPage.displayName = "BookPage";
 type PageFlipGestureEvent =
   | ReactMouseEvent<HTMLElement>
   | ReactTouchEvent<HTMLElement>;
+
+function gestureClientX(event: PageFlipGestureEvent): number | null {
+  if ("touches" in event) {
+    return event.touches[0]?.clientX ?? event.changedTouches[0]?.clientX ?? null;
+  }
+
+  return event.clientX;
+}
+
+function guardPageFlipGesture(event: PageFlipGestureEvent) {
+  const clientX = gestureClientX(event);
+  const bookBlock = event.currentTarget
+    .closest(".primer-book-shell")
+    ?.querySelector(".stf__block");
+
+  if (!bookBlock || clientX === null) {
+    event.stopPropagation();
+    return;
+  }
+
+  if (!isPointerNearPageTurnEdge(clientX, bookBlock.getBoundingClientRect())) {
+    event.stopPropagation();
+  }
+}
 
 function stopPageFlipGesture(event: PageFlipGestureEvent) {
   event.stopPropagation();
@@ -225,6 +330,21 @@ async function fetchStudentBookState(
   return normalizeBookState(payload.book);
 }
 
+async function resetStudentRecord(
+  learner: AuthenticatedStudent,
+  session: AuthSession | null,
+): Promise<ResetStudentPayload> {
+  const response = await fetch(
+    `${apiBaseUrl}/api/students/${encodeURIComponent(learner.studentId)}/reset`,
+    {
+      method: "POST",
+      headers: authHeaders(session),
+    },
+  );
+
+  return (await response.json()) as ResetStudentPayload;
+}
+
 async function fetchStudentMemoryGraph(
   learner: AuthenticatedStudent,
   session: AuthSession | null,
@@ -249,8 +369,13 @@ async function fetchStudentMemoryGraph(
 
 export function PrimerBook() {
   const bookRef = useRef<FlipBookRef | null>(null);
+  const bookShellRef = useRef<HTMLDivElement | null>(null);
   const narrationAudioRef = useRef<HTMLAudioElement | null>(null);
   const bootstrappedStudentIdRef = useRef<string | null>(null);
+  const infographicExplanationRequestIdRef = useRef(0);
+  const layoutRefreshTimerRef = useRef<number[]>([]);
+  const pendingBookEndPageRef = useRef<number | null>(null);
+  const selectionCaptureTimerRef = useRef<number | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [authenticatedStudent, setAuthenticatedStudent] =
     useState<AuthenticatedStudent | null>(null);
@@ -266,6 +391,9 @@ export function PrimerBook() {
     null,
   );
   const [isMemoryOpen, setIsMemoryOpen] = useState(false);
+  const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
+  const [isResettingStudent, setIsResettingStudent] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
   const [memoryGraphStatus, setMemoryGraphStatus] = useState(
     "Memory graph not loaded.",
   );
@@ -283,8 +411,27 @@ export function PrimerBook() {
   );
   const [infographicArtifact, setInfographicArtifact] =
     useState<InfographicArtifact | null>(null);
+  const [selectionInfographics, setSelectionInfographics] = useState<
+    SelectionInfographic[]
+  >([]);
+  const [selectedTextAction, setSelectedTextAction] =
+    useState<SelectedTextAction | null>(null);
+  const [isSelectionInfographicLoading, setIsSelectionInfographicLoading] =
+    useState(false);
+  const [enlargedInfographic, setEnlargedInfographic] =
+    useState<EnlargedInfographic | null>(null);
+  const [infographicExplanation, setInfographicExplanation] =
+    useState<InfographicExplanationPayload | null>(null);
+  const [isInfographicExplanationLoading, setIsInfographicExplanationLoading] =
+    useState(false);
+  const [isInfographicExplanationPlaying, setIsInfographicExplanationPlaying] =
+    useState(false);
+  const [infographicExplanationStatus, setInfographicExplanationStatus] =
+    useState("Ready to explain the enlarged diagram.");
   const [stagegateResult, setStagegateResult] =
     useState<StagegateResult>(emptyStagegateResult);
+  const [isStagegateSubmitting, setIsStagegateSubmitting] = useState(false);
+  const [isStartingNextLesson, setIsStartingNextLesson] = useState(false);
   const [answer, setAnswer] = useState("");
   const [isNarrating, setIsNarrating] = useState(false);
   const [isNarrationLoading, setIsNarrationLoading] = useState(false);
@@ -293,11 +440,18 @@ export function PrimerBook() {
   );
 
   const hydratePersistedBook = useCallback(
-    (book: StudentBookState | null, learner: AuthenticatedStudent) => {
+    (
+      book: StudentBookState | null,
+      learner: AuthenticatedStudent,
+      options?: { turnToEnd?: boolean },
+    ) => {
       if (!book) {
         return false;
       }
 
+      if (options?.turnToEnd && book.entries.length > 0) {
+        pendingBookEndPageRef.current = defaultBookPageIndex(book.entries);
+      }
       setBookEntries(book.entries);
 
       if (book.activeLesson) {
@@ -387,7 +541,11 @@ export function PrimerBook() {
     setHasAsked(true);
     setHasGeneratedInfographic(false);
     setHasPassedStagegate(false);
+    setIsStagegateSubmitting(false);
+    setIsStartingNextLesson(false);
     setInfographicArtifact(null);
+    setSelectionInfographics([]);
+    setSelectedTextAction(null);
     setStagegateResult(emptyStagegateResult);
     setAnswer("");
     setBookEntries([]);
@@ -399,7 +557,7 @@ export function PrimerBook() {
           return null;
         }
 
-        if (hydratePersistedBook(savedBook, learner)) {
+        if (hydratePersistedBook(savedBook, learner, { turnToEnd: true })) {
           setLessonStatus("Restored the saved Primer book from the database.");
           return null;
         }
@@ -426,7 +584,9 @@ export function PrimerBook() {
         );
         setLesson(normalizedLesson);
         setTopic(normalizedLesson.topic);
-        hydratePersistedBook(normalizeBookState(payload.book), learner);
+        hydratePersistedBook(normalizeBookState(payload.book), learner, {
+          turnToEnd: true,
+        });
         setLessonStatus(
           normalizedLesson.aiMode === "openai_responses"
             ? "Opening path generated by OpenAI Responses."
@@ -451,6 +611,13 @@ export function PrimerBook() {
 
   useEffect(() => {
     return () => {
+      for (const timer of layoutRefreshTimerRef.current) {
+        window.clearTimeout(timer);
+      }
+      layoutRefreshTimerRef.current = [];
+      if (selectionCaptureTimerRef.current !== null) {
+        window.clearTimeout(selectionCaptureTimerRef.current);
+      }
       const audio = narrationAudioRef.current;
       if (audio) {
         audio.pause();
@@ -459,6 +626,25 @@ export function PrimerBook() {
       narrationAudioRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    if (!isInfographicExplanationLoading) {
+      return;
+    }
+
+    const messages = [
+      "Reading the diagram with GPT-5.5 vision...",
+      "Writing a learner-friendly explanation...",
+      "Generating fable voice narration...",
+    ];
+    let index = 0;
+    const timer = window.setInterval(() => {
+      index = (index + 1) % messages.length;
+      setInfographicExplanationStatus(messages[index]);
+    }, 1800);
+
+    return () => window.clearInterval(timer);
+  }, [isInfographicExplanationLoading]);
 
   async function loadMemoryGraph(nodeId?: string) {
     if (!authenticatedStudent) {
@@ -523,7 +709,55 @@ export function PrimerBook() {
     return stagesForStagegate(hasPassedStagegate);
   }, [hasPassedStagegate]);
 
-  const pageCount = 10 + bookEntries.length;
+  const contentBookEntries = useMemo(
+    () => bookEntries.filter(isBookContentEntry),
+    [bookEntries],
+  );
+  const selectionInfographicsByPage = useMemo(() => {
+    const byPage = new Map<number, SelectionInfographic[]>();
+    for (const infographic of selectionInfographics) {
+      const pageInfographics = byPage.get(infographic.pageIndex) ?? [];
+      pageInfographics.push(infographic);
+      byPage.set(infographic.pageIndex, pageInfographics);
+    }
+    return byPage;
+  }, [selectionInfographics]);
+  const pageCount = staticBookPageCount + contentBookEntries.length;
+
+  useEffect(() => {
+    const targetPage = pendingBookEndPageRef.current;
+    if (targetPage === null || !authenticatedStudent) {
+      return;
+    }
+
+    const clampedPage = Math.max(0, Math.min(targetPage, pageCount - 1));
+    const timers: number[] = [];
+
+    function turnWhenReady(attemptsLeft: number) {
+      const pageFlip = bookRef.current?.pageFlip();
+      const availablePageCount = pageFlip?.getPageCount() ?? pageCount;
+      if (pageFlip && availablePageCount > clampedPage) {
+        pendingBookEndPageRef.current = null;
+        pageFlip.flip(clampedPage, "bottom");
+        setCurrentPage(clampedPage);
+        return;
+      }
+
+      if (attemptsLeft > 0) {
+        timers.push(
+          window.setTimeout(() => turnWhenReady(attemptsLeft - 1), 80),
+        );
+      }
+    }
+
+    timers.push(window.setTimeout(() => turnWhenReady(6), 0));
+
+    return () => {
+      for (const timer of timers) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [authenticatedStudent, contentBookEntries.length, pageCount]);
 
   function flipNext() {
     bookRef.current?.pageFlip()?.flipNext("bottom");
@@ -537,15 +771,174 @@ export function PrimerBook() {
     bookRef.current?.pageFlip()?.flip(page, "bottom");
   }
 
+  function clearBookLayoutRefreshTimers() {
+    for (const timer of layoutRefreshTimerRef.current) {
+      window.clearTimeout(timer);
+    }
+    layoutRefreshTimerRef.current = [];
+  }
+
+  function refreshBookLayout(targetPage?: number) {
+    const pageFlip = bookRef.current?.pageFlip();
+    if (!pageFlip) {
+      return;
+    }
+
+    pageFlip.update?.();
+
+    if (typeof targetPage !== "number") {
+      return;
+    }
+
+    const pageCount = pageFlip.getPageCount();
+    if (pageCount <= 0) {
+      return;
+    }
+
+    const clampedPage = Math.max(0, Math.min(targetPage, pageCount - 1));
+    pageFlip.turnToPage?.(clampedPage);
+    setCurrentPage(clampedPage);
+  }
+
+  function scheduleBookLayoutRefresh(targetPage?: number) {
+    clearBookLayoutRefreshTimers();
+    layoutRefreshTimerRef.current = [0, 80, 240].map((delay) =>
+      window.setTimeout(() => refreshBookLayout(targetPage), delay),
+    );
+  }
+
+  function inlineInfographicsForPage(pageIndex: number) {
+    return selectionInfographicsByPage.get(pageIndex) ?? [];
+  }
+
+  function openInfographicImage(image: EnlargedInfographic) {
+    infographicExplanationRequestIdRef.current += 1;
+    setEnlargedInfographic(image);
+    setInfographicExplanation(null);
+    setIsInfographicExplanationLoading(false);
+    setIsInfographicExplanationPlaying(false);
+    setInfographicExplanationStatus("Ready to explain the enlarged diagram.");
+  }
+
+  function scheduleSelectionCapture() {
+    if (selectionCaptureTimerRef.current !== null) {
+      window.clearTimeout(selectionCaptureTimerRef.current);
+    }
+
+    selectionCaptureTimerRef.current = window.setTimeout(() => {
+      selectionCaptureTimerRef.current = null;
+      captureSelectedBookText();
+    }, 0);
+  }
+
+  function captureSelectedBookText() {
+    const shell = bookShellRef.current;
+    const selection = window.getSelection();
+    if (!shell || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      setSelectedTextAction(null);
+      return;
+    }
+
+    const range = selection.getRangeAt(0);
+    const selectionRoot = elementFromNode(range.commonAncestorContainer);
+    if (!selectionRoot || !shell.contains(selectionRoot)) {
+      setSelectedTextAction(null);
+      return;
+    }
+
+    const text = normalizeSelectedBookText(selection.toString());
+    const bounds = firstRangeBounds(range);
+    if (!text || !bounds) {
+      setSelectedTextAction(null);
+      return;
+    }
+
+    const position = popupPositionForBounds(bounds);
+    setSelectedTextAction({
+      pageIndex: pageIndexFromRange(range) ?? currentPage,
+      text,
+      x: position.x,
+      y: position.y,
+    });
+  }
+
+  async function generateInfographicForSelection() {
+    if (!authenticatedStudent || !selectedTextAction) {
+      return;
+    }
+
+    const action = selectedTextAction;
+    setIsSelectionInfographicLoading(true);
+    setInfographicStatus("Calling gpt-image-2 for the selected passage...");
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/artifact/infographic`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders(session) },
+        body: JSON.stringify({
+          studentId: authenticatedStudent.studentId,
+          topic: lesson.topic,
+          lessonSummary: action.text,
+          infographicPrompt: selectedTextInfographicPrompt(
+            action.text,
+            lesson.topic,
+          ),
+          size: "1024x1024",
+        }),
+      });
+      const payload = await response.json();
+      const artifact = payload.artifact as InfographicArtifact | undefined;
+      if (!artifact) {
+        setInfographicStatus(
+          payload.error ?? "The selected passage could not be illustrated yet.",
+        );
+        return;
+      }
+
+      setInfographicArtifact(artifact);
+      setHasGeneratedInfographic(Boolean(artifact.generated));
+      setSelectionInfographics((currentInfographics) => [
+        ...currentInfographics,
+        {
+          artifact,
+          id: `selection-${Date.now()}-${currentInfographics.length}`,
+          pageIndex: action.pageIndex,
+          sourceText: action.text,
+          topic: lesson.topic,
+        },
+      ]);
+      hydratePersistedBook(normalizeBookState(payload.book), authenticatedStudent);
+      scheduleBookLayoutRefresh(action.pageIndex);
+      setSelectedTextAction(null);
+      window.getSelection()?.removeAllRanges();
+      setInfographicStatus(
+        artifact.generated
+          ? `Selected passage illustrated with ${
+              artifact.model ?? "gpt-image-2"
+            }.`
+          : (artifact.message ??
+              "Set OPENAI_API_KEY in backend/.env to generate an image."),
+      );
+    } catch (error) {
+      setInfographicStatus(
+        `Could not generate an infographic for the selection: ${String(error)}`,
+      );
+    } finally {
+      setIsSelectionInfographicLoading(false);
+    }
+  }
+
   function clearNarrationAudio() {
     const audio = narrationAudioRef.current;
     if (!audio) {
+      setIsInfographicExplanationPlaying(false);
       return;
     }
 
     audio.pause();
     audio.src = "";
     narrationAudioRef.current = null;
+    setIsInfographicExplanationPlaying(false);
   }
 
   function stopNarration(message = "Narration stopped.") {
@@ -642,20 +1035,147 @@ export function PrimerBook() {
     }
   }
 
-  async function startTopic(nextTopic = topic) {
+  async function explainEnlargedInfographic() {
+    if (!authenticatedStudent || !enlargedInfographic) {
+      return;
+    }
+
+    if (isInfographicExplanationLoading) {
+      return;
+    }
+
+    if (isInfographicExplanationPlaying || narrationAudioRef.current) {
+      clearNarrationAudio();
+      setIsNarrating(false);
+      setInfographicExplanationStatus("Diagram narration stopped.");
+      return;
+    }
+
+    setIsInfographicExplanationLoading(true);
+    setInfographicExplanation(null);
+    setInfographicExplanationStatus("Reading the diagram with GPT-5.5 vision...");
+    const requestId = infographicExplanationRequestIdRef.current + 1;
+    infographicExplanationRequestIdRef.current = requestId;
+
+    try {
+      const response = await fetch(
+        `${apiBaseUrl}/api/artifact/infographic/explain`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders(session) },
+          body: JSON.stringify({
+            studentId: authenticatedStudent.studentId,
+            topic: enlargedInfographic.title ?? lesson.topic,
+            imageSrc: enlargedInfographic.src,
+            title: enlargedInfographic.title,
+            alt: enlargedInfographic.alt,
+            prompt: lesson.infographicPrompt,
+          }),
+        },
+      );
+      const payload = await response.json();
+      const explanation = payload.explanation as
+        | InfographicExplanationPayload
+        | undefined;
+
+      if (infographicExplanationRequestIdRef.current !== requestId) {
+        return;
+      }
+
+      if (!explanation?.generated) {
+        setInfographicExplanation(explanation ?? null);
+        setInfographicExplanationStatus(
+          explanation?.message ??
+            explanation?.error ??
+            payload.error ??
+            "The diagram explanation could not be generated yet.",
+        );
+        return;
+      }
+
+      setInfographicExplanation(explanation);
+      const audioDataUrl = explanation.speech?.audioDataUrl;
+      if (!explanation.speechGenerated || !audioDataUrl) {
+        setInfographicExplanationStatus(
+          explanation.speech?.message ??
+            explanation.speech?.error ??
+            "GPT-5.5 explained the diagram, but TTS was unavailable.",
+        );
+        return;
+      }
+
+      const audio = new Audio(audioDataUrl);
+      narrationAudioRef.current = audio;
+      audio.onended = () => {
+        narrationAudioRef.current = null;
+        setIsInfographicExplanationPlaying(false);
+        setInfographicExplanationStatus(
+          `Diagram explained with ${explanation.model ?? "GPT-5.5"} and ${
+            explanation.voice ?? explanation.speech?.voice ?? "fable"
+          } voice.`,
+        );
+      };
+      audio.onerror = () => {
+        narrationAudioRef.current = null;
+        setIsInfographicExplanationPlaying(false);
+        setInfographicExplanationStatus("Could not play the diagram narration.");
+      };
+
+      setIsNarrating(false);
+      setIsInfographicExplanationPlaying(true);
+      setInfographicExplanationStatus(
+        `Playing diagram explanation with ${
+          explanation.voice ?? explanation.speech?.voice ?? "fable"
+        } voice.`,
+      );
+      await audio.play();
+    } catch (error) {
+      if (infographicExplanationRequestIdRef.current !== requestId) {
+        return;
+      }
+      clearNarrationAudio();
+      setIsNarrating(false);
+      setInfographicExplanationStatus(
+        `Could not explain this diagram: ${String(error)}`,
+      );
+    } finally {
+      if (infographicExplanationRequestIdRef.current === requestId) {
+        setIsInfographicExplanationLoading(false);
+      }
+    }
+  }
+
+  async function startTopic(
+    nextTopic = topic,
+    options?: { keepStagegateVisibleUntilLoaded?: boolean },
+  ) {
     if (!authenticatedStudent) {
       return;
     }
 
     const cleanTopic = nextTopic.trim();
+    const keepStagegateVisible =
+      options?.keepStagegateVisibleUntilLoaded ?? false;
 
     stopNarration("OpenAI narration is ready.");
+    infographicExplanationRequestIdRef.current += 1;
     setTopic(cleanTopic);
     setLessonStatus("Asking OpenAI Responses to guide this path...");
     setHasAsked(true);
     setHasGeneratedInfographic(false);
     setInfographicArtifact(null);
-    setHasPassedStagegate(false);
+    setSelectionInfographics([]);
+    setSelectedTextAction(null);
+    setInfographicExplanation(null);
+    setIsInfographicExplanationLoading(false);
+    setIsInfographicExplanationPlaying(false);
+    setInfographicExplanationStatus("Ready to explain the enlarged diagram.");
+    setIsStagegateSubmitting(false);
+    if (!keepStagegateVisible) {
+      setHasPassedStagegate(false);
+      setStagegateResult(emptyStagegateResult);
+      setAnswer("");
+    }
 
     try {
       const payload = await requestLessonStart(
@@ -678,6 +1198,9 @@ export function PrimerBook() {
         payload.lesson,
         cleanTopic || firstTopicHint(authenticatedStudent),
       );
+      setHasPassedStagegate(false);
+      setStagegateResult(emptyStagegateResult);
+      setAnswer("");
       setLesson(normalizedLesson);
       setTopic(normalizedLesson.topic);
       setRemoteMemories(normalizeMemories(payload.student?.memories));
@@ -693,6 +1216,19 @@ export function PrimerBook() {
       goToPage(4);
     } catch (error) {
       setLessonStatus(`Could not reach backend: ${String(error)}`);
+    }
+  }
+
+  async function startNextLesson() {
+    if (isStartingNextLesson) {
+      return;
+    }
+
+    setIsStartingNextLesson(true);
+    try {
+      await startTopic(lesson.topic, { keepStagegateVisibleUntilLoaded: true });
+    } finally {
+      setIsStartingNextLesson(false);
     }
   }
 
@@ -719,6 +1255,7 @@ export function PrimerBook() {
       setInfographicArtifact(payload.artifact);
       setHasGeneratedInfographic(Boolean(payload.artifact?.generated));
       hydratePersistedBook(normalizeBookState(payload.book), authenticatedStudent);
+      scheduleBookLayoutRefresh();
       setInfographicStatus(
         payload.artifact?.generated
           ? `Generated with ${payload.artifact.model ?? "gpt-image-2"}.`
@@ -730,10 +1267,14 @@ export function PrimerBook() {
     }
   }
 
-  async function submitStagegate() {
-    if (!authenticatedStudent) {
+  async function submitStagegate(nextAnswer = answer) {
+    if (!authenticatedStudent || isStagegateSubmitting) {
       return;
     }
+
+    setAnswer(nextAnswer);
+    setIsStagegateSubmitting(true);
+    let shouldTurnToUnlock = false;
 
     try {
       const response = await fetch(`${apiBaseUrl}/api/tutor/stagegate`, {
@@ -742,7 +1283,7 @@ export function PrimerBook() {
         body: JSON.stringify({
           studentId: authenticatedStudent.studentId,
           topic: lesson.topic,
-          answer,
+          answer: nextAnswer,
           stageLevel: lesson.stageLevel,
         }),
       });
@@ -769,14 +1310,15 @@ export function PrimerBook() {
         if (isMemoryOpen) {
           void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
         }
-        window.setTimeout(flipNext, 250);
         return;
       }
 
-      setStagegateResult(normalizeStagegateResult(payload.result));
+      const normalizedResult = normalizeStagegateResult(payload.result);
+      setStagegateResult(normalizedResult);
       setRemoteMemories(normalizeMemories(payload.student?.memories));
-      setHasPassedStagegate(Boolean(payload.result?.passed));
+      setHasPassedStagegate(normalizedResult.passed);
       hydratePersistedBook(normalizeBookState(payload.book), authenticatedStudent);
+      shouldTurnToUnlock = normalizedResult.passed;
       if (isMemoryOpen) {
         void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
       }
@@ -796,9 +1338,117 @@ export function PrimerBook() {
         gaps: ["The backend stagegate assessor was unavailable."],
         feedbackToStudent: `Could not reach backend: ${String(error)}`,
       });
+    } finally {
+      setIsStagegateSubmitting(false);
     }
 
-    window.setTimeout(flipNext, 250);
+    if (shouldTurnToUnlock) {
+      window.setTimeout(flipNext, 250);
+    }
+  }
+
+  async function handleResetStudentRecord() {
+    if (!authenticatedStudent || isResettingStudent) {
+      return;
+    }
+
+    const learnerToReset = authenticatedStudent;
+    const currentSession = session;
+    setIsResettingStudent(true);
+    setResetError(null);
+    stopNarration("OpenAI narration is ready.");
+    infographicExplanationRequestIdRef.current += 1;
+    setLessonStatus("Resetting this student record...");
+
+    try {
+      const resetPayload = await resetStudentRecord(
+        learnerToReset,
+        currentSession,
+      );
+      if (resetPayload.error || !resetPayload.student) {
+        const message =
+          resetPayload.error ?? "The student record could not be reset.";
+        setResetError(message);
+        setLessonStatus(message);
+        return;
+      }
+
+      const resetStudent = resetPayload.student;
+      bootstrappedStudentIdRef.current = resetStudent.studentId;
+      pendingBookEndPageRef.current = null;
+      storeAuth({ student: resetStudent, session: currentSession });
+      setAuthenticatedStudent(resetStudent);
+      setSession(currentSession);
+      setRemoteMemories(normalizeMemories(resetStudent.memories));
+      setMemoryGraph(null);
+      setIsMemoryOpen(false);
+      setMemoryGraphStatus("Memory graph not loaded.");
+      setSelectedMemoryNodeId(null);
+      setCurrentPage(0);
+      setTopic(resetStudent.interests[0] ?? "");
+      setLesson(initialLesson);
+      setBookEntries([]);
+      setHasAsked(true);
+      setHasGeneratedInfographic(false);
+      setHasPassedStagegate(false);
+      setIsStagegateSubmitting(false);
+      setIsStartingNextLesson(false);
+      setInfographicArtifact(null);
+      setSelectionInfographics([]);
+      setSelectedTextAction(null);
+      setIsSelectionInfographicLoading(false);
+      setEnlargedInfographic(null);
+      setInfographicExplanation(null);
+      setIsInfographicExplanationLoading(false);
+      setIsInfographicExplanationPlaying(false);
+      setInfographicExplanationStatus("Ready to explain the enlarged diagram.");
+      setStagegateResult(emptyStagegateResult);
+      setAnswer("");
+      setInfographicStatus("No generated infographic yet.");
+      setLessonStatus(
+        "Student record reset. Generating a fresh opening path...",
+      );
+      setIsResetDialogOpen(false);
+      goToPage(0);
+
+      const lessonPayload = await requestLessonStart(
+        resetStudent,
+        currentSession,
+      );
+      setRemoteMemories(normalizeMemories(lessonPayload.student?.memories));
+      if (lessonPayload.student) {
+        storeAuth({ student: lessonPayload.student, session: currentSession });
+        setAuthenticatedStudent(lessonPayload.student);
+      }
+      if (lessonPayload.error || !lessonPayload.lesson) {
+        setLessonStatus(
+          lessonPayload.error ??
+            "The fresh opening lesson could not be generated yet.",
+        );
+        return;
+      }
+
+      const normalizedLesson = normalizeLesson(
+        lessonPayload.lesson,
+        firstTopicHint(resetStudent),
+      );
+      setLesson(normalizedLesson);
+      setTopic(normalizedLesson.topic);
+      hydratePersistedBook(normalizeBookState(lessonPayload.book), resetStudent, {
+        turnToEnd: true,
+      });
+      setLessonStatus(
+        normalizedLesson.aiMode === "openai_responses"
+          ? "Fresh opening path generated by OpenAI Responses."
+          : "Fresh opening path generated from the student profile.",
+      );
+    } catch (error) {
+      const message = `Could not reset the student record: ${String(error)}`;
+      setResetError(message);
+      setLessonStatus(message);
+    } finally {
+      setIsResettingStudent(false);
+    }
   }
 
   function handleAuthenticated(payload: AuthPayload) {
@@ -826,12 +1476,16 @@ export function PrimerBook() {
   function handleLogout() {
     clearStoredAuth();
     stopNarration("OpenAI narration is ready.");
+    infographicExplanationRequestIdRef.current += 1;
     bootstrappedStudentIdRef.current = null;
     setAuthenticatedStudent(null);
     setSession(null);
     setRemoteMemories(null);
     setMemoryGraph(null);
     setIsMemoryOpen(false);
+    setIsResetDialogOpen(false);
+    setIsResettingStudent(false);
+    setResetError(null);
     setMemoryGraphStatus("Memory graph not loaded.");
     setSelectedMemoryNodeId(null);
     setCurrentPage(0);
@@ -841,7 +1495,17 @@ export function PrimerBook() {
     setHasAsked(false);
     setHasGeneratedInfographic(false);
     setHasPassedStagegate(false);
+    setIsStagegateSubmitting(false);
+    setIsStartingNextLesson(false);
     setInfographicArtifact(null);
+    setSelectionInfographics([]);
+    setSelectedTextAction(null);
+    setIsSelectionInfographicLoading(false);
+    setEnlargedInfographic(null);
+    setInfographicExplanation(null);
+    setIsInfographicExplanationLoading(false);
+    setIsInfographicExplanationPlaying(false);
+    setInfographicExplanationStatus("Ready to explain the enlarged diagram.");
     setStagegateResult(emptyStagegateResult);
     setAnswer("");
     setLessonStatus("A starting point will be chosen from the student profile.");
@@ -886,6 +1550,18 @@ export function PrimerBook() {
           </button>
           <button
             type="button"
+            onClick={() => {
+              setResetError(null);
+              setIsResetDialogOpen(true);
+            }}
+            disabled={isResettingStudent}
+            className="inline-flex h-10 items-center gap-2 rounded-full border border-amber-200/20 bg-black/28 px-3 text-sm text-amber-50/82 shadow-2xl shadow-black/20 transition hover:text-amber-50 disabled:cursor-wait disabled:opacity-60"
+          >
+            <RotateCcw className="h-4 w-4" />
+            Reset
+          </button>
+          <button
+            type="button"
             onClick={handleLogout}
             className="inline-flex h-10 items-center gap-2 rounded-full border border-cyan-100/15 bg-black/28 px-3 text-sm text-cyan-50/78 shadow-2xl shadow-black/20 transition hover:text-cyan-50"
           >
@@ -894,7 +1570,13 @@ export function PrimerBook() {
           </button>
         </div>
 
-        <div className="primer-book-shell relative">
+        <div
+          ref={bookShellRef}
+          className="primer-book-shell relative"
+          onKeyUpCapture={scheduleSelectionCapture}
+          onMouseUpCapture={scheduleSelectionCapture}
+          onTouchEndCapture={scheduleSelectionCapture}
+        >
           <div className="absolute inset-x-8 top-1/2 h-10 -translate-y-1/2 rounded-full bg-black/35 blur-3xl" />
           <HTMLFlipBook
             ref={bookRef}
@@ -925,19 +1607,44 @@ export function PrimerBook() {
               setCurrentPage(Number(event.data))
             }
           >
-                <BookPage density="hard" tone="cover">
+                <BookPage
+                  density="hard"
+                  inlineInfographics={inlineInfographicsForPage(0)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(0)}
+                  onOpenInfographic={openInfographicImage}
+                  pageIndex={0}
+                  tone="cover"
+                >
                   <CoverPage learner={learner} lesson={lesson} />
                 </BookPage>
 
-                <BookPage pageNumber={1}>
+                <BookPage
+                  inlineInfographics={inlineInfographicsForPage(1)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(1)}
+                  onOpenInfographic={openInfographicImage}
+                  pageIndex={1}
+                  pageNumber={1}
+                >
                   <WelcomePage learner={learner} memories={visibleMemories} />
                 </BookPage>
 
-                <BookPage pageNumber={2}>
+                <BookPage
+                  inlineInfographics={inlineInfographicsForPage(2)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(2)}
+                  onOpenInfographic={openInfographicImage}
+                  pageIndex={2}
+                  pageNumber={2}
+                >
                   <StageMapPage stages={visibleStages} />
                 </BookPage>
 
-                <BookPage pageNumber={3}>
+                <BookPage
+                  inlineInfographics={inlineInfographicsForPage(3)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(3)}
+                  onOpenInfographic={openInfographicImage}
+                  pageIndex={3}
+                  pageNumber={3}
+                >
                   <AskPage
                     hasAsked={hasAsked}
                     lessonStatus={lessonStatus}
@@ -948,21 +1655,41 @@ export function PrimerBook() {
                   />
                 </BookPage>
 
-                <BookPage pageNumber={4}>
+                <BookPage
+                  inlineInfographics={inlineInfographicsForPage(4)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(4)}
+                  onOpenInfographic={openInfographicImage}
+                  pageIndex={4}
+                  pageNumber={4}
+                >
                   <StoryPage lesson={lesson} />
                 </BookPage>
 
-                <BookPage pageNumber={5}>
+                <BookPage
+                  inlineInfographics={inlineInfographicsForPage(5)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(5)}
+                  onOpenInfographic={openInfographicImage}
+                  pageIndex={5}
+                  pageNumber={5}
+                >
                   <InfographicPage
                     artifact={infographicArtifact}
                     infographicStatus={infographicStatus}
                     lesson={lesson}
                     hasGeneratedInfographic={hasGeneratedInfographic}
                     onGenerate={() => void generateInfographic()}
+                    onImageLoad={() => scheduleBookLayoutRefresh()}
+                    onOpenInfographic={openInfographicImage}
                   />
                 </BookPage>
 
-                <BookPage pageNumber={6}>
+                <BookPage
+                  inlineInfographics={inlineInfographicsForPage(6)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(6)}
+                  onOpenInfographic={openInfographicImage}
+                  pageIndex={6}
+                  pageNumber={6}
+                >
                   <VoiceoverPage
                     lesson={lesson}
                     isNarrating={isNarrating}
@@ -972,30 +1699,68 @@ export function PrimerBook() {
                   />
                 </BookPage>
 
-                <BookPage pageNumber={7}>
+                <BookPage
+                  inlineInfographics={inlineInfographicsForPage(7)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(7)}
+                  onOpenInfographic={openInfographicImage}
+                  pageIndex={7}
+                  pageNumber={7}
+                >
                   <FollowUpPage lesson={lesson} />
                 </BookPage>
 
-                <BookPage pageNumber={8}>
+                <BookPage
+                  inlineInfographics={inlineInfographicsForPage(8)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(8)}
+                  onOpenInfographic={openInfographicImage}
+                  pageIndex={8}
+                  pageNumber={8}
+                >
                   <StagegatePage
                     answer={answer}
                     hasPassed={hasPassedStagegate}
+                    isSubmitting={isStagegateSubmitting}
                     lesson={lesson}
-                    onAnswerChange={setAnswer}
-                    onSubmit={submitStagegate}
+                    onSubmit={(nextAnswer) => void submitStagegate(nextAnswer)}
+                    result={stagegateResult}
                   />
                 </BookPage>
 
-                <BookPage density="hard" tone="deep">
+                <BookPage
+                  density="hard"
+                  inlineInfographics={inlineInfographicsForPage(9)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(9)}
+                  onOpenInfographic={openInfographicImage}
+                  pageIndex={9}
+                  tone="deep"
+                >
                   <UnlockPage
                     result={stagegateResult}
                     hasPassed={hasPassedStagegate}
+                    lesson={lesson}
+                    lessonStatus={lessonStatus}
+                    isStartingNextLesson={isStartingNextLesson}
+                    onStartNextLesson={() => void startNextLesson()}
                   />
                 </BookPage>
 
-                {bookEntries.map((entry, index) => (
-                  <BookPage key={entry.entryId} pageNumber={10 + index}>
-                    <SavedBookEntryPage entry={entry} />
+                {contentBookEntries.map((entry, index) => (
+                  <BookPage
+                    key={entry.entryId}
+                    inlineInfographics={inlineInfographicsForPage(
+                      staticBookPageCount + index,
+                    )}
+                    onLayoutChange={() =>
+                      scheduleBookLayoutRefresh(staticBookPageCount + index)
+                    }
+                    onOpenInfographic={openInfographicImage}
+                    pageIndex={staticBookPageCount + index}
+                    pageNumber={staticBookPageCount + index}
+                  >
+                    <SavedBookEntryPage
+                      entry={entry}
+                      onOpenInfographic={openInfographicImage}
+                    />
                   </BookPage>
                 ))}
           </HTMLFlipBook>
@@ -1022,7 +1787,51 @@ export function PrimerBook() {
                 </button>
           </div>
         </div>
+        {selectedTextAction ? (
+          <SelectedTextInfographicPopup
+            action={selectedTextAction}
+            isLoading={isSelectionInfographicLoading}
+            onDismiss={() => {
+              setSelectedTextAction(null);
+              window.getSelection()?.removeAllRanges();
+            }}
+            onGenerate={() => void generateInfographicForSelection()}
+          />
+        ) : null}
       </section>
+      {enlargedInfographic ? (
+        <InfographicLightbox
+          explanation={infographicExplanation}
+          image={enlargedInfographic}
+          isExplanationLoading={isInfographicExplanationLoading}
+          isExplanationPlaying={isInfographicExplanationPlaying}
+          status={infographicExplanationStatus}
+          onClose={() => {
+            infographicExplanationRequestIdRef.current += 1;
+            if (isInfographicExplanationPlaying) {
+              clearNarrationAudio();
+            }
+            setEnlargedInfographic(null);
+            setInfographicExplanation(null);
+            setIsInfographicExplanationLoading(false);
+            setInfographicExplanationStatus("Ready to explain the enlarged diagram.");
+          }}
+          onExplain={() => void explainEnlargedInfographic()}
+        />
+      ) : null}
+      {isResetDialogOpen ? (
+        <ResetStudentDialog
+          error={resetError}
+          isResetting={isResettingStudent}
+          learner={learner}
+          onCancel={() => {
+            if (!isResettingStudent) {
+              setIsResetDialogOpen(false);
+            }
+          }}
+          onConfirm={() => void handleResetStudentRecord()}
+        />
+      ) : null}
       {isMemoryOpen ? (
         <MemoryGraphDialog
           graph={memoryGraph}
@@ -1304,14 +2113,18 @@ function InfographicPage({
   lesson,
   hasGeneratedInfographic,
   onGenerate,
+  onImageLoad,
+  onOpenInfographic,
 }: {
   artifact: InfographicArtifact | null;
   infographicStatus: string;
   lesson: PrimerLesson;
   hasGeneratedInfographic: boolean;
   onGenerate: () => void;
+  onImageLoad: () => void;
+  onOpenInfographic: (image: EnlargedInfographic) => void;
 }) {
-  const imageSrc = artifact?.imageDataUrl ?? artifact?.imageUrl ?? null;
+  const imageSrc = artifactImageSrc(artifact);
 
   return (
     <div className="flex h-full flex-col">
@@ -1331,14 +2144,15 @@ function InfographicPage({
       </h2>
       <p className="mt-1 text-sm text-stone-600">{infographicStatus}</p>
       {imageSrc ? (
-        <div className="mt-4 overflow-hidden rounded-[8px] border border-stone-300 bg-white">
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
-            src={imageSrc}
-            alt={`Generated infographic for ${lesson.topic}`}
-            className="aspect-square w-full object-cover"
-          />
-        </div>
+        <InfographicImageButton
+          alt={`Generated infographic for ${lesson.topic}`}
+          className="mt-4 block overflow-hidden rounded-[8px] border border-stone-300 bg-white"
+          imageClassName="aspect-square w-full object-cover"
+          onImageLoad={onImageLoad}
+          onOpen={onOpenInfographic}
+          src={imageSrc}
+          title={`${lesson.topic} infographic`}
+        />
       ) : (
         <>
           <div className="mt-4 rounded-[8px] border border-stone-300 bg-white/70 p-4">
@@ -1458,12 +2272,6 @@ function FollowUpPage({ lesson }: { lesson: PrimerLesson }) {
       <p className="mt-5 text-lg leading-8 text-stone-800">
         {lesson.analogy}
       </p>
-      <div className="mt-5 rounded-[8px] border border-stone-300 bg-white/60 p-4">
-        <p className="text-xs uppercase text-stone-500">Communication style</p>
-        <p className="mt-2 text-sm leading-6 text-stone-700">
-          {lesson.communicationStyle}
-        </p>
-      </div>
       <div className="mt-7 overflow-hidden rounded-[8px] border border-stone-300 bg-white/64">
         <div className="grid grid-cols-3 border-b border-stone-300 bg-stone-100 text-xs font-semibold uppercase text-stone-500">
           <span className="p-3">Term</span>
@@ -1483,10 +2291,6 @@ function FollowUpPage({ lesson }: { lesson: PrimerLesson }) {
           </div>
         ))}
       </div>
-      <p className="mt-5 text-sm leading-6 text-stone-600">
-        This page uses stored learning preferences without inventing new facts
-        about the learner.
-      </p>
     </div>
   );
 }
@@ -1494,16 +2298,36 @@ function FollowUpPage({ lesson }: { lesson: PrimerLesson }) {
 function StagegatePage({
   answer,
   hasPassed,
+  isSubmitting,
   lesson,
-  onAnswerChange,
   onSubmit,
+  result,
 }: {
   answer: string;
   hasPassed: boolean;
+  isSubmitting: boolean;
   lesson: PrimerLesson;
-  onAnswerChange: (answer: string) => void;
-  onSubmit: () => void;
+  onSubmit: (answer: string) => void;
+  result: StagegateResult;
 }) {
+  const answerInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const hasFeedback =
+    !hasPassed &&
+    !isSubmitting &&
+    result.feedbackToStudent.trim() !== "" &&
+    result.feedbackToStudent !== emptyStagegateResult.feedbackToStudent;
+
+  useEffect(() => {
+    const input = answerInputRef.current;
+    if (input && document.activeElement !== input) {
+      input.value = answer;
+    }
+  }, [answer]);
+
+  function currentAnswer() {
+    return answerInputRef.current?.value ?? answer;
+  }
+
   return (
     <div className="flex h-full flex-col">
       <Kicker icon={Unlock}>Stagegate</Kicker>
@@ -1515,17 +2339,28 @@ function StagegatePage({
       </p>
       <textarea
         {...pageFlipInteractiveHandlers}
-        value={answer}
-        onChange={(event) => onAnswerChange(event.target.value)}
-        className="mt-5 min-h-[150px] resize-none rounded-[8px] border border-stone-300 bg-white/70 p-4 text-sm leading-6 text-stone-800 outline-none focus:border-[#1e6f73] focus:ring-2 focus:ring-[#1e6f73]/20"
+        ref={answerInputRef}
+        defaultValue={answer}
+        disabled={isSubmitting}
+        className={`mt-5 resize-none rounded-[8px] border border-stone-300 bg-white/70 p-4 text-sm leading-6 text-stone-800 outline-none transition focus:border-[#1e6f73] focus:ring-2 focus:ring-[#1e6f73]/20 disabled:cursor-wait disabled:opacity-70 ${
+          hasFeedback || isSubmitting ? "min-h-[104px]" : "min-h-[150px]"
+        }`}
       />
+      {isSubmitting ? <StagegateThinkingPanel /> : null}
+      {hasFeedback ? <StagegateGuidancePanel result={result} /> : null}
       <button
         {...pageFlipInteractiveHandlers}
         type="button"
-        onClick={onSubmit}
-        className="mt-5 inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#d8b86a] px-5 text-sm font-semibold text-[#1c211d] transition hover:bg-[#e5c879]"
+        disabled={isSubmitting}
+        onClick={() => onSubmit(currentAnswer())}
+        className="mt-5 inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#d8b86a] px-5 text-sm font-semibold text-[#1c211d] transition hover:bg-[#e5c879] disabled:cursor-wait disabled:opacity-75"
       >
-        {hasPassed ? (
+        {isSubmitting ? (
+          <>
+            <Cog className="h-4 w-4 animate-spin" />
+            Thinking through your answer
+          </>
+        ) : hasPassed ? (
           <>
             <Check className="h-4 w-4" />
             Stagegate passed
@@ -1544,13 +2379,89 @@ function StagegatePage({
   );
 }
 
+function StagegateThinkingPanel() {
+  return (
+    <div
+      aria-live="polite"
+      role="status"
+      className="mt-4 flex items-center gap-3 rounded-[8px] border border-[#1e6f73]/25 bg-[#eaf8f6]/75 p-3 text-[#174f52]"
+    >
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/78">
+        <Brain className="h-5 w-5 animate-pulse" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-semibold uppercase">
+          Primer is checking the gate
+        </p>
+        <p className="mt-1 text-sm leading-5">
+          Reading your reasoning, matching it to the rubric, and preparing the
+          next page.
+        </p>
+      </div>
+      <span className="flex shrink-0 items-center gap-1" aria-hidden="true">
+        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#1e6f73] [animation-delay:-0.2s]" />
+        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#1e6f73] [animation-delay:-0.1s]" />
+        <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[#1e6f73]" />
+      </span>
+    </div>
+  );
+}
+
+function StagegateGuidancePanel({ result }: { result: StagegateResult }) {
+  const guidance = result.gaps.slice(0, 3);
+
+  return (
+    <div
+      aria-live="polite"
+      className="mt-4 max-h-36 overflow-y-auto rounded-[8px] border border-amber-300/70 bg-amber-50/78 p-3 text-[#514010]"
+    >
+      <div className="flex items-start gap-2">
+        <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+        <div>
+          <p className="text-xs font-semibold uppercase">
+            Try again - score {Math.round(result.score * 100)}%
+          </p>
+          <p className="mt-1 text-sm leading-5">{result.feedbackToStudent}</p>
+        </div>
+      </div>
+      {guidance.length > 0 ? (
+        <ul className="mt-2 space-y-1 pl-6 text-xs leading-5">
+          {guidance.map((gap, index) => (
+            <li key={`${index}-${gap}`} className="list-disc">
+              {gap}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
 function UnlockPage({
   result,
   hasPassed,
+  isStartingNextLesson,
+  lesson,
+  lessonStatus,
+  onStartNextLesson,
 }: {
   result: StagegateResult;
   hasPassed: boolean;
+  isStartingNextLesson: boolean;
+  lesson: PrimerLesson;
+  lessonStatus: string;
+  onStartNextLesson: () => void;
 }) {
+  const unlockedLabel =
+    result.nextLevelUnlocked === "transfer"
+      ? "Level 3: Transfer"
+      : result.nextLevelUnlocked === "complete"
+        ? "next path"
+        : "Level 2: Mechanism";
+  const hasAttemptFeedback =
+    result.feedbackToStudent.trim() !== "" &&
+    result.feedbackToStudent !== emptyStagegateResult.feedbackToStudent;
+
   return (
     <div className="flex h-full flex-col text-stone-50">
       <Kicker icon={Check} dark>
@@ -1562,12 +2473,18 @@ function UnlockPage({
       <p className="mt-4 text-base leading-7 text-cyan-50/78">
         {hasPassed
           ? result.feedbackToStudent
-          : "Submit the stagegate page to unlock the next level and add a new visible memory."}
+          : hasAttemptFeedback
+            ? result.feedbackToStudent
+            : "Submit the stagegate page to unlock the next level and add a new visible memory."}
       </p>
 
       <div className="mt-6 space-y-3">
         {Object.entries(result.rubric).map(([label, value]) => (
-          <RubricBar key={label} label={label} value={hasPassed ? value : 0} />
+          <RubricBar
+            key={label}
+            label={label}
+            value={hasPassed || hasAttemptFeedback ? value : 0}
+          />
         ))}
       </div>
 
@@ -1584,14 +2501,49 @@ function UnlockPage({
       <div className="mt-auto rounded-[8px] bg-[#d8b86a] p-4 text-[#1c211d]">
         <p className="text-xs uppercase">Unlocked</p>
         <p className="mt-1 text-lg font-semibold">
-          {hasPassed ? "Level 2: Mechanism" : "Pass Level 1 first"}
+          {hasPassed ? unlockedLabel : "Pass Level 1 first"}
         </p>
+        {hasPassed ? (
+          <>
+            <button
+              {...pageFlipInteractiveHandlers}
+              type="button"
+              disabled={isStartingNextLesson}
+              onClick={onStartNextLesson}
+              className="mt-3 inline-flex h-10 w-full items-center justify-center gap-2 rounded-full bg-[#173b3b] px-4 text-sm font-semibold text-cyan-50 transition hover:bg-[#1f4f4f] disabled:cursor-wait disabled:opacity-75"
+            >
+              {isStartingNextLesson ? (
+                <>
+                  <Cog className="h-4 w-4 animate-spin" />
+                  Starting next lesson
+                </>
+              ) : (
+                <>
+                  <Play className="h-4 w-4" />
+                  Start next lesson
+                </>
+              )}
+            </button>
+            <p
+              aria-live="polite"
+              className="mt-2 text-xs leading-5 text-[#3d3210]"
+            >
+              Continue {lesson.topic}. {lessonStatus}
+            </p>
+          </>
+        ) : null}
       </div>
     </div>
   );
 }
 
-function SavedBookEntryPage({ entry }: { entry: StudentBookEntry }) {
+function SavedBookEntryPage({
+  entry,
+  onOpenInfographic,
+}: {
+  entry: StudentBookEntry;
+  onOpenInfographic: (image: EnlargedInfographic) => void;
+}) {
   const createdAt = entry.createdAt
     ? new Date(entry.createdAt).toLocaleString()
     : "Saved in the book";
@@ -1634,7 +2586,7 @@ function SavedBookEntryPage({ entry }: { entry: StudentBookEntry }) {
 
   if (entry.kind === "infographic") {
     const artifact = entry.payload.artifact as InfographicArtifact | undefined;
-    const imageSrc = artifact?.imageDataUrl ?? artifact?.imageUrl ?? null;
+    const imageSrc = artifactImageSrc(artifact);
 
     return (
       <div className="flex h-full flex-col">
@@ -1644,14 +2596,14 @@ function SavedBookEntryPage({ entry }: { entry: StudentBookEntry }) {
         </h2>
         <p className="mt-2 text-xs uppercase text-stone-500">{createdAt}</p>
         {imageSrc ? (
-          <div className="mt-5 overflow-hidden rounded-[8px] border border-stone-300 bg-white">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={imageSrc}
-              alt={`Saved infographic for ${entry.topic ?? "this lesson"}`}
-              className="aspect-square w-full object-cover"
-            />
-          </div>
+          <InfographicImageButton
+            alt={`Saved infographic for ${entry.topic ?? "this lesson"}`}
+            className="mt-5 block overflow-hidden rounded-[8px] border border-stone-300 bg-white"
+            imageClassName="aspect-square w-full object-cover"
+            onOpen={onOpenInfographic}
+            src={imageSrc}
+            title={entry.topic ?? "Saved infographic"}
+          />
         ) : (
           <div className="mt-5 rounded-[8px] border border-stone-300 bg-white/70 p-4">
             <p className="text-xs uppercase text-stone-500">Fallback artifact</p>
@@ -1667,36 +2619,394 @@ function SavedBookEntryPage({ entry }: { entry: StudentBookEntry }) {
     );
   }
 
-  const stagegateResult = normalizeStagegateResult(entry.payload.result);
-  const request = recordValue(entry.payload.request);
-  const savedAnswer = stringValue(request?.answer);
+  return null;
+}
 
+function InlineSelectionInfographics({
+  infographics,
+  onLayoutChange,
+  onOpenInfographic,
+}: {
+  infographics: SelectionInfographic[];
+  onLayoutChange?: () => void;
+  onOpenInfographic?: (image: EnlargedInfographic) => void;
+}) {
   return (
-    <div className="flex h-full flex-col">
-      <Kicker icon={Unlock}>Saved stagegate</Kicker>
-      <h2 className="mt-4 text-3xl font-semibold leading-tight text-stone-950">
-        {entry.topic ?? "Stagegate attempt"}
-      </h2>
-      <p className="mt-2 text-xs uppercase text-stone-500">{createdAt}</p>
-      <div className="mt-5 rounded-[8px] border border-stone-300 bg-white/70 p-4">
-        <p className="text-xs uppercase text-stone-500">Student answer</p>
-        <p className="mt-2 text-sm leading-6 text-stone-800">
-          {savedAnswer ?? "No answer text was stored."}
-        </p>
-      </div>
-      <div className="mt-5 rounded-[8px] bg-[#173b3b] p-4 text-stone-50">
-        <p className="text-xs uppercase text-cyan-100/75">
-          {stagegateResult.passed ? "Passed" : "Still practicing"}
-        </p>
-        <p className="mt-2 text-sm leading-6">
-          {stagegateResult.feedbackToStudent}
-        </p>
-      </div>
-      <div className="mt-auto">
-        <RubricBar label="score" value={stagegateResult.score} />
+    <div className="mt-3 flex shrink-0 gap-2 overflow-x-auto border-t border-stone-300/70 pt-3">
+      {infographics.map((infographic) => {
+        const imageSrc = artifactImageSrc(infographic.artifact);
+        const title = `Selection from ${infographic.topic}`;
+
+        return (
+          <div
+            key={infographic.id}
+            className="flex min-w-[190px] max-w-[230px] items-center gap-2 rounded-[8px] border border-stone-300 bg-white/68 p-2"
+          >
+            {imageSrc && onOpenInfographic ? (
+              <InfographicImageButton
+                alt={title}
+                className="h-16 w-16 shrink-0 overflow-hidden rounded-[6px] border border-stone-300 bg-white"
+                imageClassName="h-full w-full object-cover"
+                onImageLoad={onLayoutChange}
+                onOpen={onOpenInfographic}
+                src={imageSrc}
+                title={title}
+              />
+            ) : (
+              <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-[6px] border border-stone-300 bg-[#173b3b] text-cyan-50">
+                <Sparkles className="h-5 w-5" />
+              </div>
+            )}
+            <div className="min-w-0">
+              <p className="text-[10px] font-semibold uppercase text-[#1e6f73]">
+                Selection diagram
+              </p>
+              <p className="mt-1 line-clamp-2 text-xs leading-4 text-stone-700">
+                {infographic.sourceText}
+              </p>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function InfographicImageButton({
+  alt,
+  className,
+  imageClassName,
+  onImageLoad,
+  onOpen,
+  src,
+  title,
+}: {
+  alt: string;
+  className: string;
+  imageClassName: string;
+  onImageLoad?: () => void;
+  onOpen: (image: EnlargedInfographic) => void;
+  src: string;
+  title?: string;
+}) {
+  return (
+    <button
+      {...pageFlipInteractiveHandlers}
+      type="button"
+      aria-label="Enlarge infographic"
+      title="Enlarge infographic"
+      onClick={() => onOpen({ alt, src, title })}
+      className={`group relative cursor-zoom-in ${className}`}
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={src}
+        alt={alt}
+        className={imageClassName}
+        onLoad={onImageLoad}
+      />
+      <span className="absolute right-2 top-2 inline-flex h-7 w-7 items-center justify-center rounded-full bg-black/55 text-white opacity-0 transition group-hover:opacity-100 group-focus-visible:opacity-100">
+        <Maximize2 className="h-3.5 w-3.5" />
+      </span>
+    </button>
+  );
+}
+
+function SelectedTextInfographicPopup({
+  action,
+  isLoading,
+  onDismiss,
+  onGenerate,
+}: {
+  action: SelectedTextAction;
+  isLoading: boolean;
+  onDismiss: () => void;
+  onGenerate: () => void;
+}) {
+  return (
+    <div
+      className="fixed z-40 w-[228px] rounded-[8px] border border-cyan-100/18 bg-[#0b1515]/96 p-2.5 text-cyan-50 shadow-2xl shadow-black/35 backdrop-blur"
+      style={{ left: action.x, top: action.y }}
+      onMouseDown={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
+      onTouchStart={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
+    >
+      <p className="line-clamp-2 text-xs leading-4 text-cyan-50/76">
+        {action.text}
+      </p>
+      <div className="mt-2 flex items-center gap-2">
+        <button
+          type="button"
+          disabled={isLoading}
+          onClick={onGenerate}
+          className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-full bg-[#d8b86a] px-3 text-xs font-semibold text-[#19221f] transition hover:bg-[#e4c77a] disabled:cursor-wait disabled:opacity-70"
+        >
+          <Sparkles className="h-3.5 w-3.5" />
+          {isLoading ? "Generating" : "Infographic"}
+        </button>
+        <button
+          type="button"
+          aria-label="Dismiss selected text action"
+          onClick={onDismiss}
+          className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-cyan-100/18 text-cyan-50/76 transition hover:text-cyan-50"
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
       </div>
     </div>
   );
+}
+
+function InfographicLightbox({
+  explanation,
+  image,
+  isExplanationLoading,
+  isExplanationPlaying,
+  onClose,
+  onExplain,
+  status,
+}: {
+  explanation: InfographicExplanationPayload | null;
+  image: EnlargedInfographic;
+  isExplanationLoading: boolean;
+  isExplanationPlaying: boolean;
+  onClose: () => void;
+  onExplain: () => void;
+  status: string;
+}) {
+  const observations = explanation?.keyObservations ?? [];
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-[#071111]/94 p-4 text-cyan-50 backdrop-blur-md"
+      onClick={onClose}
+    >
+      <div
+        className="relative grid max-h-full w-full max-w-6xl gap-3 lg:grid-cols-[minmax(0,1fr)_340px]"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <button
+          type="button"
+          aria-label="Close enlarged infographic"
+          onClick={onClose}
+          className="absolute right-2 top-2 z-10 inline-flex h-10 w-10 items-center justify-center rounded-full bg-black/60 text-cyan-50 transition hover:bg-black/75"
+        >
+          <X className="h-4 w-4" />
+        </button>
+        <div className="overflow-hidden rounded-[8px] border border-cyan-100/18 bg-black/24">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={image.src}
+            alt={image.alt}
+            className="max-h-[86svh] w-full object-contain"
+          />
+        </div>
+        <aside className="max-h-[86svh] overflow-y-auto rounded-[8px] border border-cyan-100/18 bg-[#101919]/96 p-4 shadow-2xl shadow-black/30">
+          <p className="text-xs uppercase text-cyan-100/70">
+            Diagram voice explanation
+          </p>
+          <h2 className="mt-2 text-xl font-semibold leading-tight text-stone-50">
+            {image.title ?? "Generated infographic"}
+          </h2>
+          <p className="mt-3 text-sm leading-6 text-stone-300">{status}</p>
+          {isExplanationLoading ? <IndeterminateProgress /> : null}
+          <button
+            type="button"
+            onClick={onExplain}
+            disabled={isExplanationLoading}
+            className="mt-4 inline-flex h-11 w-full items-center justify-center gap-2 rounded-full bg-[#d8b86a] px-4 text-sm font-semibold text-[#19221f] transition hover:bg-[#e4c77a] disabled:cursor-wait disabled:opacity-70"
+          >
+            {isExplanationLoading ? (
+              <>
+                <Sparkles className="h-4 w-4" />
+                Explaining diagram
+              </>
+            ) : isExplanationPlaying ? (
+              <>
+                <Square className="h-4 w-4" />
+                Stop explanation
+              </>
+            ) : (
+              <>
+                <Volume2 className="h-4 w-4" />
+                Explain aloud
+              </>
+            )}
+          </button>
+          <p className="mt-3 text-xs leading-5 text-cyan-50/58">
+            GPT-5.5 reads the image with vision input. The voice is
+            AI-generated.
+          </p>
+
+          {explanation?.explanation ? (
+            <div className="mt-4 border-t border-cyan-100/12 pt-4">
+              <p className="text-xs uppercase text-cyan-100/60">
+                Explanation
+              </p>
+              <p className="mt-2 text-sm leading-6 text-stone-200">
+                {explanation.explanation}
+              </p>
+            </div>
+          ) : null}
+
+          {observations.length > 0 ? (
+            <div className="mt-4 space-y-2">
+              {observations.map((observation) => (
+                <div
+                  key={observation}
+                  className="rounded-[8px] border border-cyan-100/12 bg-cyan-50/10 px-3 py-2 text-xs leading-5 text-cyan-50/78"
+                >
+                  {observation}
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </aside>
+      </div>
+    </div>
+  );
+}
+
+function IndeterminateProgress() {
+  return (
+    <div className="mt-4 h-2 overflow-hidden rounded-full bg-cyan-50/12">
+      <div className="h-full w-1/2 animate-[pulse_1.2s_ease-in-out_infinite] rounded-full bg-[#d8b86a]" />
+    </div>
+  );
+}
+
+function ResetStudentDialog({
+  error,
+  isResetting,
+  learner,
+  onCancel,
+  onConfirm,
+}: {
+  error: string | null;
+  isResetting: boolean;
+  learner: AuthenticatedStudent;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-[#071111]/92 p-4 text-cyan-50 backdrop-blur-md">
+      <div className="w-full max-w-md rounded-[8px] border border-amber-200/24 bg-[#101919] p-5 shadow-2xl shadow-black/40">
+        <div className="flex items-start gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-amber-300/16 text-amber-100">
+            <TriangleAlert className="h-5 w-5" />
+          </div>
+          <div>
+            <p className="text-xs uppercase text-amber-100/78">
+              Reset student record
+            </p>
+            <h2 className="mt-2 text-2xl font-semibold text-stone-50">
+              Start {learner.displayName}&apos;s Primer over?
+            </h2>
+            <p className="mt-3 text-sm leading-6 text-stone-300">
+              This deletes this student&apos;s books, book entries, progress,
+              story continuity, and memories. The signup profile and login stay
+              in place so a fresh opening lesson can be generated immediately.
+            </p>
+          </div>
+        </div>
+
+        {error ? (
+          <p className="mt-4 rounded-[8px] border border-red-300/25 bg-red-950/30 px-3 py-2 text-sm leading-6 text-red-100">
+            {error}
+          </p>
+        ) : null}
+
+        <div className="mt-6 flex flex-wrap items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={isResetting}
+            className="inline-flex h-10 items-center justify-center rounded-full border border-cyan-100/16 px-4 text-sm font-semibold text-cyan-50/78 transition hover:text-cyan-50 disabled:cursor-wait disabled:opacity-60"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={isResetting}
+            className="inline-flex h-10 items-center justify-center gap-2 rounded-full bg-[#d8b86a] px-4 text-sm font-semibold text-[#19221f] transition hover:bg-[#e4c77a] disabled:cursor-wait disabled:opacity-70"
+          >
+            <RotateCcw className="h-4 w-4" />
+            {isResetting ? "Resetting" : "Reset and restart"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function artifactImageSrc(artifact: InfographicArtifact | null | undefined) {
+  return artifact?.imageDataUrl ?? artifact?.imageUrl ?? null;
+}
+
+function elementFromNode(node: Node | null): Element | null {
+  if (!node) {
+    return null;
+  }
+
+  if (node.nodeType === Node.ELEMENT_NODE) {
+    return node as Element;
+  }
+
+  return node.parentElement;
+}
+
+function closestPrimerPage(node: Node | null): HTMLElement | null {
+  return elementFromNode(node)?.closest<HTMLElement>(".primer-page") ?? null;
+}
+
+function pageIndexFromRange(range: Range): number | null {
+  const page =
+    closestPrimerPage(range.startContainer) ??
+    closestPrimerPage(range.commonAncestorContainer);
+  const index = Number(page?.dataset.primerPageIndex);
+
+  return Number.isFinite(index) ? index : null;
+}
+
+function firstRangeBounds(range: Range): DOMRect | null {
+  const bounds = range.getBoundingClientRect();
+  if (bounds.width > 0 || bounds.height > 0) {
+    return bounds;
+  }
+
+  for (const rect of Array.from(range.getClientRects())) {
+    if (rect.width > 0 || rect.height > 0) {
+      return rect;
+    }
+  }
+
+  return null;
+}
+
+function popupPositionForBounds(bounds: DOMRect) {
+  const popupWidth = 228;
+  const x = clamp(
+    bounds.left + bounds.width / 2 - popupWidth / 2,
+    12,
+    window.innerWidth - popupWidth - 12,
+  );
+  const yAbove = bounds.top - 68;
+  const y = yAbove >= 12 ? yAbove : bounds.bottom + 10;
+
+  return {
+    x,
+    y: clamp(y, 12, window.innerHeight - 96),
+  };
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), Math.max(min, max));
 }
 
 function MemoryGraphDialog({
@@ -1945,16 +3255,6 @@ function toMemoryFlowEdges(
       labelBgBorderRadius: 4,
     };
   });
-}
-
-function recordValue(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object"
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
-function stringValue(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
 }
 
 function preserveDraggedPositions(

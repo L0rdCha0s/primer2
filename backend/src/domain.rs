@@ -126,6 +126,17 @@ pub struct InfographicRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct InfographicExplanationRequest {
+    pub student_id: Option<String>,
+    pub topic: String,
+    pub image_src: String,
+    pub title: Option<String>,
+    pub alt: Option<String>,
+    pub prompt: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NarrationRequest {
     pub student_id: Option<String>,
     pub topic: Option<String>,

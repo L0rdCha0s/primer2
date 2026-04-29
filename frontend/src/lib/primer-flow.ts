@@ -80,6 +80,41 @@ export type StudentBookState = {
   hasPassedStagegate: boolean;
 };
 
+export const staticBookPageCount = 10;
+
+export function bookEndPageIndex(entryCount: number): number {
+  const safeEntryCount = Number.isFinite(entryCount)
+    ? Math.max(0, Math.floor(entryCount))
+    : 0;
+
+  return staticBookPageCount + safeEntryCount - 1;
+}
+
+export function isBookContentEntry(
+  entry: Pick<StudentBookEntry, "kind">,
+): entry is Pick<StudentBookEntry, "kind"> & {
+  kind: "lesson" | "infographic";
+} {
+  return entry.kind === "lesson" || entry.kind === "infographic";
+}
+
+export function bookContentEntryCount(
+  entries: Array<Pick<StudentBookEntry, "kind">>,
+): number {
+  return entries.filter(isBookContentEntry).length;
+}
+
+export function defaultBookPageIndex(
+  entries: Array<Pick<StudentBookEntry, "kind">>,
+): number {
+  const latestEntry = entries.at(-1);
+  if (latestEntry?.kind === "stagegate") {
+    return staticBookPageCount - 1;
+  }
+
+  return bookEndPageIndex(bookContentEntryCount(entries));
+}
+
 type BackendMemory = {
   assertionId?: string;
   memory_type?: unknown;

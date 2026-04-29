@@ -1,9 +1,9 @@
 use crate::{
     AppState, db,
     domain::{
-        DEFAULT_STUDENT_PUBLIC_ID, InfographicRequest, LessonStartRequest, LoginRequest,
-        MemoryGraphRequest, MemoryProfileRequest, NarrationRequest, RegisterRequest,
-        StagegateRequest,
+        DEFAULT_STUDENT_PUBLIC_ID, InfographicExplanationRequest, InfographicRequest,
+        LessonStartRequest, LoginRequest, MemoryGraphRequest, MemoryProfileRequest,
+        NarrationRequest, RegisterRequest, StagegateRequest,
     },
     memory,
     openai::build_infographic_prompt,
@@ -21,10 +21,15 @@ pub fn api_routes() -> Route {
         .at("/api/auth/login", post(login))
         .at("/api/students", get(list_students))
         .at("/api/students/:student_id", get(get_student))
+        .at("/api/students/:student_id/reset", post(reset_student))
         .at("/api/book/:student_id", get(get_book))
         .at("/api/lesson/start", post(start_lesson))
         .at("/api/tutor/respond", post(tutor_respond))
         .at("/api/artifact/infographic", post(infographic))
+        .at(
+            "/api/artifact/infographic/explain",
+            post(explain_infographic),
+        )
         .at("/api/narration/speech", post(narration_speech))
         .at("/api/tutor/stagegate", post(stagegate))
         .at("/api/memory/profile", post(memory_profile))
@@ -88,6 +93,38 @@ async fn get_student(Path(student_id): Path<String>, Data(state): Data<&AppState
     };
 
     Json(json!({ "student": student }))
+}
+
+#[handler]
+async fn reset_student(
+    Path(student_id): Path<String>,
+    Data(state): Data<&AppState>,
+) -> Json<Value> {
+    match db::reset_student_learning_state(&state.db, &student_id).await {
+        Ok(student) => Json(json!({
+            "studentId": student_id,
+            "student": student,
+            "book": null,
+            "reset": {
+                "booksDeleted": true,
+                "bookEntriesDeleted": true,
+                "memoriesDeleted": true,
+                "progressDeleted": true
+            }
+        })),
+        Err(error) => Json(json!({
+            "studentId": student_id,
+            "student": null,
+            "book": null,
+            "error": error.to_string(),
+            "reset": {
+                "booksDeleted": false,
+                "bookEntriesDeleted": false,
+                "memoriesDeleted": false,
+                "progressDeleted": false
+            }
+        })),
+    }
 }
 
 #[handler]
@@ -242,6 +279,39 @@ async fn infographic(
         "studentId": student_id,
         "artifact": result,
         "book": book
+    }))
+}
+
+#[handler]
+async fn explain_infographic(
+    Data(state): Data<&AppState>,
+    Json(request): Json<InfographicExplanationRequest>,
+) -> Json<Value> {
+    let student_id = request
+        .student_id
+        .clone()
+        .unwrap_or_else(|| DEFAULT_STUDENT_PUBLIC_ID.to_string());
+    let student = match db::get_or_seed_student(&state.db, &student_id).await {
+        Ok(student) => student,
+        Err(error) => return Json(json!({ "error": error.to_string() })),
+    };
+
+    let result = match state.openai.explain_infographic(&student, &request).await {
+        Ok(result) => result,
+        Err(error) => json!({
+            "aiMode": "openai_error",
+            "generated": false,
+            "speechGenerated": false,
+            "error": error,
+            "model": state.openai.text_model(),
+            "speechModel": state.openai.speech_model(),
+            "voice": state.openai.speech_voice()
+        }),
+    };
+
+    Json(json!({
+        "studentId": student_id,
+        "explanation": result
     }))
 }
 

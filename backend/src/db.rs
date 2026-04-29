@@ -17,7 +17,7 @@ use argon2::{
 use chrono::{DateTime, FixedOffset, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend, DbErr,
-    EntityTrait, QueryFilter, QueryOrder, Set, Statement,
+    EntityTrait, QueryFilter, QueryOrder, Set, Statement, TransactionTrait, Value as SeaOrmValue,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -565,6 +565,82 @@ pub async fn append_stagegate_book_entry(
     .await?;
 
     book_state_for_book(db, &student, &book).await
+}
+
+pub async fn reset_student_learning_state(
+    db: &DatabaseConnection,
+    public_id: &str,
+) -> Result<StudentRecord, DbErr> {
+    let student = get_or_seed_student_row(db, public_id).await?;
+    let student_id = student.id;
+
+    let tx = db.begin().await?;
+
+    student_book_entry::Entity::delete_many()
+        .filter(student_book_entry::Column::StudentId.eq(student_id))
+        .exec(&tx)
+        .await?;
+    student_book::Entity::delete_many()
+        .filter(student_book::Column::StudentId.eq(student_id))
+        .exec(&tx)
+        .await?;
+    narrative_character_biography::Entity::delete_many()
+        .filter(narrative_character_biography::Column::StudentId.eq(student_id))
+        .exec(&tx)
+        .await?;
+    narrative_character::Entity::delete_many()
+        .filter(narrative_character::Column::StudentId.eq(student_id))
+        .exec(&tx)
+        .await?;
+    concept_progress::Entity::delete_many()
+        .filter(concept_progress::Column::StudentId.eq(student_id))
+        .exec(&tx)
+        .await?;
+    student_memory::Entity::delete_many()
+        .filter(student_memory::Column::StudentId.eq(student_id))
+        .exec(&tx)
+        .await?;
+
+    tx.execute(sql_statement(
+        r#"
+        UPDATE memory_assertions
+        SET supersedes_assertion_id = NULL,
+            contradicts_assertion_id = NULL
+        WHERE student_id = $1
+        "#,
+        vec![student_id.into()],
+    ))
+    .await?;
+    tx.execute(sql_statement(
+        "DELETE FROM memory_assertions WHERE student_id = $1",
+        vec![student_id.into()],
+    ))
+    .await?;
+    tx.execute(sql_statement(
+        "DELETE FROM memory_entities WHERE student_id = $1",
+        vec![student_id.into()],
+    ))
+    .await?;
+    tx.execute(sql_statement(
+        "DELETE FROM memory_sources WHERE student_id = $1",
+        vec![student_id.into()],
+    ))
+    .await?;
+
+    let interests = string_array(student.interests.clone());
+    let mut active: student::ActiveModel = student.into();
+    active.suggested_topics = Set(json!(suggested_topics_for_interests(&interests)));
+    active.updated_at = Set(now());
+    active.update(&tx).await?;
+
+    tx.commit().await?;
+    if let Err(error) = memory::delete_student_graph_projection(db, student_id).await {
+        println!(
+            "[primerlab-api] AGE graph reset failed for student={public_id}; SQL reset already completed: {error}"
+        );
+    }
+    let refreshed_student = get_or_seed_student_row(db, public_id).await?;
+    student_record(db, &refreshed_student).await
 }
 
 pub async fn relevant_narrative_characters(
@@ -1369,6 +1445,10 @@ fn normalize_character_name(value: &str) -> String {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn sql_statement(sql: &str, values: Vec<SeaOrmValue>) -> Statement {
+    Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
 }
 
 fn now() -> DateTime<FixedOffset> {

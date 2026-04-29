@@ -2,9 +2,13 @@ import { describe, expect, test } from "vitest";
 
 import {
   buildLessonStartBody,
+  bookEndPageIndex,
+  bookContentEntryCount,
+  defaultBookPageIndex,
   emptyStagegateResult,
   firstTopicHint,
   initialLesson,
+  isBookContentEntry,
   mergeMemoryGraph,
   normalizeBookState,
   normalizeLesson,
@@ -12,6 +16,7 @@ import {
   normalizeMemoryGraph,
   normalizeStagegateResult,
   stagesForStagegate,
+  staticBookPageCount,
   type StudentMemoryGraph,
 } from "./primer-flow";
 
@@ -253,6 +258,27 @@ describe("memory contract normalization", () => {
 });
 
 describe("persisted book contract normalization", () => {
+  test("calculates the end page after persisted book entries", () => {
+    expect(staticBookPageCount).toBe(10);
+    expect(bookEndPageIndex(0)).toBe(9);
+    expect(bookEndPageIndex(1)).toBe(10);
+    expect(bookEndPageIndex(4)).toBe(13);
+  });
+
+  test("keeps stagegate attempts out of appended content pages", () => {
+    const entries = [
+      { kind: "lesson" },
+      { kind: "stagegate" },
+      { kind: "stagegate" },
+    ];
+
+    expect(entries.filter(isBookContentEntry)).toEqual([{ kind: "lesson" }]);
+    expect(bookContentEntryCount(entries)).toBe(1);
+    expect(defaultBookPageIndex(entries)).toBe(9);
+    expect(defaultBookPageIndex([{ kind: "lesson" }, { kind: "infographic" }]))
+      .toBe(11);
+  });
+
   test("normalizes persisted book entries and latest interaction state", () => {
     const book = normalizeBookState({
       studentId: "student-123",
