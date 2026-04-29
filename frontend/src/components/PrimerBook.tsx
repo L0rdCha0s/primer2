@@ -63,15 +63,11 @@ import {
   type PrimerLesson,
   type Stage,
   type StagegateResult,
-  type StudentBookContentPage,
   type StudentBookLesson,
   type StudentBookState,
   type StudentMemory,
   type StudentMemoryGraph,
-  bookContentPageCount,
-  bookEndPageIndex,
   buildLessonStartBody,
-  defaultBookPageIndex,
   emptyStagegateResult,
   firstTopicHint,
   initialLesson,
@@ -84,7 +80,6 @@ import {
   openingProfileHint,
   stagesForStagegate,
   staticBookPageCount,
-  visibleBookContentPages,
 } from "@/lib/primer-flow";
 import {
   type StudentReportCard,
@@ -223,6 +218,9 @@ type MemoryFlowEdge = Edge<MemoryEdgeData>;
 
 const chooseTopicPageIndex = 3;
 const storyPageIndex = 4;
+const unlockPageIndex = staticBookPageCount - 1;
+const stagegatePageIndex = unlockPageIndex - 1;
+const firstAppendixPageIndex = unlockPageIndex + 1;
 
 type BookPageProps = {
   children: ReactNode;
@@ -412,24 +410,17 @@ async function fetchStudentMemoryGraph(
 }
 
 function restoredBookTargetPage(book: StudentBookState): number {
-  const contentPageCount = bookContentPageCount(
-    visibleBookContentPages(book.lessons),
-  );
   if (book.latestStagegate) {
     return book.hasPassedStagegate
-      ? staticBookPageCount + contentPageCount
-      : staticBookPageCount - 1;
-  }
-
-  if (contentPageCount > 0) {
-    return bookEndPageIndex(contentPageCount);
+      ? firstAppendixPageIndex
+      : unlockPageIndex;
   }
 
   if (book.currentLesson) {
-    return chooseTopicPageIndex;
+    return storyPageIndex;
   }
 
-  return defaultBookPageIndex(visibleBookContentPages(book.lessons));
+  return chooseTopicPageIndex;
 }
 
 export function PrimerBook() {
@@ -908,39 +899,8 @@ export function PrimerBook() {
     return stagesForStagegate(hasPassedStagegate);
   }, [hasPassedStagegate]);
 
-  const hasNextTopicPage = hasPassedStagegate;
-  const visibleBookPages = useMemo(
-    () => visibleBookContentPages(bookLessons),
-    [bookLessons],
-  );
-  const persistedBookPages = useMemo(() => {
-    return visibleBookPages.reduce<{
-      lessonCount: number;
-      pages: Array<{
-        page: StudentBookContentPage;
-        lessonOrdinal: number;
-        pageIndex: number;
-      }>;
-    }>(
-      (current, page, index) => {
-        const lessonCount = current.lessonCount + 1;
-
-        return {
-          lessonCount,
-          pages: [
-            ...current.pages,
-            {
-              page,
-              lessonOrdinal: lessonCount,
-              pageIndex: staticBookPageCount + index,
-            },
-          ],
-        };
-      },
-      { lessonCount: 0, pages: [] },
-    ).pages;
-  }, [visibleBookPages]);
-  const nextTopicPageIndex = staticBookPageCount + persistedBookPages.length;
+  const isNextTopicUnlocked = hasPassedStagegate;
+  const nextTopicPageIndex = firstAppendixPageIndex;
   const selectionInfographicsByPage = useMemo(() => {
     const byPage = new Map<number, SelectionInfographic[]>();
     for (const infographic of selectionInfographics) {
@@ -950,7 +910,7 @@ export function PrimerBook() {
     }
     return byPage;
   }, [selectionInfographics]);
-  const pageCount = nextTopicPageIndex + (hasNextTopicPage ? 1 : 0);
+  const pageCount = firstAppendixPageIndex + 1;
 
   useEffect(() => {
     const targetPage = pendingBookEndPageRef.current;
@@ -985,7 +945,7 @@ export function PrimerBook() {
         window.clearTimeout(timer);
       }
     };
-  }, [authenticatedStudent, hasNextTopicPage, pageCount]);
+  }, [authenticatedStudent, pageCount]);
 
   function flipNext() {
     bookRef.current?.pageFlip()?.flipNext("bottom");
@@ -2062,10 +2022,12 @@ export function PrimerBook() {
 
                 <BookPage
                   density="hard"
-                  inlineInfographics={inlineInfographicsForPage(9)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(9)}
+                  inlineInfographics={inlineInfographicsForPage(unlockPageIndex)}
+                  onLayoutChange={() =>
+                    scheduleBookLayoutRefresh(unlockPageIndex)
+                  }
                   onOpenInfographic={openInfographicImage}
-                  pageIndex={9}
+                  pageIndex={unlockPageIndex}
                   tone="deep"
                 >
                   <UnlockPage
@@ -2077,58 +2039,41 @@ export function PrimerBook() {
                   />
                 </BookPage>
 
-                {persistedBookPages.map(
-                  ({ page, lessonOrdinal, pageIndex }) => (
-                    <BookPage
-                      key={page.pageId}
-                      inlineInfographics={inlineInfographicsForPage(pageIndex)}
-                      onLayoutChange={() => scheduleBookLayoutRefresh(pageIndex)}
-                      onOpenInfographic={openInfographicImage}
-                      pageIndex={pageIndex}
-                      pageNumber={pageIndex}
-                    >
-                      <PersistedBookPage
-                        page={page}
-                        fallbackTopic={firstTopicHint(learner)}
-                        lessonOrdinal={lessonOrdinal}
-                      />
-                    </BookPage>
-                  ),
-                )}
+                <BookPage
+                  inlineInfographics={inlineInfographicsForPage(
+                    nextTopicPageIndex,
+                  )}
+                  onLayoutChange={() =>
+                    scheduleBookLayoutRefresh(nextTopicPageIndex)
+                  }
+                  onOpenInfographic={openInfographicImage}
+                  pageIndex={nextTopicPageIndex}
+                  pageNumber={nextTopicPageIndex}
+                >
+                  {isNextTopicUnlocked ? (
+                    <AskPage
+                      hasAsked={hasAsked}
+                      lessonStatus="Level complete. Choose the next thing to explore."
+                      suggestedTopics={lesson.suggestedTopics}
+                      topic={topic}
+                      onAsk={(nextTopic) =>
+                        void startTopic(nextTopic, {
+                          keepStagegateVisibleUntilLoaded: true,
+                        })
+                      }
+                      onChooseTopic={(nextTopic) =>
+                        void startTopic(nextTopic, {
+                          keepStagegateVisibleUntilLoaded: true,
+                        })
+                      }
+                    />
+                  ) : (
+                    <LockedNextTopicPage
+                      onReturnToStagegate={() => goToPage(stagegatePageIndex)}
+                    />
+                  )}
+                </BookPage>
 
-                {hasNextTopicPage
-                  ? [
-                      <BookPage
-                        key="next-topic"
-                        inlineInfographics={inlineInfographicsForPage(
-                          nextTopicPageIndex,
-                        )}
-                        onLayoutChange={() =>
-                          scheduleBookLayoutRefresh(nextTopicPageIndex)
-                        }
-                        onOpenInfographic={openInfographicImage}
-                        pageIndex={nextTopicPageIndex}
-                        pageNumber={nextTopicPageIndex}
-                      >
-                        <AskPage
-                          hasAsked={hasAsked}
-                          lessonStatus="Level complete. Choose the next thing to explore."
-                          suggestedTopics={lesson.suggestedTopics}
-                          topic={topic}
-                          onAsk={(nextTopic) =>
-                            void startTopic(nextTopic, {
-                              keepStagegateVisibleUntilLoaded: true,
-                            })
-                          }
-                          onChooseTopic={(nextTopic) =>
-                            void startTopic(nextTopic, {
-                              keepStagegateVisibleUntilLoaded: true,
-                            })
-                          }
-                        />
-                      </BookPage>,
-                    ]
-                  : []}
           </HTMLFlipBook>
 
           <div className="relative z-20 mt-3 flex flex-wrap items-center justify-center gap-2 sm:mt-4 sm:gap-3">
@@ -2468,6 +2413,41 @@ function AskPage({
         The backend records progress per student, then asks OpenAI Responses to
         adapt the next explanation to that memory and level.
       </p>
+    </div>
+  );
+}
+
+function LockedNextTopicPage({
+  onReturnToStagegate,
+}: {
+  onReturnToStagegate: () => void;
+}) {
+  return (
+    <div className="flex h-full flex-col">
+      <Kicker icon={Lock}>Next path</Kicker>
+      <h2 className="mt-4 text-3xl font-semibold leading-tight text-stone-950">
+        Finish this level first.
+      </h2>
+      <p className="mt-5 text-base leading-7 text-stone-700">
+        The next topic chooser opens after the stagegate records a passing
+        result.
+      </p>
+      <div className="mt-6 rounded-[8px] border border-[#d8b86a]/55 bg-[#fff8df] p-4 text-[#514010]">
+        <p className="text-xs uppercase">Stagegate required</p>
+        <p className="mt-2 text-sm leading-6">
+          Submit an answer on the stagegate page to unlock the next learning
+          path.
+        </p>
+      </div>
+      <button
+        {...pageFlipInteractiveHandlers}
+        type="button"
+        onClick={onReturnToStagegate}
+        className="mt-auto inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#1e6f73] px-5 text-sm font-semibold text-white transition hover:bg-[#195e61]"
+      >
+        <ChevronLeft className="h-4 w-4" />
+        Return to stagegate
+      </button>
     </div>
   );
 }
@@ -2923,108 +2903,6 @@ function UnlockPage({
       </div>
     </div>
   );
-}
-
-function PersistedBookPage({
-  page,
-  fallbackTopic,
-  lessonOrdinal,
-}: {
-  page: StudentBookContentPage;
-  fallbackTopic: string;
-  lessonOrdinal: number;
-}) {
-  return (
-    <LessonHistoryPage
-      page={page}
-      fallbackTopic={fallbackTopic}
-      lessonOrdinal={lessonOrdinal}
-    />
-  );
-}
-
-function LessonHistoryPage({
-  page,
-  fallbackTopic,
-  lessonOrdinal,
-}: {
-  page: StudentBookContentPage;
-  fallbackTopic: string;
-  lessonOrdinal: number;
-}) {
-  const lesson = lessonFromBookPage(page, fallbackTopic);
-
-  return (
-    <div className="flex h-full flex-col overflow-hidden">
-      <Kicker icon={BookOpen}>Lesson {lessonOrdinal}</Kicker>
-      <h2 className="mt-3 text-3xl font-semibold leading-tight text-stone-950">
-        {lesson.topic}
-      </h2>
-      <p className="mt-2 text-xs uppercase text-stone-500">
-        Saved {savedEntryLabel(page.createdAt)}
-      </p>
-      <div className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
-        <p className="text-base leading-7 text-stone-800">
-          {lesson.storyScene}
-        </p>
-        <div className="border-l-2 border-[#1e6f73] bg-white/55 px-4 py-3">
-          <p className="text-xs uppercase text-stone-500">Plain explanation</p>
-          <p className="mt-2 text-sm leading-6 text-stone-800">
-            {lesson.plainExplanation}
-          </p>
-        </div>
-        <div className="rounded-[8px] border border-stone-300 bg-white/55 px-4 py-3">
-          <p className="text-xs uppercase text-stone-500">Connection</p>
-          <p className="mt-2 text-sm leading-6 text-stone-700">
-            {lesson.analogy}
-          </p>
-        </div>
-        <div className="rounded-[8px] bg-[#173b3b] px-4 py-3 text-stone-50">
-          <p className="text-xs uppercase text-cyan-100/75">Stagegate prompt</p>
-          <p className="mt-2 text-sm leading-6">{lesson.stagegatePrompt}</p>
-        </div>
-        {lesson.keyTerms.length > 0 ? (
-          <div className="grid gap-2">
-            {lesson.keyTerms.slice(0, 4).map((term) => (
-              <div
-                key={term.term}
-                className="rounded-[8px] border border-stone-300 bg-white/60 px-3 py-2"
-              >
-                <p className="text-sm font-semibold text-stone-950">
-                  {term.term}
-                </p>
-                <p className="mt-1 text-xs leading-5 text-stone-600">
-                  {term.definition}
-                </p>
-              </div>
-            ))}
-          </div>
-        ) : null}
-      </div>
-    </div>
-  );
-}
-
-function lessonFromBookPage(
-  page: StudentBookContentPage,
-  fallbackTopic: string,
-) {
-  const payloadLesson = recordValue(page.payload)?.lesson ?? page.payload;
-  return normalizeLesson(payloadLesson, page.topic ?? fallbackTopic);
-}
-
-function savedEntryLabel(value: string) {
-  if (!value) {
-    return "in this Primer";
-  }
-
-  return value.replace("T", " ").replace(/\.\d+Z$/, " UTC").replace(/Z$/, " UTC");
-}
-
-function recordValue(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object"
-    ? (value as Record<string, unknown>)
-    : null;
 }
 
 function InlineSelectionInfographics({
