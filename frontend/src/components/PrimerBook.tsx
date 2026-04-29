@@ -855,9 +855,8 @@ export function PrimerBook() {
                     lessonStatus={lessonStatus}
                     suggestedTopics={lesson.suggestedTopics}
                     topic={topic}
-                    onAsk={() => void startTopic()}
+                    onAsk={(nextTopic) => void startTopic(nextTopic)}
                     onChooseTopic={(nextTopic) => void startTopic(nextTopic)}
-                    onTopicChange={setTopic}
                   />
                 </BookPage>
 
@@ -1092,16 +1091,34 @@ function AskPage({
   topic,
   onAsk,
   onChooseTopic,
-  onTopicChange,
 }: {
   hasAsked: boolean;
   lessonStatus: string;
   suggestedTopics: string[];
   topic: string;
-  onAsk: () => void;
+  onAsk: (topic: string) => void;
   onChooseTopic: (topic: string) => void;
-  onTopicChange: (topic: string) => void;
 }) {
+  const topicInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    const input = topicInputRef.current;
+    if (input && document.activeElement !== input) {
+      input.value = topic;
+    }
+  }, [topic]);
+
+  function currentTopic() {
+    return topicInputRef.current?.value ?? topic;
+  }
+
+  function chooseTopic(nextTopic: string) {
+    if (topicInputRef.current) {
+      topicInputRef.current.value = nextTopic;
+    }
+    onChooseTopic(nextTopic);
+  }
+
   return (
     <div className="flex h-full flex-col">
       <Kicker icon={Mic}>Ask Primer</Kicker>
@@ -1118,9 +1135,9 @@ function AskPage({
         </label>
         <input
           {...pageFlipInteractiveHandlers}
+          ref={topicInputRef}
           id="topic"
-          value={topic}
-          onChange={(event) => onTopicChange(event.target.value)}
+          defaultValue={topic}
           className="mt-3 h-12 w-full rounded-[8px] border border-stone-300 bg-white px-4 text-base font-semibold text-stone-900 outline-none focus:border-[#1e6f73] focus:ring-2 focus:ring-[#1e6f73]/20"
           placeholder="Leave blank for a profile-based starting point"
         />
@@ -1129,7 +1146,7 @@ function AskPage({
         <button
           {...pageFlipInteractiveHandlers}
           type="button"
-          onClick={onAsk}
+          onClick={() => onAsk(currentTopic())}
           className="inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#1e6f73] px-5 text-sm font-semibold text-white transition hover:bg-[#195e61]"
         >
           <Volume2 className="h-4 w-4" />
@@ -1147,7 +1164,7 @@ function AskPage({
               {...pageFlipInteractiveHandlers}
               key={suggestedTopic}
               type="button"
-              onClick={() => onChooseTopic(suggestedTopic)}
+              onClick={() => chooseTopic(suggestedTopic)}
               className="rounded-full border border-stone-300 bg-white/60 px-3 py-2 text-xs font-semibold text-stone-700 transition hover:border-[#1e6f73] hover:text-[#1e6f73]"
             >
               {suggestedTopic}

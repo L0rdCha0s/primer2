@@ -1,12 +1,13 @@
-use poem::{Body, Endpoint, IntoResponse, Request, Response, Result, http::HeaderMap};
+use poem::{
+    Body, Endpoint, IntoResponse, Request, Response, Result,
+    http::{Method, Uri},
+};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
 };
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -15,73 +16,66 @@ pub async fn log_request_to_stdout<E>(next: Arc<E>, mut request: Request) -> Res
 where
     E: Endpoint,
 {
+    if request.method() == Method::OPTIONS {
+        return next.call(request).await.map(IntoResponse::into_response);
+    }
+
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let method = request.method().clone();
     let uri = request.original_uri().clone();
-    let remote_addr = request.remote_addr().to_string();
+    let function_name = function_name_for_request(&method, uri.path());
     let content_type = request.content_type().map(ToOwned::to_owned);
-    let headers = format_headers(request.headers());
     let body = request.take_body().into_vec().await?;
-    let body_byte_count = body.len();
-    let body_log = format_body(&body, content_type.as_deref());
+    let inputs = format_inputs(&body, content_type.as_deref(), &uri);
     request.set_body(Body::from(body));
 
-    println!(
-        "[primerlab-api][request:{request_id}] --> {method} {uri} remote={remote_addr} bodyBytes={}",
-        body_byte_count
-    );
-    println!("[primerlab-api][request:{request_id}] headers={headers}");
-    println!("[primerlab-api][request:{request_id}] body=\n{body_log}");
+    println!("[primerlab-api][request:{request_id}] {function_name} inputs=\n{inputs}");
 
-    let started_at = Instant::now();
-    match next.call(request).await {
-        Ok(output) => {
-            let response = output.into_response();
-            println!(
-                "[primerlab-api][request:{request_id}] <-- {method} {uri} status={} durationMs={}",
-                response.status().as_u16(),
-                started_at.elapsed().as_millis()
-            );
-            Ok(response)
+    next.call(request).await.map(IntoResponse::into_response)
+}
+
+fn function_name_for_request(method: &Method, path: &str) -> String {
+    match (method.as_str(), path) {
+        ("GET", "/health") => "health".to_string(),
+        ("POST", "/api/auth/register") => "register".to_string(),
+        ("POST", "/api/auth/login") => "login".to_string(),
+        ("GET", "/api/students") => "list_students".to_string(),
+        ("POST", "/api/lesson/start") => "start_lesson".to_string(),
+        ("POST", "/api/tutor/respond") => "tutor_respond".to_string(),
+        ("POST", "/api/artifact/infographic") => "infographic".to_string(),
+        ("POST", "/api/narration/speech") => "narration_speech".to_string(),
+        ("POST", "/api/tutor/stagegate") => "stagegate".to_string(),
+        ("POST", "/api/memory/profile") => "memory_profile".to_string(),
+        ("POST", "/api/memory/graph") => "memory_graph".to_string(),
+        ("GET", path) if path.strip_prefix("/api/students/").is_some() => {
+            "get_student".to_string()
         }
-        Err(error) => {
-            println!(
-                "[primerlab-api][request:{request_id}] <-- {method} {uri} error={error} durationMs={}",
-                started_at.elapsed().as_millis()
-            );
-            Err(error)
-        }
+        _ => format!("unmatched_route {} {}", method.as_str(), path),
     }
 }
 
-fn format_headers(headers: &HeaderMap) -> String {
-    let mut grouped_headers: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
-    for (name, value) in headers {
-        let name = name.as_str().to_string();
-        let value = if is_sensitive_header(&name) {
-            "[redacted]".to_string()
-        } else {
-            value
-                .to_str()
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|_| "<non-utf8 header value>".to_string())
-        };
-
-        grouped_headers.entry(name).or_default().push(value);
+fn format_inputs(body: &[u8], content_type: Option<&str>, uri: &Uri) -> String {
+    if !body.is_empty() {
+        return format_body(body, content_type);
     }
 
-    let mut json_headers = Map::new();
-    for (name, values) in grouped_headers {
-        let value = if values.len() == 1 {
-            json!(values[0])
-        } else {
-            json!(values)
-        };
-        json_headers.insert(name, value);
+    let mut inputs = Map::new();
+    if let Some(student_id) = uri
+        .path()
+        .strip_prefix("/api/students/")
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+    {
+        inputs.insert("studentId".to_string(), json!(student_id));
+    }
+    if let Some(query) = uri.query().filter(|value| !value.is_empty()) {
+        inputs.insert("query".to_string(), json!(query));
     }
 
-    serde_json::to_string_pretty(&Value::Object(json_headers)).unwrap_or_else(|_| "{}".to_string())
+    if inputs.is_empty() {
+        "<empty>".to_string()
+    } else {
+        serde_json::to_string_pretty(&Value::Object(inputs)).unwrap_or_else(|_| "{}".to_string())
+    }
 }
 
 fn format_body(body: &[u8], content_type: Option<&str>) -> String {
@@ -135,18 +129,6 @@ fn redact_json_value(value: &mut Value) {
         }
         _ => {}
     }
-}
-
-fn is_sensitive_header(name: &str) -> bool {
-    matches!(
-        normalize_name(name).as_str(),
-        "authorization"
-            | "cookie"
-            | "proxyauthorization"
-            | "setcookie"
-            | "xapikey"
-            | "xopenaiapikey"
-    )
 }
 
 fn is_sensitive_json_key(key: &str) -> bool {
