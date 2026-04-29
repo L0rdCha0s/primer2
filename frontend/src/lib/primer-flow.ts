@@ -97,6 +97,10 @@ export type StudentBookState = {
 };
 
 export const staticBookPageCount = 10;
+export const chooseTopicPageIndex = 3;
+export const firstLessonPageIndex = 4;
+export const lessonBookPageCount = 5;
+export const lessonStagegatePageOffset = 4;
 export type BookContentKind = "lesson";
 export type StudentBookContentPage = StudentBookPage & {
   kind: BookContentKind;
@@ -125,7 +129,7 @@ export function bookContentPageCount(
 export function visibleBookContentPages(
   lessons: StudentBookLesson[],
 ): StudentBookContentPage[] {
-  return lessons
+  return orderedBookLessons(lessons)
     .flatMap((lesson) =>
       lesson.pages.map((page) => ({
         page,
@@ -146,6 +150,78 @@ export function visibleBookContentPages(
         left.page.position - right.page.position,
     )
     .map(({ page }) => page);
+}
+
+export function orderedBookLessons(
+  lessons: StudentBookLesson[],
+): StudentBookLesson[] {
+  return lessons
+    .slice()
+    .sort(
+      (left, right) =>
+        left.position - right.position ||
+        left.createdAt.localeCompare(right.createdAt) ||
+        left.lessonId.localeCompare(right.lessonId),
+    );
+}
+
+export function lessonStoryPageIndex(lessonIndex: number): number {
+  return firstLessonPageIndex + safeLessonIndex(lessonIndex) * lessonBookPageCount;
+}
+
+export function lessonStagegatePageIndex(lessonIndex: number): number {
+  return lessonStoryPageIndex(lessonIndex) + lessonStagegatePageOffset;
+}
+
+export function unlockPageIndexForLessonCount(lessonCount: number): number {
+  return firstLessonPageIndex + safeLessonCount(lessonCount) * lessonBookPageCount;
+}
+
+export function nextTopicPageIndexForLessonCount(lessonCount: number): number {
+  return unlockPageIndexForLessonCount(lessonCount) + 1;
+}
+
+export function pageCountForLessonCount(lessonCount: number): number {
+  return nextTopicPageIndexForLessonCount(lessonCount) + 1;
+}
+
+export function currentBookLessonIndex(
+  book: Pick<StudentBookState, "currentLessonId" | "lessons"> | null,
+): number {
+  const lessons = orderedBookLessons(book?.lessons ?? []);
+  if (lessons.length === 0) {
+    return 0;
+  }
+
+  const currentIndex = lessons.findIndex(
+    (lesson) => lesson.lessonId === book?.currentLessonId,
+  );
+  return currentIndex >= 0 ? currentIndex : lessons.length - 1;
+}
+
+export function restoredBookTargetPage(book: StudentBookState): number {
+  const lessonCount = safeLessonCount(book.lessons.length);
+  const currentLessonIndex = currentBookLessonIndex(book);
+
+  if (book.latestStagegate) {
+    return book.hasPassedStagegate
+      ? nextTopicPageIndexForLessonCount(lessonCount)
+      : unlockPageIndexForLessonCount(lessonCount);
+  }
+
+  if (book.currentLesson) {
+    return lessonStoryPageIndex(currentLessonIndex);
+  }
+
+  return chooseTopicPageIndex;
+}
+
+function safeLessonIndex(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+function safeLessonCount(value: number): number {
+  return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
 }
 
 export function defaultBookPageIndex(

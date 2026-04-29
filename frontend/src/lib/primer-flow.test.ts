@@ -4,20 +4,28 @@ import {
   buildLessonStartBody,
   bookEndPageIndex,
   bookContentPageCount,
+  currentBookLessonIndex,
   defaultBookPageIndex,
   emptyStagegateResult,
   firstTopicHint,
+  lessonStagegatePageIndex,
+  lessonStoryPageIndex,
   initialLesson,
   isBookContentPage,
   mergeMemoryGraph,
+  nextTopicPageIndexForLessonCount,
   normalizeBookState,
   normalizeLesson,
   normalizeMemories,
   normalizeMemoryGraph,
   normalizeStagegateResult,
+  orderedBookLessons,
   openingProfileHint,
+  pageCountForLessonCount,
+  restoredBookTargetPage,
   stagesForStagegate,
   staticBookPageCount,
+  unlockPageIndexForLessonCount,
   visibleBookContentPages,
   type StudentMemoryGraph,
 } from "./primer-flow";
@@ -380,6 +388,72 @@ describe("persisted book contract normalization", () => {
     ]);
     expect(bookContentPageCount(visiblePages)).toBe(2);
     expect(defaultBookPageIndex(visiblePages)).toBe(11);
+  });
+
+  test("plans chronological lesson page ranges before the unlock pages", () => {
+    const book = normalizeBookState({
+      studentId: "student-123",
+      bookId: "book-1",
+      currentLessonId: "lesson-2",
+      currentLesson: { topic: "car motion" },
+      lessons: [
+        {
+          lessonId: "lesson-2",
+          topic: "car motion",
+          position: 2,
+          lesson: { topic: "car motion" },
+          pages: [],
+        },
+        {
+          lessonId: "lesson-1",
+          topic: "basketball and force",
+          position: 1,
+          lesson: { topic: "basketball and force" },
+          pages: [],
+        },
+      ],
+    });
+
+    expect(orderedBookLessons(book?.lessons ?? []).map((lesson) => lesson.topic))
+      .toEqual(["basketball and force", "car motion"]);
+    expect(currentBookLessonIndex(book)).toBe(1);
+    expect(lessonStoryPageIndex(0)).toBe(4);
+    expect(lessonStagegatePageIndex(0)).toBe(8);
+    expect(lessonStoryPageIndex(1)).toBe(9);
+    expect(lessonStagegatePageIndex(1)).toBe(13);
+    expect(unlockPageIndexForLessonCount(2)).toBe(14);
+    expect(nextTopicPageIndexForLessonCount(2)).toBe(15);
+    expect(pageCountForLessonCount(2)).toBe(16);
+    expect(restoredBookTargetPage(book!)).toBe(9);
+  });
+
+  test("restores completed current books to the next-topic chooser", () => {
+    const book = normalizeBookState({
+      studentId: "student-123",
+      bookId: "book-1",
+      currentLessonId: "lesson-2",
+      currentLesson: { topic: "car motion" },
+      latestStagegate: { passed: true, score: 0.92 },
+      hasPassedStagegate: true,
+      lessons: [
+        {
+          lessonId: "lesson-1",
+          topic: "basketball and force",
+          position: 1,
+          lesson: { topic: "basketball and force" },
+          pages: [],
+        },
+        {
+          lessonId: "lesson-2",
+          topic: "car motion",
+          position: 2,
+          lesson: { topic: "car motion" },
+          pages: [],
+        },
+      ],
+    });
+
+    expect(restoredBookTargetPage(book!)).toBe(15);
   });
 
   test("normalizes persisted book lessons, pages, and latest interaction state", () => {
