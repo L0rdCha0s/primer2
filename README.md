@@ -18,7 +18,6 @@ The platform turns learning into a guided journey. Each lesson is delivered as p
 - **AI-guided topic and lesson planning:** The backend uses OpenAI-powered reasoning to shape topic guidance, adaptive communication, lesson planning, and stagegate grading.
 - **Generated visual teaching artifacts:** Primer can generate infographics for lessons using image generation, while still providing graceful fallbacks when live AI credentials are unavailable.
 - **Stagegate progression:** Students move forward by proving understanding. The system can evaluate a response, unlock Level 2, and keep the experience grounded in mastery.
-- **Demo resilience:** The core path is built to keep working without live AI credentials, making Primer practical for development, demos, and hackathon review.
 - **Production-minded architecture:** A Rust API, typed JSON contracts, SeaORM persistence, migrations, Postgres, pgvector, and Apache AGE give the MVP a serious foundation.
 
 ## Value To Students
