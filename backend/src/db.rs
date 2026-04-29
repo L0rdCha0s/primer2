@@ -29,10 +29,12 @@ pub async fn init_database(db: &DatabaseConnection) -> Result<(), DbErr> {
         "CREATE EXTENSION IF NOT EXISTS vector",
         "CREATE EXTENSION IF NOT EXISTS age",
         "LOAD 'age'",
+        r#"SET search_path = ag_catalog, "$user", public"#,
         r#"SELECT ag_catalog.create_graph('primer_memory')
            WHERE NOT EXISTS (
                SELECT 1 FROM ag_catalog.ag_graph WHERE name = 'primer_memory'
            )"#,
+        "SET search_path TO public",
         r#"CREATE TABLE IF NOT EXISTS students (
             id uuid PRIMARY KEY,
             public_id text NOT NULL UNIQUE,

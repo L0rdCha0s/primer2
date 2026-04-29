@@ -1,4 +1,7 @@
-use crate::domain::{InfographicRequest, LessonStartRequest, StagegateRequest, StudentRecord};
+use crate::domain::{
+    InfographicRequest, LessonStartRequest, NarrationRequest, StagegateRequest, StudentRecord,
+};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
 
 #[derive(Clone)]
@@ -6,8 +9,13 @@ pub struct OpenAiClient {
     api_key: Option<String>,
     http: reqwest::Client,
     image_model: String,
+    speech_model: String,
+    speech_voice: String,
     text_model: String,
 }
+
+const OPENAI_SPEECH_INPUT_LIMIT: usize = 4096;
+const DEFAULT_NARRATION_INSTRUCTIONS: &str = "Narrate like a warm, curious story tutor reading a real book aloud. Use clear pacing, gentle emphasis, and an encouraging tone for a young learner.";
 
 impl OpenAiClient {
     pub fn from_env() -> Self {
@@ -18,6 +26,9 @@ impl OpenAiClient {
             http: reqwest::Client::new(),
             image_model: std::env::var("OPENAI_IMAGE_MODEL")
                 .unwrap_or_else(|_| "gpt-image-2".to_string()),
+            speech_model: std::env::var("OPENAI_TTS_MODEL")
+                .unwrap_or_else(|_| "gpt-4o-mini-tts".to_string()),
+            speech_voice: "fable".to_string(),
             text_model: std::env::var("OPENAI_TEXT_MODEL")
                 .unwrap_or_else(|_| "gpt-5.5".to_string()),
         }
@@ -33,6 +44,14 @@ impl OpenAiClient {
 
     pub fn image_model(&self) -> &str {
         &self.image_model
+    }
+
+    pub fn speech_model(&self) -> &str {
+        &self.speech_model
+    }
+
+    pub fn speech_voice(&self) -> &str {
+        &self.speech_voice
     }
 
     pub async fn guide_lesson(
@@ -86,7 +105,10 @@ Return only JSON that matches the provided schema."#;
         request: &StagegateRequest,
     ) -> Result<Value, String> {
         let Some(api_key) = self.api_key.as_deref() else {
-            return Ok(fallback_stagegate(request));
+            return Err(
+                "OpenAI API key is required to grade stagegates. Set OPENAI_API_KEY in backend/.env."
+                    .to_string(),
+            );
         };
 
         let system_prompt = r#"You are PrimerLab's stagegate assessor.
@@ -189,6 +211,84 @@ Return only JSON that matches the provided schema."#;
         }))
     }
 
+    pub async fn generate_narration(&self, request: &NarrationRequest) -> Result<Value, String> {
+        let Some(api_key) = self.api_key.as_deref() else {
+            return Ok(json!({
+                "aiMode": "missing_openai_api_key",
+                "model": self.speech_model,
+                "voice": self.speech_voice,
+                "generated": false,
+                "message": "Set OPENAI_API_KEY in backend/.env to generate OpenAI TTS narration."
+            }));
+        };
+
+        let input = trim_speech_input(&request.text);
+        if input.is_empty() {
+            return Err("Narration text is required.".to_string());
+        }
+
+        let instructions = request
+            .instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_NARRATION_INSTRUCTIONS);
+
+        let mut body = json!({
+            "model": self.speech_model,
+            "voice": self.speech_voice,
+            "input": input,
+            "response_format": "mp3",
+            "speed": 0.95
+        });
+
+        if self.speech_model.starts_with("gpt-4o-mini-tts") {
+            body["instructions"] = json!(instructions);
+        }
+
+        let response = self
+            .http
+            .post("https://api.openai.com/v1/audio/speech")
+            .bearer_auth(api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| format!("OpenAI TTS request failed: {error}"))?;
+
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("audio/mpeg")
+            .to_string();
+        let payload = response
+            .bytes()
+            .await
+            .map_err(|error| format!("OpenAI TTS response was not readable: {error}"))?;
+
+        if !status.is_success() {
+            return Err(format!(
+                "OpenAI TTS API returned {status}: {}",
+                String::from_utf8_lossy(&payload)
+            ));
+        }
+
+        Ok(json!({
+            "aiMode": "openai_audio_speech",
+            "model": self.speech_model,
+            "voice": self.speech_voice,
+            "generated": true,
+            "topic": request.topic,
+            "contentType": content_type,
+            "audioDataUrl": format!(
+                "data:{content_type};base64,{}",
+                BASE64_STANDARD.encode(payload)
+            ),
+            "inputCharacters": input.chars().count()
+        }))
+    }
+
     async fn responses_json(
         &self,
         api_key: &str,
@@ -244,6 +344,13 @@ Return only JSON that matches the provided schema."#;
         serde_json::from_str(&output_text)
             .map_err(|error| format!("OpenAI Responses output was not valid JSON: {error}"))
     }
+}
+
+fn trim_speech_input(text: &str) -> String {
+    text.trim()
+        .chars()
+        .take(OPENAI_SPEECH_INPUT_LIMIT)
+        .collect()
 }
 
 pub fn build_infographic_prompt(student: &StudentRecord, request: &InfographicRequest) -> String {
@@ -394,53 +501,6 @@ fn stagegate_schema() -> Value {
                     }
                 }
             }
-        }
-    })
-}
-
-pub fn fallback_stagegate(request: &StagegateRequest) -> Value {
-    let score = if request.answer.trim().len() > 48 {
-        0.78
-    } else {
-        0.45
-    };
-    let passed = score >= 0.75;
-
-    json!({
-        "aiMode": "missing_openai_api_key",
-        "passed": passed,
-        "score": score,
-        "rubric": {
-            "accuracy": score,
-            "causalReasoning": score,
-            "vocabulary": score,
-            "transfer": score
-        },
-        "masteryEvidence": if passed {
-            json!(["Submitted a complete enough demo answer for local fallback grading."])
-        } else {
-            json!([])
-        },
-        "gaps": if passed {
-            json!(["Connect this answer to a new example next."])
-        } else {
-            json!(["Add more detail before the Primer unlocks the next level."])
-        },
-        "feedbackToStudent": if passed {
-            "Local fallback passed this answer. Add OPENAI_API_KEY for real rubric grading."
-        } else {
-            "This answer needs more detail. Add OPENAI_API_KEY for real rubric grading."
-        },
-        "nextLevelUnlocked": if passed { json!("mechanism") } else { Value::Null },
-        "newMemories": if passed {
-            json!([{
-                "memoryType": "knowledge",
-                "content": format!("Learner made progress on {} at the intuition level.", request.topic),
-                "confidence": 0.6,
-                "tags": ["local-fallback", request.topic.as_str()]
-            }])
-        } else {
-            json!([])
         }
     })
 }

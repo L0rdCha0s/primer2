@@ -7,6 +7,8 @@
     "db:migrate": "cargo run --manifest-path backend/migration/Cargo.toml -- up",
     "dev:frontend": "npm --prefix frontend run dev",
     "dev:backend": "./run.sh",
+    "dev:test:frontend": "NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:4100 npm --prefix frontend run dev -- --port 3001",
+    "dev:test:backend": "./run-test.sh",
     "build:frontend": "npm --prefix frontend run build",
     "lint:frontend": "npm --prefix frontend run lint",
     "check:backend": "cargo check --manifest-path backend/Cargo.toml",

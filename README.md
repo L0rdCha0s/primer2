@@ -58,6 +58,16 @@ Or start Postgres, wait for it, migrate, and run the API:
 ./run.sh
 ```
 
+Run an isolated test API without touching the default API or database ports:
+
+```bash
+./run-test.sh
+```
+
+The test API binds to `127.0.0.1:4100` and its Postgres instance is exposed on
+`127.0.0.1:15434` by default. Override `BIND_ADDR` or `PRIMERLAB_DB_PORT` when
+you need another pair of ports.
+
 ## Frontend
 
 ```bash

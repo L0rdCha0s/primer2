@@ -77,171 +77,154 @@ export function AuthGate({ onAuthenticated }: AuthGateProps) {
   }
 
   return (
-    <main className="min-h-screen overflow-hidden bg-[#111515] text-stone-100">
+    <main className="relative min-h-[100svh] overflow-hidden bg-[#111515] text-stone-100">
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_18%_14%,rgba(76,139,141,0.34),transparent_34%),radial-gradient(circle_at_84%_22%,rgba(215,170,92,0.2),transparent_30%),linear-gradient(135deg,#101818_0%,#182321_56%,#0d1112_100%)]" />
-      <div className="relative mx-auto grid min-h-screen w-full max-w-[1180px] items-center gap-10 px-5 py-8 lg:grid-cols-[1fr_420px] lg:px-8">
-        <section className="max-w-2xl">
-          <div className="inline-flex items-center gap-2 border border-cyan-100/25 px-3 py-1 text-xs uppercase text-cyan-50/80">
+      <section className="relative z-10 mx-auto flex min-h-[100svh] w-full max-w-[430px] flex-col justify-center px-5 py-8">
+        <div className="mb-7 text-center">
+          <div className="inline-flex items-center gap-2 text-xs uppercase text-cyan-50/78">
             <BookOpen className="h-3.5 w-3.5" />
             PrimerLab
           </div>
-          <h1 className="mt-7 max-w-[11ch] text-5xl font-semibold leading-[1.02] text-stone-50 sm:text-6xl">
-            Open your Primer.
+          <h1 className="mt-4 text-3xl font-semibold leading-tight text-stone-50">
+            {isSignup ? "Create student profile" : "Welcome back"}
           </h1>
-          <p className="mt-5 max-w-xl text-lg leading-8 text-cyan-50/76">
-            Create a student profile so the story book can remember interests,
-            tune examples, and keep progress separate.
-          </p>
-          <div className="mt-10 grid max-w-xl gap-3 sm:grid-cols-4">
-            {["Username", "Age", "Biography", "Interests"].map((item) => (
-              <div
-                key={item}
-                className="border-l border-cyan-100/20 bg-cyan-50/6 px-4 py-3"
+        </div>
+
+        <div className="flex rounded-[8px] border border-cyan-100/12 bg-black/20 p-1">
+          <button
+            type="button"
+            onClick={() => setMode("signup")}
+            className={`h-10 flex-1 rounded-[6px] text-sm font-semibold transition ${
+              isSignup
+                ? "bg-[#d8b86a] text-[#17201d]"
+                : "text-cyan-50/72 hover:text-cyan-50"
+            }`}
+          >
+            Sign up
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("login")}
+            className={`h-10 flex-1 rounded-[6px] text-sm font-semibold transition ${
+              !isSignup
+                ? "bg-[#d8b86a] text-[#17201d]"
+                : "text-cyan-50/72 hover:text-cyan-50"
+            }`}
+          >
+            Sign in
+          </button>
+        </div>
+
+        <form className="mt-5 grid gap-4" onSubmit={submitAuth}>
+          <AuthField icon={UserRound} label="Username" htmlFor="username">
+            <input
+              id="username"
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              minLength={3}
+              required
+              className="auth-input"
+              autoComplete="username"
+            />
+          </AuthField>
+
+          <AuthField icon={KeyRound} label="Password" htmlFor="password">
+            <input
+              id="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              minLength={8}
+              required
+              type="password"
+              className="auth-input"
+              autoComplete={isSignup ? "new-password" : "current-password"}
+            />
+          </AuthField>
+
+          {isSignup ? (
+            <>
+              <AuthField
+                icon={Sparkles}
+                label="Display name"
+                htmlFor="display-name"
               >
-                <p className="text-xs uppercase text-cyan-100/58">{item}</p>
-                <p className="mt-1 text-sm text-stone-200">Required</p>
-              </div>
-            ))}
-          </div>
-        </section>
+                <input
+                  id="display-name"
+                  value={displayName}
+                  onChange={(event) => setDisplayName(event.target.value)}
+                  required
+                  className="auth-input"
+                  autoComplete="given-name"
+                />
+              </AuthField>
 
-        <section className="rounded-[8px] border border-cyan-100/12 bg-[#0d1414]/84 p-5 shadow-2xl shadow-black/35">
-          <div className="flex rounded-[8px] border border-cyan-100/12 bg-black/20 p-1">
-            <button
-              type="button"
-              onClick={() => setMode("signup")}
-              className={`h-10 flex-1 rounded-[6px] text-sm font-semibold transition ${
-                isSignup
-                  ? "bg-[#d8b86a] text-[#17201d]"
-                  : "text-cyan-50/72 hover:text-cyan-50"
-              }`}
-            >
-              Sign up
-            </button>
-            <button
-              type="button"
-              onClick={() => setMode("login")}
-              className={`h-10 flex-1 rounded-[6px] text-sm font-semibold transition ${
-                !isSignup
-                  ? "bg-[#d8b86a] text-[#17201d]"
-                  : "text-cyan-50/72 hover:text-cyan-50"
-              }`}
-            >
-              Sign in
-            </button>
-          </div>
+              <AuthField icon={CalendarDays} label="Age" htmlFor="age">
+                <input
+                  id="age"
+                  value={age}
+                  onChange={(event) => setAge(event.target.value)}
+                  min={5}
+                  max={18}
+                  required
+                  type="number"
+                  className="auth-input"
+                  inputMode="numeric"
+                />
+              </AuthField>
 
-          <form className="mt-5 grid gap-4" onSubmit={submitAuth}>
-            <AuthField icon={UserRound} label="Username" htmlFor="username">
-              <input
-                id="username"
-                value={username}
-                onChange={(event) => setUsername(event.target.value)}
-                minLength={3}
-                required
-                className="auth-input"
-                autoComplete="username"
-              />
-            </AuthField>
+              <AuthField
+                icon={Sparkles}
+                label="Biography"
+                htmlFor="biography"
+              >
+                <textarea
+                  id="biography"
+                  value={biography}
+                  onChange={(event) => setBiography(event.target.value)}
+                  required
+                  className="auth-textarea"
+                  placeholder="Loves tide pools, builds paper machines, asks why storms happen"
+                  rows={4}
+                />
+              </AuthField>
 
-            <AuthField icon={KeyRound} label="Password" htmlFor="password">
-              <input
-                id="password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                minLength={8}
-                required
-                type="password"
-                className="auth-input"
-                autoComplete={isSignup ? "new-password" : "current-password"}
-              />
-            </AuthField>
+              <AuthField
+                icon={Sparkles}
+                label="Interests"
+                htmlFor="interests"
+              >
+                <input
+                  id="interests"
+                  value={interests}
+                  onChange={(event) => setInterests(event.target.value)}
+                  required
+                  className="auth-input"
+                  placeholder="marine biology, drawing, puzzles"
+                />
+              </AuthField>
+            </>
+          ) : null}
 
-            {isSignup ? (
-              <>
-                <AuthField
-                  icon={Sparkles}
-                  label="Display name"
-                  htmlFor="display-name"
-                >
-                  <input
-                    id="display-name"
-                    value={displayName}
-                    onChange={(event) => setDisplayName(event.target.value)}
-                    required
-                    className="auth-input"
-                    autoComplete="given-name"
-                  />
-                </AuthField>
+          {error ? (
+            <p className="rounded-[8px] border border-red-300/25 bg-red-950/28 px-3 py-2 text-sm leading-6 text-red-100">
+              {error}
+            </p>
+          ) : null}
 
-                <AuthField icon={CalendarDays} label="Age" htmlFor="age">
-                  <input
-                    id="age"
-                    value={age}
-                    onChange={(event) => setAge(event.target.value)}
-                    min={5}
-                    max={18}
-                    required
-                    type="number"
-                    className="auth-input"
-                    inputMode="numeric"
-                  />
-                </AuthField>
-
-                <AuthField
-                  icon={Sparkles}
-                  label="Biography"
-                  htmlFor="biography"
-                >
-                  <textarea
-                    id="biography"
-                    value={biography}
-                    onChange={(event) => setBiography(event.target.value)}
-                    required
-                    className="auth-textarea"
-                    placeholder="Loves tide pools, builds paper machines, asks why storms happen"
-                    rows={4}
-                  />
-                </AuthField>
-
-                <AuthField
-                  icon={Sparkles}
-                  label="Interests"
-                  htmlFor="interests"
-                >
-                  <input
-                    id="interests"
-                    value={interests}
-                    onChange={(event) => setInterests(event.target.value)}
-                    required
-                    className="auth-input"
-                    placeholder="marine biology, drawing, puzzles"
-                  />
-                </AuthField>
-              </>
-            ) : null}
-
-            {error ? (
-              <p className="rounded-[8px] border border-red-300/25 bg-red-950/28 px-3 py-2 text-sm leading-6 text-red-100">
-                {error}
-              </p>
-            ) : null}
-
-            <button
-              type="submit"
-              disabled={isSubmitting}
-              className="mt-1 inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#d8b86a] px-5 text-sm font-semibold text-[#17201d] transition hover:bg-[#e5c879] disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              <LogIn className="h-4 w-4" />
-              {isSubmitting
-                ? "Checking..."
-                : isSignup
-                  ? "Create student profile"
-                  : "Sign in"}
-            </button>
-          </form>
-        </section>
-      </div>
+          <button
+            type="submit"
+            disabled={isSubmitting}
+            className="mt-1 inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#d8b86a] px-5 text-sm font-semibold text-[#17201d] transition hover:bg-[#e5c879] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <LogIn className="h-4 w-4" />
+            {isSubmitting
+              ? "Checking..."
+              : isSignup
+                ? "Create student profile"
+                : "Sign in"}
+          </button>
+        </form>
+      </section>
     </main>
   );
 }

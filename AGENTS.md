@@ -41,6 +41,8 @@ We are building PrimerLab, a hackathon MVP for an adaptive story-driven tutor in
 
 ## Not Negotiable
 - Ensure that all modules in the frontend and backend are kept small and tight, and focused. Modularise wherre things grow beyond control
+- Ensure the API logs detailed information about all requests to the CLI stdout so we can see what's happening, and so you can debug in test mode
 
 ## System
 - We have a psql client at /Applications/Postgres.app/Contents/Versions/latest/bin/psql that you can use to connect to our docker postgresql instance.
+- For testing, to ensure we don't stomp on the running API - spin up a parallel instance of everything required (database, frontend, backend)

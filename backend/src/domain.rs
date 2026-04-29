@@ -87,6 +87,15 @@ pub struct InfographicRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct NarrationRequest {
+    pub student_id: Option<String>,
+    pub topic: Option<String>,
+    pub text: String,
+    pub instructions: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StagegateRequest {
     pub student_id: Option<String>,
     pub topic: String,
@@ -101,6 +110,16 @@ pub struct MemoryProfileRequest {
     pub valid_as_of: Option<DateTime<Utc>>,
     pub known_as_of: Option<DateTime<Utc>>,
     pub max_facts: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryGraphRequest {
+    pub student_id: Option<String>,
+    pub node_id: Option<String>,
+    pub valid_as_of: Option<DateTime<Utc>>,
+    pub known_as_of: Option<DateTime<Utc>>,
+    pub max_edges: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,6 +166,47 @@ pub struct StudentMemoryProfile {
     pub subject_facts: Vec<MemoryAssertionRecord>,
     pub inbound_facts: Vec<MemoryAssertionRecord>,
     pub timeline: Vec<MemoryAssertionRecord>,
+    pub valid_as_of: String,
+    pub known_as_of: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryGraphNode {
+    pub id: String,
+    pub node_type: String,
+    pub kind: String,
+    pub label: String,
+    pub summary: Option<String>,
+    pub expanded: bool,
+    pub fact_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryGraphEdge {
+    pub id: String,
+    pub source: String,
+    pub target: String,
+    pub label: String,
+    pub assertion_id: String,
+    pub predicate: String,
+    pub content: String,
+    pub memory_type: String,
+    pub confidence: f64,
+    pub observed_at: String,
+    pub valid_from: Option<String>,
+    pub known_from: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudentMemoryGraph {
+    pub student_id: String,
+    pub root_node_id: String,
+    pub selected_node_id: String,
+    pub nodes: Vec<MemoryGraphNode>,
+    pub edges: Vec<MemoryGraphEdge>,
     pub valid_as_of: String,
     pub known_as_of: String,
 }

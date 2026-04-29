@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use crate::{
     domain::{
-        MemoryAssertionRecord, MemoryEntityRecord, MemoryProfileRequest, StudentMemory,
+        MemoryAssertionRecord, MemoryEntityRecord, MemoryGraphEdge, MemoryGraphNode,
+        MemoryGraphRequest, MemoryProfileRequest, StudentMemory, StudentMemoryGraph,
         StudentMemoryProfile,
     },
     entities::student,
@@ -313,6 +316,126 @@ pub async fn profile_for_student(
         subject_facts,
         inbound_facts,
         timeline,
+        valid_as_of: valid_as_of.to_rfc3339(),
+        known_as_of: known_as_of.to_rfc3339(),
+    }))
+}
+
+pub async fn graph_for_student(
+    db: &DatabaseConnection,
+    public_id: &str,
+    request: MemoryGraphRequest,
+) -> Result<Option<StudentMemoryGraph>, DbErr> {
+    let Some(student_id) = student_id_for_public_id(db, public_id).await? else {
+        return Ok(None);
+    };
+    let Some((root_entity_id, root_entity)) = root_student_entity(db, student_id).await? else {
+        return Ok(None);
+    };
+
+    let valid_as_of = request.valid_as_of.unwrap_or_else(Utc::now).fixed_offset();
+    let known_as_of = request.known_as_of.unwrap_or_else(Utc::now).fixed_offset();
+    let max_edges = i64::from(request.max_edges.unwrap_or(24).clamp(1, 100));
+    let root_node_id = entity_node_id(root_entity_id);
+    let requested_node_id = request.node_id.as_deref().unwrap_or(&root_node_id);
+    let selected = GraphSelection::from_node_id(requested_node_id)
+        .unwrap_or(GraphSelection::Entity(root_entity_id));
+
+    let rows = match selected {
+        GraphSelection::Entity(entity_id) => {
+            graph_assertions_for_entity(
+                db,
+                student_id,
+                entity_id,
+                valid_as_of,
+                known_as_of,
+                max_edges,
+            )
+            .await?
+        }
+        GraphSelection::Value(assertion_id) => {
+            graph_assertions_for_value(db, student_id, assertion_id, valid_as_of, known_as_of)
+                .await?
+        }
+    };
+
+    let selected_node_id = selected.node_id();
+    let mut nodes = BTreeMap::new();
+    nodes.insert(root_node_id.clone(), root_entity);
+
+    if let GraphSelection::Entity(entity_id) = selected {
+        if let Some(selected_entity) = graph_entity_node(db, student_id, entity_id, true).await? {
+            nodes.insert(entity_node_id(entity_id), selected_entity);
+        }
+    }
+
+    let mut edges = Vec::new();
+    for row in rows {
+        let subject_node_id = entity_node_id(row.subject_entity_id);
+        nodes.entry(subject_node_id.clone()).or_insert_with(|| {
+            graph_node(
+                &subject_node_id,
+                "entity",
+                &row.subject_kind,
+                &row.subject_name,
+                None,
+                row.subject_entity_id == selected.entity_id().unwrap_or_default(),
+            )
+        });
+
+        let target_node_id = if let Some(object_entity_id) = row.object_entity_id {
+            let object_node_id = entity_node_id(object_entity_id);
+            nodes.entry(object_node_id.clone()).or_insert_with(|| {
+                graph_node(
+                    &object_node_id,
+                    "entity",
+                    row.object_kind.as_deref().unwrap_or("memory"),
+                    row.object_name.as_deref().unwrap_or("Memory node"),
+                    None,
+                    object_entity_id == selected.entity_id().unwrap_or_default(),
+                )
+            });
+            object_node_id
+        } else {
+            let value_node_id = value_node_id(row.assertion_id);
+            nodes.entry(value_node_id.clone()).or_insert_with(|| {
+                graph_node(
+                    &value_node_id,
+                    "value",
+                    &row.memory_type,
+                    &shorten_label(&row.content),
+                    Some(row.content.clone()),
+                    row.assertion_id == selected.value_assertion_id().unwrap_or_default(),
+                )
+            });
+            value_node_id
+        };
+
+        increment_fact_count(&mut nodes, &subject_node_id);
+        increment_fact_count(&mut nodes, &target_node_id);
+
+        edges.push(MemoryGraphEdge {
+            id: row.assertion_id.to_string(),
+            source: subject_node_id,
+            target: target_node_id,
+            label: row.predicate.replace('_', " "),
+            assertion_id: row.assertion_id.to_string(),
+            predicate: row.predicate,
+            content: row.content,
+            memory_type: row.memory_type,
+            confidence: row.confidence,
+            observed_at: row.observed_at.to_rfc3339(),
+            valid_from: row.valid_from.map(|value| value.to_rfc3339()),
+            known_from: row.known_from.map(|value| value.to_rfc3339()),
+        });
+    }
+
+    Ok(Some(StudentMemoryGraph {
+        student_id: public_id.to_string(),
+        root_node_id,
+        selected_node_id,
+        nodes: nodes.into_values().collect(),
+        edges,
         valid_as_of: valid_as_of.to_rfc3339(),
         known_as_of: known_as_of.to_rfc3339(),
     }))
@@ -649,6 +772,333 @@ async fn timeline_assertions(
     rows.into_iter()
         .map(|row| assertion_record_from_row(&row))
         .collect()
+}
+
+async fn student_id_for_public_id(
+    db: &DatabaseConnection,
+    public_id: &str,
+) -> Result<Option<Uuid>, DbErr> {
+    db.query_one(statement(
+        "SELECT id FROM students WHERE public_id = $1",
+        vec![public_id.to_string().into()],
+    ))
+    .await?
+    .map(|row| row.try_get("", "id"))
+    .transpose()
+}
+
+async fn root_student_entity(
+    db: &DatabaseConnection,
+    student_id: Uuid,
+) -> Result<Option<(Uuid, MemoryGraphNode)>, DbErr> {
+    let Some(row) = db
+        .query_one(statement(
+            r#"
+            SELECT id, kind, canonical_name, identity_key
+            FROM memory_entities
+            WHERE student_id = $1
+              AND kind = 'student'
+              AND status = 'active'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+            vec![student_id.into()],
+        ))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let entity_id: Uuid = row.try_get("", "id")?;
+    let kind: String = row.try_get("", "kind")?;
+    let canonical_name: String = row.try_get("", "canonical_name")?;
+
+    Ok(Some((
+        entity_id,
+        graph_node(
+            &entity_node_id(entity_id),
+            "entity",
+            &kind,
+            &canonical_name,
+            None,
+            true,
+        ),
+    )))
+}
+
+async fn graph_entity_node(
+    db: &DatabaseConnection,
+    student_id: Uuid,
+    entity_id: Uuid,
+    expanded: bool,
+) -> Result<Option<MemoryGraphNode>, DbErr> {
+    let Some(row) = db
+        .query_one(statement(
+            r#"
+            SELECT id, kind, canonical_name
+            FROM memory_entities
+            WHERE student_id = $1
+              AND id = $2
+              AND status = 'active'
+            "#,
+            vec![student_id.into(), entity_id.into()],
+        ))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let kind: String = row.try_get("", "kind")?;
+    let canonical_name: String = row.try_get("", "canonical_name")?;
+
+    Ok(Some(graph_node(
+        &entity_node_id(entity_id),
+        "entity",
+        &kind,
+        &canonical_name,
+        None,
+        expanded,
+    )))
+}
+
+async fn graph_assertions_for_entity(
+    db: &DatabaseConnection,
+    student_id: Uuid,
+    entity_id: Uuid,
+    valid_as_of: DateTime<FixedOffset>,
+    known_as_of: DateTime<FixedOffset>,
+    limit: i64,
+) -> Result<Vec<GraphAssertionRow>, DbErr> {
+    let rows = db
+        .query_all(statement(
+            graph_assertion_select_sql(
+                r#"
+                a.student_id = $1
+                AND (a.subject_entity_id = $2 OR a.object_entity_id = $2)
+                AND a.status IN ('active', 'superseded')
+                AND a.valid_period @> $3
+                AND a.tx_period @> $4
+                ORDER BY a.salience DESC, a.observed_at DESC, a.id
+                LIMIT $5
+                "#,
+            )
+            .as_str(),
+            vec![
+                student_id.into(),
+                entity_id.into(),
+                valid_as_of.into(),
+                known_as_of.into(),
+                limit.into(),
+            ],
+        ))
+        .await?;
+
+    rows.into_iter()
+        .map(|row| graph_row_from_row(&row))
+        .collect()
+}
+
+async fn graph_assertions_for_value(
+    db: &DatabaseConnection,
+    student_id: Uuid,
+    assertion_id: Uuid,
+    valid_as_of: DateTime<FixedOffset>,
+    known_as_of: DateTime<FixedOffset>,
+) -> Result<Vec<GraphAssertionRow>, DbErr> {
+    let rows = db
+        .query_all(statement(
+            graph_assertion_select_sql(
+                r#"
+                a.student_id = $1
+                AND a.id = $2
+                AND a.status IN ('active', 'superseded')
+                AND a.valid_period @> $3
+                AND a.tx_period @> $4
+                LIMIT 1
+                "#,
+            )
+            .as_str(),
+            vec![
+                student_id.into(),
+                assertion_id.into(),
+                valid_as_of.into(),
+                known_as_of.into(),
+            ],
+        ))
+        .await?;
+
+    rows.into_iter()
+        .map(|row| graph_row_from_row(&row))
+        .collect()
+}
+
+fn graph_assertion_select_sql(where_clause: &str) -> String {
+    format!(
+        r#"
+        SELECT a.id AS assertion_id,
+               a.predicate,
+               a.object_entity_id,
+               a.object_text,
+               a.object_value,
+               a.qualifiers,
+               a.metadata,
+               a.confidence,
+               a.salience,
+               lower(a.valid_period) AS valid_from,
+               lower(a.tx_period) AS known_from,
+               a.observed_at,
+               s.id AS subject_entity_id,
+               s.kind AS subject_kind,
+               s.canonical_name AS subject_name,
+               s.identity_key AS subject_identity_key,
+               o.kind AS object_kind,
+               o.canonical_name AS object_name,
+               o.identity_key AS object_identity_key
+        FROM memory_assertions a
+        JOIN memory_entities s ON s.id = a.subject_entity_id
+        LEFT JOIN memory_entities o ON o.id = a.object_entity_id
+        WHERE {where_clause}
+        "#
+    )
+}
+
+#[derive(Clone)]
+struct GraphAssertionRow {
+    assertion_id: Uuid,
+    predicate: String,
+    subject_entity_id: Uuid,
+    subject_kind: String,
+    subject_name: String,
+    object_entity_id: Option<Uuid>,
+    object_kind: Option<String>,
+    object_name: Option<String>,
+    content: String,
+    memory_type: String,
+    confidence: f64,
+    valid_from: Option<DateTime<FixedOffset>>,
+    known_from: Option<DateTime<FixedOffset>>,
+    observed_at: DateTime<FixedOffset>,
+}
+
+fn graph_row_from_row(row: &QueryResult) -> Result<GraphAssertionRow, DbErr> {
+    let assertion_id: Uuid = row.try_get("", "assertion_id")?;
+    let predicate: String = row.try_get("", "predicate")?;
+    let object_text: Option<String> = row.try_get("", "object_text")?;
+    let metadata: JsonValue = row.try_get("", "metadata")?;
+    let object_name: Option<String> = row.try_get("", "object_name")?;
+    let content = display_content(&metadata, object_text.as_deref(), object_name.as_deref());
+    let memory_type = metadata
+        .get("memory_type")
+        .and_then(JsonValue::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| memory_type_for_predicate(&predicate).to_string());
+
+    Ok(GraphAssertionRow {
+        assertion_id,
+        predicate,
+        subject_entity_id: row.try_get("", "subject_entity_id")?,
+        subject_kind: row.try_get("", "subject_kind")?,
+        subject_name: row.try_get("", "subject_name")?,
+        object_entity_id: row.try_get("", "object_entity_id")?,
+        object_kind: row.try_get("", "object_kind")?,
+        object_name,
+        content,
+        memory_type,
+        confidence: row.try_get("", "confidence")?,
+        valid_from: row.try_get("", "valid_from")?,
+        known_from: row.try_get("", "known_from")?,
+        observed_at: row.try_get("", "observed_at")?,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum GraphSelection {
+    Entity(Uuid),
+    Value(Uuid),
+}
+
+impl GraphSelection {
+    fn from_node_id(node_id: &str) -> Option<Self> {
+        parse_entity_node_id(node_id)
+            .map(Self::Entity)
+            .or_else(|| parse_value_node_id(node_id).map(Self::Value))
+    }
+
+    fn node_id(self) -> String {
+        match self {
+            Self::Entity(entity_id) => entity_node_id(entity_id),
+            Self::Value(assertion_id) => value_node_id(assertion_id),
+        }
+    }
+
+    fn entity_id(self) -> Option<Uuid> {
+        match self {
+            Self::Entity(entity_id) => Some(entity_id),
+            Self::Value(_) => None,
+        }
+    }
+
+    fn value_assertion_id(self) -> Option<Uuid> {
+        match self {
+            Self::Entity(_) => None,
+            Self::Value(assertion_id) => Some(assertion_id),
+        }
+    }
+}
+
+fn graph_node(
+    id: &str,
+    node_type: &str,
+    kind: &str,
+    label: &str,
+    summary: Option<String>,
+    expanded: bool,
+) -> MemoryGraphNode {
+    MemoryGraphNode {
+        id: id.to_string(),
+        node_type: node_type.to_string(),
+        kind: kind.to_string(),
+        label: shorten_label(label),
+        summary,
+        expanded,
+        fact_count: 0,
+    }
+}
+
+fn increment_fact_count(nodes: &mut BTreeMap<String, MemoryGraphNode>, node_id: &str) {
+    if let Some(node) = nodes.get_mut(node_id) {
+        node.fact_count += 1;
+    }
+}
+
+fn entity_node_id(entity_id: Uuid) -> String {
+    format!("entity:{entity_id}")
+}
+
+fn value_node_id(assertion_id: Uuid) -> String {
+    format!("value:{assertion_id}")
+}
+
+fn parse_entity_node_id(node_id: &str) -> Option<Uuid> {
+    node_id
+        .strip_prefix("entity:")
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn parse_value_node_id(node_id: &str) -> Option<Uuid> {
+    node_id
+        .strip_prefix("value:")
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn shorten_label(label: &str) -> String {
+    const MAX_CHARS: usize = 58;
+    let trimmed = label.trim();
+    if trimmed.chars().count() <= MAX_CHARS {
+        return trimmed.to_string();
+    }
+
+    let mut output = trimmed.chars().take(MAX_CHARS).collect::<String>();
+    output.push_str("...");
+    output
 }
 
 async fn project_entity(

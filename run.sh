@@ -14,10 +14,33 @@ for _ in {1..30}; do
     sleep 1
 done
 
+DATABASE_URL_WAS_SET=0
+DATABASE_URL_OVERRIDE=""
+BIND_ADDR_WAS_SET=0
+BIND_ADDR_OVERRIDE=""
+
+if [[ ${DATABASE_URL+x} ]]; then
+    DATABASE_URL_WAS_SET=1
+    DATABASE_URL_OVERRIDE="$DATABASE_URL"
+fi
+
+if [[ ${BIND_ADDR+x} ]]; then
+    BIND_ADDR_WAS_SET=1
+    BIND_ADDR_OVERRIDE="$BIND_ADDR"
+fi
+
 if [[ -f "$ROOT_DIR/backend/.env" ]]; then
     set -a
     source "$ROOT_DIR/backend/.env"
     set +a
+fi
+
+if [[ "$DATABASE_URL_WAS_SET" -eq 1 ]]; then
+    export DATABASE_URL="$DATABASE_URL_OVERRIDE"
+fi
+
+if [[ "$BIND_ADDR_WAS_SET" -eq 1 ]]; then
+    export BIND_ADDR="$BIND_ADDR_OVERRIDE"
 fi
 
 : "${DATABASE_URL:?DATABASE_URL must be set in backend/.env or the environment before running migrations}"

@@ -2,7 +2,8 @@ use crate::{
     AppState, db,
     domain::{
         DEFAULT_STUDENT_PUBLIC_ID, InfographicRequest, LessonStartRequest, LoginRequest,
-        MemoryProfileRequest, RegisterRequest, StagegateRequest,
+        MemoryGraphRequest, MemoryProfileRequest, NarrationRequest, RegisterRequest,
+        StagegateRequest,
     },
     memory,
     openai::build_infographic_prompt,
@@ -23,8 +24,10 @@ pub fn api_routes() -> Route {
         .at("/api/lesson/start", post(start_lesson))
         .at("/api/tutor/respond", post(tutor_respond))
         .at("/api/artifact/infographic", post(infographic))
+        .at("/api/narration/speech", post(narration_speech))
         .at("/api/tutor/stagegate", post(stagegate))
         .at("/api/memory/profile", post(memory_profile))
+        .at("/api/memory/graph", post(memory_graph))
 }
 
 #[handler]
@@ -34,6 +37,8 @@ fn health(Data(state): Data<&AppState>) -> Json<Value> {
         "service": "primerlab-api",
         "textModel": state.openai.text_model(),
         "imageModel": state.openai.image_model(),
+        "speechModel": state.openai.speech_model(),
+        "speechVoice": state.openai.speech_voice(),
         "hasOpenAiKey": state.openai.has_api_key()
     }))
 }
@@ -177,6 +182,29 @@ async fn infographic(
 }
 
 #[handler]
+async fn narration_speech(
+    Data(state): Data<&AppState>,
+    Json(request): Json<NarrationRequest>,
+) -> Json<Value> {
+    let student_id = request.student_id.clone();
+    let result = match state.openai.generate_narration(&request).await {
+        Ok(result) => result,
+        Err(error) => json!({
+            "aiMode": "openai_error",
+            "generated": false,
+            "error": error,
+            "model": state.openai.speech_model(),
+            "voice": state.openai.speech_voice()
+        }),
+    };
+
+    Json(json!({
+        "studentId": student_id,
+        "narration": result
+    }))
+}
+
+#[handler]
 async fn stagegate(
     Data(state): Data<&AppState>,
     Json(request): Json<StagegateRequest>,
@@ -192,10 +220,15 @@ async fn stagegate(
 
     let result = match state.openai.grade_stagegate(&student, &request).await {
         Ok(result) => result,
-        Err(error) => json!({
-            "aiMode": "openai_error",
-            "error": error,
-        }),
+        Err(error) => {
+            return Json(json!({
+                "studentId": student_id,
+                "result": null,
+                "student": student,
+                "aiMode": "openai_unavailable",
+                "error": error,
+            }));
+        }
     };
 
     let updated_student = match db::update_progress_after_stagegate(
@@ -240,6 +273,34 @@ async fn memory_profile(
         Err(error) => Json(json!({
             "studentId": student_id,
             "profile": null,
+            "error": error.to_string(),
+        })),
+    }
+}
+
+#[handler]
+async fn memory_graph(
+    Data(state): Data<&AppState>,
+    Json(request): Json<MemoryGraphRequest>,
+) -> Json<Value> {
+    let student_id = request
+        .student_id
+        .clone()
+        .unwrap_or_else(|| DEFAULT_STUDENT_PUBLIC_ID.to_string());
+
+    match memory::graph_for_student(&state.db, &student_id, request).await {
+        Ok(Some(graph)) => Json(json!({
+            "studentId": student_id,
+            "graph": graph,
+        })),
+        Ok(None) => Json(json!({
+            "studentId": student_id,
+            "graph": null,
+            "error": "Student memory graph was not found.",
+        })),
+        Err(error) => Json(json!({
+            "studentId": student_id,
+            "graph": null,
             "error": error.to_string(),
         })),
     }

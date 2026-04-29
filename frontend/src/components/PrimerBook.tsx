@@ -1,6 +1,17 @@
 "use client";
 
 import {
+  Background,
+  Controls,
+  MiniMap,
+  ReactFlow,
+  type Edge,
+  type Node,
+  type NodeMouseHandler,
+  useEdgesState,
+  useNodesState,
+} from "@xyflow/react";
+import {
   Atom,
   Bolt,
   BookOpen,
@@ -15,7 +26,7 @@ import {
   Leaf,
   Lock,
   LogOut,
-  Map,
+  Map as MapIcon,
   Mic,
   Play,
   Search,
@@ -24,6 +35,7 @@ import {
   Unlock,
   Volume2,
   Waves,
+  X,
 } from "lucide-react";
 import { AuthGate } from "@/components/AuthGate";
 import HTMLFlipBook from "react-pageflip";
@@ -108,6 +120,17 @@ type InfographicArtifact = {
   model?: string;
 };
 
+type NarrationPayload = {
+  aiMode?: string;
+  generated?: boolean;
+  audioDataUrl?: string | null;
+  contentType?: string;
+  error?: string;
+  message?: string;
+  model?: string;
+  voice?: string;
+};
+
 type BackendMemory = {
   assertionId?: string;
   memory_type?: StudentMemory["type"];
@@ -123,6 +146,60 @@ type BackendMemory = {
   knownTo?: string;
   source?: string;
 };
+
+type MemoryGraphNodeRecord = {
+  id: string;
+  nodeType: string;
+  kind: string;
+  label: string;
+  summary?: string | null;
+  expanded: boolean;
+  factCount: number;
+};
+
+type MemoryGraphEdgeRecord = {
+  id: string;
+  source: string;
+  target: string;
+  label: string;
+  assertionId: string;
+  predicate: string;
+  content: string;
+  memoryType: string;
+  confidence: number;
+  observedAt: string;
+  validFrom?: string | null;
+  knownFrom?: string | null;
+};
+
+type StudentMemoryGraph = {
+  studentId: string;
+  rootNodeId: string;
+  selectedNodeId: string;
+  nodes: MemoryGraphNodeRecord[];
+  edges: MemoryGraphEdgeRecord[];
+  validAsOf: string;
+  knownAsOf: string;
+};
+
+type MemoryNodeData = Record<string, unknown> & {
+  label: string;
+  kind: string;
+  nodeType: string;
+  factCount: number;
+  expanded: boolean;
+  summary?: string | null;
+};
+
+type MemoryEdgeData = Record<string, unknown> & {
+  label: string;
+  content: string;
+  memoryType: string;
+  confidence: number;
+};
+
+type MemoryFlowNode = Node<MemoryNodeData>;
+type MemoryFlowEdge = Edge<MemoryEdgeData>;
 
 type BookPageProps = {
   children: ReactNode;
@@ -167,7 +244,7 @@ const iconMap: Record<
   gear: Cog,
   leaf: Leaf,
   magnifier: Search,
-  map: Map,
+  map: MapIcon,
   spark: Sparkles,
   water: Waves,
 };
@@ -195,8 +272,31 @@ const initialLesson: PrimerLesson = {
   keyTerms: lightningInfographic.keyTerms,
 };
 
+async function fetchStudentMemoryGraph(
+  learner: AuthenticatedStudent,
+  session: AuthSession | null,
+  nodeId?: string,
+): Promise<StudentMemoryGraph | null> {
+  const response = await fetch(`${apiBaseUrl}/api/memory/graph`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders(session) },
+    body: JSON.stringify({
+      studentId: learner.studentId,
+      nodeId,
+      maxEdges: 36,
+    }),
+  });
+  const payload = await response.json();
+  if (payload.error || !payload.graph) {
+    return null;
+  }
+
+  return normalizeMemoryGraph(payload.graph);
+}
+
 export function PrimerBook() {
   const bookRef = useRef<FlipBookRef | null>(null);
+  const narrationAudioRef = useRef<HTMLAudioElement | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [authenticatedStudent, setAuthenticatedStudent] =
     useState<AuthenticatedStudent | null>(null);
@@ -207,6 +307,16 @@ export function PrimerBook() {
   const [remoteMemories, setRemoteMemories] = useState<StudentMemory[] | null>(
     null,
   );
+  const [memoryGraph, setMemoryGraph] = useState<StudentMemoryGraph | null>(
+    null,
+  );
+  const [isMemoryOpen, setIsMemoryOpen] = useState(false);
+  const [memoryGraphStatus, setMemoryGraphStatus] = useState(
+    "Memory graph not loaded.",
+  );
+  const [selectedMemoryNodeId, setSelectedMemoryNodeId] = useState<
+    string | null
+  >(null);
   const [hasAsked, setHasAsked] = useState(false);
   const [hasGeneratedInfographic, setHasGeneratedInfographic] = useState(false);
   const [hasPassedStagegate, setHasPassedStagegate] = useState(false);
@@ -224,6 +334,10 @@ export function PrimerBook() {
     "I think the important idea is that a hidden cause builds up, then something visible happens when it crosses a limit.",
   );
   const [isNarrating, setIsNarrating] = useState(false);
+  const [isNarrationLoading, setIsNarrationLoading] = useState(false);
+  const [narrationStatus, setNarrationStatus] = useState(
+    "OpenAI narration is ready.",
+  );
   const learnerName = authenticatedStudent?.displayName ?? student.displayName;
 
   useEffect(() => {
@@ -258,11 +372,69 @@ export function PrimerBook() {
 
   useEffect(() => {
     return () => {
-      if ("speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
+      const audio = narrationAudioRef.current;
+      if (audio) {
+        audio.pause();
+        audio.src = "";
       }
+      narrationAudioRef.current = null;
     };
   }, []);
+
+  async function loadMemoryGraph(nodeId?: string) {
+    if (!authenticatedStudent) {
+      return;
+    }
+
+    const isInitialLoad = !nodeId;
+    setMemoryGraphStatus(
+      isInitialLoad ? "Loading memory graph..." : "Loading connected memories...",
+    );
+
+    try {
+      const graph = await fetchStudentMemoryGraph(
+        authenticatedStudent,
+        session,
+        nodeId,
+      );
+
+      if (!graph) {
+        setMemoryGraphStatus("No graph memory is available yet.");
+        return;
+      }
+
+      setMemoryGraph((currentGraph) =>
+        isInitialLoad ? graph : mergeMemoryGraph(currentGraph, graph),
+      );
+      setSelectedMemoryNodeId(graph.selectedNodeId);
+      setMemoryGraphStatus(
+        isInitialLoad
+          ? "Relational bitemporal graph loaded."
+          : "Connected memory nodes loaded.",
+      );
+    } catch (error) {
+      setMemoryGraphStatus(`Memory graph unavailable: ${String(error)}`);
+    }
+  }
+
+  function openMemoryGraph() {
+    setIsMemoryOpen(true);
+    if (!memoryGraph) {
+      void loadMemoryGraph();
+    }
+  }
+
+  function walkMemoryNode(nodeId: string) {
+    setSelectedMemoryNodeId(nodeId);
+
+    const node = memoryGraph?.nodes.find((candidate) => candidate.id === nodeId);
+    if (node?.expanded) {
+      setMemoryGraphStatus("Connected memory nodes already loaded.");
+      return;
+    }
+
+    void loadMemoryGraph(nodeId);
+  }
 
   const visibleMemories = useMemo<StudentMemory[]>(() => {
     const baseMemories = remoteMemories ?? memories;
@@ -315,27 +487,109 @@ export function PrimerBook() {
     bookRef.current?.pageFlip()?.flip(page, "bottom");
   }
 
-  function playNarration() {
-    if (!("speechSynthesis" in window)) {
+  function clearNarrationAudio() {
+    const audio = narrationAudioRef.current;
+    if (!audio) {
       return;
     }
 
-    window.speechSynthesis.cancel();
+    audio.pause();
+    audio.src = "";
+    narrationAudioRef.current = null;
+  }
 
-    if (isNarrating) {
+  function stopNarration(message = "Narration stopped.") {
+    clearNarrationAudio();
+    setIsNarrating(false);
+    setIsNarrationLoading(false);
+    setNarrationStatus(message);
+  }
+
+  async function playNarration() {
+    if (isNarrationLoading) {
+      return;
+    }
+
+    if (isNarrating || narrationAudioRef.current) {
+      stopNarration();
+      return;
+    }
+
+    if (!authenticatedStudent) {
+      return;
+    }
+
+    const narrationText = [
+      lesson.storyScene,
+      lesson.plainExplanation,
+      lesson.analogy,
+    ]
+      .join("\n\n")
+      .trim();
+
+    if (!narrationText) {
+      setNarrationStatus("There is no lesson text to narrate yet.");
+      return;
+    }
+
+    setIsNarrationLoading(true);
+    setNarrationStatus("Generating fable narration with OpenAI TTS...");
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/narration/speech`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders(session) },
+        body: JSON.stringify({
+          studentId: authenticatedStudent.studentId,
+          topic: lesson.topic,
+          text: narrationText,
+          instructions:
+            "Use the fable voice as a calm, precise book narrator for a curious learner.",
+        }),
+      });
+      const payload = await response.json();
+      const narration = payload.narration as NarrationPayload | undefined;
+
+      if (!narration?.generated || !narration.audioDataUrl) {
+        setNarrationStatus(
+          narration?.message ??
+            narration?.error ??
+            "OpenAI TTS narration was unavailable.",
+        );
+        return;
+      }
+
+      const audio = new Audio(narration.audioDataUrl);
+      narrationAudioRef.current = audio;
+      audio.onended = () => {
+        narrationAudioRef.current = null;
+        setIsNarrating(false);
+        setNarrationStatus(
+          `Narrated with ${narration.voice ?? "fable"} via ${
+            narration.model ?? "OpenAI TTS"
+          }.`,
+        );
+      };
+      audio.onerror = () => {
+        narrationAudioRef.current = null;
+        setIsNarrating(false);
+        setNarrationStatus("Could not play the generated narration.");
+      };
+
+      setIsNarrating(true);
+      setNarrationStatus(
+        `Playing AI-generated narration with ${
+          narration.voice ?? "fable"
+        } voice.`,
+      );
+      await audio.play();
+    } catch (error) {
+      clearNarrationAudio();
       setIsNarrating(false);
-      return;
+      setNarrationStatus(`Could not generate narration: ${String(error)}`);
+    } finally {
+      setIsNarrationLoading(false);
     }
-
-    const utterance = new SpeechSynthesisUtterance(
-      `${lesson.storyScene} ${lesson.plainExplanation} ${lesson.analogy}`,
-    );
-    utterance.rate = 0.93;
-    utterance.pitch = 1.04;
-    utterance.onend = () => setIsNarrating(false);
-    utterance.onerror = () => setIsNarrating(false);
-    setIsNarrating(true);
-    window.speechSynthesis.speak(utterance);
   }
 
   async function startTopic(nextTopic = topic) {
@@ -348,6 +602,7 @@ export function PrimerBook() {
       return;
     }
 
+    stopNarration("OpenAI narration is ready.");
     setTopic(cleanTopic);
     setLessonStatus("Asking OpenAI Responses to guide this path...");
     setHasAsked(true);
@@ -371,7 +626,9 @@ export function PrimerBook() {
         setLessonStatus(
           payload.error ?? "The Primer could not generate this lesson yet.",
         );
-        void loadMemoryProfile(authenticatedStudent, session);
+        if (isMemoryOpen) {
+          void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
+        }
         return;
       }
 
@@ -382,7 +639,9 @@ export function PrimerBook() {
           ? "Guided by OpenAI Responses."
           : "Guided by the Primer.",
       );
-      void loadMemoryProfile(authenticatedStudent, session);
+      if (isMemoryOpen) {
+        void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
+      }
       goToPage(4);
     } catch (error) {
       setLessonStatus(`Could not reach backend: ${String(error)}`);
@@ -439,10 +698,37 @@ export function PrimerBook() {
         }),
       });
       const payload = await response.json();
+      if (payload.error || !payload.result) {
+        setRemoteMemories(normalizeMemories(payload.student?.memories));
+        setHasPassedStagegate(false);
+        setStagegateResult({
+          ...seededStagegateResult,
+          passed: false,
+          score: 0,
+          rubric: {
+            accuracy: 0,
+            causalReasoning: 0,
+            vocabulary: 0,
+            transfer: 0,
+          },
+          masteryEvidence: [],
+          gaps: ["The backend stagegate assessor was unavailable."],
+          feedbackToStudent:
+            payload.error ?? "The Primer could not grade this answer yet.",
+        });
+        if (isMemoryOpen) {
+          void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
+        }
+        window.setTimeout(flipNext, 250);
+        return;
+      }
+
       setStagegateResult(normalizeStagegateResult(payload.result));
       setRemoteMemories(normalizeMemories(payload.student?.memories));
       setHasPassedStagegate(Boolean(payload.result?.passed));
-      void loadMemoryProfile(authenticatedStudent, session);
+      if (isMemoryOpen) {
+        void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
+      }
     } catch (error) {
       setHasPassedStagegate(false);
       setStagegateResult({
@@ -483,21 +769,19 @@ export function PrimerBook() {
     if (studentProfile.interests.length > 0) {
       setTopic(studentProfile.interests[0]);
     }
-    setMemoryProfileStatus("Loading memory graph...");
     storeAuth({ student: studentProfile, session: nextSession });
-    void loadMemoryProfile(studentProfile, nextSession);
   }
 
   function handleLogout() {
     clearStoredAuth();
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-    }
+    stopNarration("OpenAI narration is ready.");
     setAuthenticatedStudent(null);
     setSession(null);
     setRemoteMemories(null);
-    setMemoryProfile(null);
-    setMemoryProfileStatus("Loading memory graph...");
+    setMemoryGraph(null);
+    setIsMemoryOpen(false);
+    setMemoryGraphStatus("Memory graph not loaded.");
+    setSelectedMemoryNodeId(null);
     setCurrentPage(0);
     setTopic("lightning");
     setLesson(initialLesson);
@@ -527,69 +811,65 @@ export function PrimerBook() {
   const learner = authenticatedStudent;
 
   return (
-    <main className="min-h-screen overflow-hidden bg-[#111515] text-stone-100">
+    <main className="relative min-h-[100svh] overflow-hidden bg-[#111515] text-stone-100">
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_10%,rgba(76,139,141,0.32),transparent_34%),radial-gradient(circle_at_82%_28%,rgba(215,170,92,0.18),transparent_28%),linear-gradient(135deg,#101818_0%,#182321_54%,#0d1112_100%)]" />
       <div className="absolute inset-x-0 top-0 h-px bg-cyan-100/20" />
 
-      <div className="relative mx-auto flex min-h-screen w-full max-w-[1380px] flex-col px-4 py-4 sm:px-6 lg:px-8">
-        <header className="flex flex-wrap items-center justify-between gap-4 py-3">
-          <div>
-            <p className="text-xs uppercase text-cyan-100/70">
-              PrimerLab student view
-            </p>
-            <h1 className="mt-1 text-2xl font-semibold text-stone-50 sm:text-3xl">
-              {learner.displayName}&apos;s Clockwork Reef Primer
-            </h1>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="flex items-center gap-2 rounded-full border border-cyan-100/15 bg-cyan-50/10 px-3 py-2 text-sm text-cyan-50 shadow-2xl shadow-black/20">
-              <BookOpen className="h-4 w-4" />
-              <span>Real book mode</span>
-            </div>
-            <button
-              type="button"
-              onClick={handleLogout}
-              className="inline-flex h-10 items-center gap-2 rounded-full border border-cyan-100/15 bg-black/18 px-3 text-sm text-cyan-50/78 transition hover:text-cyan-50"
-            >
-              <LogOut className="h-4 w-4" />
-              Sign out
-            </button>
-          </div>
-        </header>
+      <section className="book-stage relative z-10 flex min-h-[100svh] w-full flex-col items-center justify-center gap-3 px-2 pb-3 pt-14 sm:px-5 sm:pb-5 sm:pt-16">
+        <div className="absolute left-3 top-3 z-30 hidden items-center gap-2 rounded-full border border-cyan-100/15 bg-black/24 px-3 py-2 text-sm text-cyan-50 shadow-2xl shadow-black/20 sm:flex">
+          <BookOpen className="h-4 w-4" />
+          <span>{learner.displayName}&apos;s Primer</span>
+        </div>
+        <div className="absolute right-3 top-3 z-30 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={openMemoryGraph}
+            className="inline-flex h-10 items-center gap-2 rounded-full border border-cyan-100/15 bg-black/28 px-3 text-sm text-cyan-50/78 shadow-2xl shadow-black/20 transition hover:text-cyan-50"
+          >
+            <Brain className="h-4 w-4" />
+            Memory
+          </button>
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="inline-flex h-10 items-center gap-2 rounded-full border border-cyan-100/15 bg-black/28 px-3 text-sm text-cyan-50/78 shadow-2xl shadow-black/20 transition hover:text-cyan-50"
+          >
+            <LogOut className="h-4 w-4" />
+            Sign out
+          </button>
+        </div>
 
-        <div className="grid flex-1 gap-5 lg:grid-cols-[minmax(0,1fr)_300px]">
-          <section className="book-stage flex min-h-[720px] items-center justify-center rounded-[8px] border border-cyan-100/10 bg-black/18 px-2 py-6 shadow-2xl shadow-black/40 sm:px-6">
-            <div className="relative w-full max-w-[1100px]">
-              <div className="absolute inset-x-8 top-1/2 h-10 -translate-y-1/2 rounded-full bg-black/35 blur-3xl" />
-              <HTMLFlipBook
-                ref={bookRef}
-                className="primer-flipbook mx-auto"
-                style={pageTurnStyle}
-                startPage={0}
-                size="stretch"
-                width={430}
-                height={620}
-                minWidth={300}
-                maxWidth={500}
-                minHeight={430}
-                maxHeight={690}
-                drawShadow
-                flippingTime={720}
-                usePortrait
-                startZIndex={20}
-                autoSize
-                maxShadowOpacity={0.28}
-                showCover
-                mobileScrollSupport
-                clickEventForward
-                useMouseEvents
-                swipeDistance={28}
-                showPageCorners
-                disableFlipByClick={false}
-                onFlip={(event: PageFlipEvent<number>) =>
-                  setCurrentPage(Number(event.data))
-                }
-              >
+        <div className="primer-book-shell relative">
+          <div className="absolute inset-x-8 top-1/2 h-10 -translate-y-1/2 rounded-full bg-black/35 blur-3xl" />
+          <HTMLFlipBook
+            ref={bookRef}
+            className="primer-flipbook mx-auto"
+            style={pageTurnStyle}
+            startPage={0}
+            size="stretch"
+            width={430}
+            height={620}
+            minWidth={300}
+            maxWidth={780}
+            minHeight={430}
+            maxHeight={1120}
+            drawShadow
+            flippingTime={720}
+            usePortrait
+            startZIndex={20}
+            autoSize
+            maxShadowOpacity={0.28}
+            showCover
+            mobileScrollSupport
+            clickEventForward
+            useMouseEvents
+            swipeDistance={28}
+            showPageCorners
+            disableFlipByClick={false}
+            onFlip={(event: PageFlipEvent<number>) =>
+              setCurrentPage(Number(event.data))
+            }
+          >
                 <BookPage density="hard" tone="cover">
                   <CoverPage learner={learner} />
                 </BookPage>
@@ -633,7 +913,9 @@ export function PrimerBook() {
                   <VoiceoverPage
                     lesson={lesson}
                     isNarrating={isNarrating}
-                    onPlayNarration={playNarration}
+                    isNarrationLoading={isNarrationLoading}
+                    narrationStatus={narrationStatus}
+                    onPlayNarration={() => void playNarration()}
                   />
                 </BookPage>
 
@@ -657,9 +939,9 @@ export function PrimerBook() {
                     hasPassed={hasPassedStagegate}
                   />
                 </BookPage>
-              </HTMLFlipBook>
+          </HTMLFlipBook>
 
-              <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
+          <div className="relative z-20 mt-3 flex flex-wrap items-center justify-center gap-2 sm:mt-4 sm:gap-3">
                 <button
                   type="button"
                   onClick={flipPrev}
@@ -679,21 +961,19 @@ export function PrimerBook() {
                   Next
                   <ChevronRight className="h-4 w-4" />
                 </button>
-              </div>
-            </div>
-          </section>
-
-          <aside className="flex flex-col gap-4 rounded-[8px] border border-cyan-100/10 bg-[#0d1414]/76 p-4 shadow-2xl shadow-black/30">
-            <StudentProfilePanel learner={learner} />
-            <ProgressPanel stages={visibleStages} />
-            <MemoryPanel memories={visibleMemories} />
-            <ContinuityPanel
-              profile={memoryProfile}
-              status={memoryProfileStatus}
-            />
-          </aside>
+          </div>
         </div>
-      </div>
+      </section>
+      {isMemoryOpen ? (
+        <MemoryGraphDialog
+          graph={memoryGraph}
+          status={memoryGraphStatus}
+          selectedNodeId={selectedMemoryNodeId}
+          onClose={() => setIsMemoryOpen(false)}
+          onRefresh={() => void loadMemoryGraph(selectedMemoryNodeId ?? undefined)}
+          onWalkNode={walkMemoryNode}
+        />
+      ) : null}
     </main>
   );
 }
@@ -781,7 +1061,7 @@ function WelcomePage({
 function StageMapPage({ stages: currentStages }: { stages: Stage[] }) {
   return (
     <div className="flex h-full flex-col">
-      <Kicker icon={Map}>Storm Gate map</Kicker>
+      <Kicker icon={MapIcon}>Storm Gate map</Kicker>
       <h2 className="mt-4 text-3xl font-semibold text-stone-950">
         Three levels guard the chamber.
       </h2>
@@ -1017,10 +1297,14 @@ function InfographicPage({
 function VoiceoverPage({
   lesson,
   isNarrating,
+  isNarrationLoading,
+  narrationStatus,
   onPlayNarration,
 }: {
   lesson: PrimerLesson;
   isNarrating: boolean;
+  isNarrationLoading: boolean;
+  narrationStatus: string;
   onPlayNarration: () => void;
 }) {
   return (
@@ -1035,9 +1319,15 @@ function VoiceoverPage({
       <button
         type="button"
         onClick={onPlayNarration}
-        className="mt-6 inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#1e6f73] px-5 text-sm font-semibold text-white transition hover:bg-[#195e61]"
+        disabled={isNarrationLoading}
+        className="mt-6 inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#1e6f73] px-5 text-sm font-semibold text-white transition hover:bg-[#195e61] disabled:cursor-wait disabled:opacity-70"
       >
-        {isNarrating ? (
+        {isNarrationLoading ? (
+          <>
+            <Sparkles className="h-4 w-4" />
+            Generating narration
+          </>
+        ) : isNarrating ? (
           <>
             <Square className="h-4 w-4" />
             Stop narration
@@ -1049,6 +1339,9 @@ function VoiceoverPage({
           </>
         )}
       </button>
+      <p className="mt-3 text-xs leading-5 text-stone-500">
+        {narrationStatus} This voice is AI-generated.
+      </p>
       <div className="mt-7 grid gap-3">
         {lesson.keyTerms.map((term) => (
           <div
@@ -1206,135 +1499,117 @@ function UnlockPage({
   );
 }
 
-function StudentProfilePanel({ learner }: { learner: AuthenticatedStudent }) {
-  return (
-    <section className="rounded-[8px] border border-cyan-100/10 bg-cyan-50/6 px-3 py-3">
-      <h3 className="text-sm font-semibold uppercase text-cyan-50/80">
-        Student profile
-      </h3>
-      <div className="mt-3 flex items-center justify-between gap-3">
-        <div>
-          <p className="text-sm font-semibold text-stone-100">
-            {learner.displayName}
-          </p>
-          <p className="mt-1 text-xs text-stone-400">
-            Age {learner.age ?? learner.ageBand}
-          </p>
-        </div>
-        <StatusBadge status="available" />
-      </div>
-      <div className="mt-3 flex flex-wrap gap-2">
-        {learner.interests.map((interest) => (
-          <span
-            key={interest}
-            className="rounded-full border border-[#d8b86a]/35 px-2.5 py-1 text-xs text-[#f4d98e]"
-          >
-            {interest}
-          </span>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function ProgressPanel({ stages: currentStages }: { stages: Stage[] }) {
-  return (
-    <section>
-      <h3 className="text-sm font-semibold uppercase text-cyan-50/80">
-        Stage map
-      </h3>
-      <div className="mt-3 space-y-2">
-        {currentStages.map((stage) => (
-          <div
-            key={stage.level}
-            className="flex items-center justify-between gap-3 rounded-[8px] border border-cyan-100/10 bg-cyan-50/6 px-3 py-3"
-          >
-            <div>
-              <p className="text-sm font-semibold text-stone-100">
-                {stage.title.replace("Level ", "L")}
-              </p>
-              <p className="text-xs text-stone-400">{stage.level}</p>
-            </div>
-            <StatusBadge status={stage.status} />
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function MemoryPanel({ memories: currentMemories }: { memories: StudentMemory[] }) {
-  return (
-    <section>
-      <h3 className="text-sm font-semibold uppercase text-cyan-50/80">
-        What the Primer remembers
-      </h3>
-      <div className="mt-3 space-y-2">
-        {currentMemories.map((memory) => (
-          <div
-            key={memory.id}
-            className="rounded-[8px] border border-cyan-100/10 bg-cyan-50/6 px-3 py-3"
-          >
-            <p className="text-xs uppercase text-[#d8b86a]">{memory.type}</p>
-            <p className="mt-1 text-sm leading-6 text-stone-200">
-              {memory.content}
-            </p>
-            {memory.predicate || memory.knownFrom ? (
-              <p className="mt-2 text-[11px] uppercase text-stone-500">
-                {memory.predicate ? memory.predicate.replaceAll("_", " ") : null}
-                {memory.knownFrom ? ` · known ${formatMemoryDate(memory.knownFrom)}` : null}
-              </p>
-            ) : null}
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function ContinuityPanel({
-  profile,
+function MemoryGraphDialog({
+  graph,
   status,
+  selectedNodeId,
+  onClose,
+  onRefresh,
+  onWalkNode,
 }: {
-  profile: StudentMemoryProfile | null;
+  graph: StudentMemoryGraph | null;
   status: string;
+  selectedNodeId: string | null;
+  onClose: () => void;
+  onRefresh: () => void;
+  onWalkNode: (nodeId: string) => void;
 }) {
+  const flowNodes = useMemo(
+    () => (graph ? toMemoryFlowNodes(graph, selectedNodeId) : []),
+    [graph, selectedNodeId],
+  );
+  const flowEdges = useMemo(
+    () => (graph ? toMemoryFlowEdges(graph, selectedNodeId) : []),
+    [graph, selectedNodeId],
+  );
+  const [nodes, setNodes, onNodesChange] =
+    useNodesState<MemoryFlowNode>(flowNodes);
+  const [edges, setEdges, onEdgesChange] =
+    useEdgesState<MemoryFlowEdge>(flowEdges);
+
+  useEffect(() => {
+    setNodes((currentNodes) =>
+      preserveDraggedPositions(flowNodes, currentNodes),
+    );
+  }, [flowNodes, setNodes]);
+
+  useEffect(() => {
+    setEdges(flowEdges);
+  }, [flowEdges, setEdges]);
+
+  const handleNodeClick: NodeMouseHandler<MemoryFlowNode> = (_, node) => {
+    onWalkNode(node.id);
+  };
+
   return (
-    <section className="mt-auto rounded-[8px] border border-cyan-100/10 bg-black/18 p-3">
-      <h3 className="text-sm font-semibold uppercase text-cyan-50/80">
-        Memory graph
-      </h3>
-      <p className="mt-2 text-xs uppercase text-stone-500">{status}</p>
-      {profile ? (
-        <>
-          <p className="mt-2 text-sm text-stone-200">
-            {profile.entity.canonicalName} · {profile.subjectFacts.length} facts
-          </p>
-          <div className="mt-3 space-y-2">
-            {profile.timeline.slice(0, 3).map((fact) => (
-              <div key={fact.assertionId} className="border-l border-cyan-100/20 pl-3">
-                <p className="text-xs uppercase text-[#d8b86a]">
-                  {fact.predicate.replaceAll("_", " ")}
-                </p>
-                <p className="mt-1 text-sm leading-5 text-stone-300">
-                  {fact.content}
-                </p>
-              </div>
-            ))}
+    <div className="fixed inset-0 z-50 bg-[#071111]/94 text-stone-100 backdrop-blur-md">
+      <div className="flex h-full min-h-0 flex-col px-3 py-3 sm:px-5 sm:py-5">
+        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-cyan-100/12 pb-3">
+          <div>
+            <p className="inline-flex items-center gap-2 text-xs uppercase text-[#d8b86a]">
+              <Brain className="h-3.5 w-3.5" />
+              Memory
+            </p>
+            <h2 className="mt-1 text-2xl font-semibold text-cyan-50">
+              Student memory graph
+            </h2>
+            <p className="mt-1 text-sm text-stone-400">{status}</p>
           </div>
-        </>
-      ) : (
-        <>
-          <p className="mt-2 text-sm leading-6 text-stone-300">
-            {themeBible.worldSummary}
-          </p>
-          <p className="mt-3 text-xs uppercase text-stone-500">Guide</p>
-          <p className="mt-1 text-sm text-stone-200">
-            {themeBible.guide.name}, {themeBible.guide.role}
-          </p>
-        </>
-      )}
-    </section>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onRefresh}
+              className="inline-flex h-10 items-center rounded-full border border-cyan-100/15 px-4 text-sm text-cyan-50/80 transition hover:text-cyan-50"
+            >
+              Refresh
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close memory graph"
+              className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-cyan-100/15 text-cyan-50/80 transition hover:text-cyan-50"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </header>
+
+        <div className="min-h-0 flex-1 pt-4">
+          <div className="memory-flow h-full min-h-[520px] overflow-hidden rounded-[8px] border border-cyan-100/12 bg-[#0c1717]">
+            {graph ? (
+              <ReactFlow
+                nodes={nodes}
+                edges={edges}
+                onNodesChange={onNodesChange}
+                onEdgesChange={onEdgesChange}
+                onNodeClick={handleNodeClick}
+                nodesDraggable
+                nodesConnectable={false}
+                edgesFocusable
+                fitView
+                fitViewOptions={{ padding: 0.22 }}
+                proOptions={{ hideAttribution: true }}
+              >
+                <Background color="#244848" gap={26} />
+                <MiniMap
+                  pannable
+                  zoomable
+                  nodeColor={(node) =>
+                    node.data.nodeType === "value" ? "#d8b86a" : "#46a7aa"
+                  }
+                  maskColor="rgb(7 17 17 / 0.72)"
+                />
+                <Controls showInteractive={false} />
+              </ReactFlow>
+            ) : (
+              <div className="flex h-full min-h-[520px] items-center justify-center px-6 text-center text-sm text-stone-400">
+                Loading relational bitemporal memory for this student.
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1379,21 +1654,223 @@ function RubricBar({ label, value }: { label: string; value: number }) {
   );
 }
 
-function StatusBadge({ status }: { status: Stage["status"] }) {
-  const className =
-    status === "locked"
-      ? "border-stone-500/30 text-stone-400"
-      : status === "passed"
-        ? "border-emerald-300/30 text-emerald-200"
-        : "border-[#d8b86a]/40 text-[#f4d98e]";
+function mergeMemoryGraph(
+  currentGraph: StudentMemoryGraph | null,
+  nextGraph: StudentMemoryGraph,
+): StudentMemoryGraph {
+  if (!currentGraph) {
+    return nextGraph;
+  }
 
-  return (
-    <span
-      className={`rounded-full border px-2.5 py-1 text-xs uppercase ${className}`}
-    >
-      {status}
-    </span>
+  const nodes = new Map(
+    currentGraph.nodes.map((node) => [node.id, node] as const),
   );
+  const edges = new Map(
+    currentGraph.edges.map((edge) => [edge.id, edge] as const),
+  );
+  for (const node of nextGraph.nodes) {
+    const existing = nodes.get(node.id);
+    nodes.set(node.id, {
+      ...existing,
+      ...node,
+      expanded: Boolean(existing?.expanded || node.expanded),
+      factCount: Math.max(existing?.factCount ?? 0, node.factCount),
+    });
+  }
+  for (const edge of nextGraph.edges) {
+    edges.set(edge.id, edge);
+  }
+
+  return {
+    ...nextGraph,
+    rootNodeId: currentGraph.rootNodeId,
+    nodes: [...nodes.values()],
+    edges: [...edges.values()],
+  };
+}
+
+function toMemoryFlowNodes(
+  graph: StudentMemoryGraph,
+  selectedNodeId: string | null,
+): MemoryFlowNode[] {
+  return graph.nodes.map((node, index) => {
+    const isRoot = node.id === graph.rootNodeId;
+    const isValue = node.nodeType === "value";
+    const isSelected = node.id === selectedNodeId;
+
+    return {
+      id: node.id,
+      type: "default",
+      position: memoryNodePosition(node, index, graph.nodes.length, isRoot),
+      selected: isSelected,
+      draggable: true,
+      data: {
+        label: node.label,
+        kind: node.kind,
+        nodeType: node.nodeType,
+        factCount: node.factCount,
+        expanded: node.expanded,
+        summary: node.summary,
+      },
+      className: `memory-flow-node ${
+        isSelected ? "memory-flow-node-selected" : ""
+      } ${isRoot ? "memory-flow-node-root" : ""} ${
+        isValue ? "memory-flow-node-value" : ""
+      }`,
+    };
+  });
+}
+
+function memoryNodePosition(
+  node: MemoryGraphNodeRecord,
+  index: number,
+  total: number,
+  isRoot: boolean,
+) {
+  if (isRoot) {
+    return { x: 0, y: 0 };
+  }
+
+  const radius = node.nodeType === "value" ? 420 : 290;
+  const angle =
+    ((Math.max(index, 1) - 1) / Math.max(total - 1, 1)) * Math.PI * 2 -
+    Math.PI / 2;
+
+  return {
+    x: Math.round(Math.cos(angle) * radius),
+    y: Math.round(Math.sin(angle) * radius),
+  };
+}
+
+function toMemoryFlowEdges(
+  graph: StudentMemoryGraph,
+  selectedNodeId: string | null,
+): MemoryFlowEdge[] {
+  return graph.edges.map((edge) => {
+    const isSelected =
+      edge.source === selectedNodeId || edge.target === selectedNodeId;
+
+    return {
+      id: edge.id,
+      source: edge.source,
+      target: edge.target,
+      type: "smoothstep",
+      label: edge.label,
+      animated: isSelected,
+      data: {
+        label: edge.label,
+        content: edge.content,
+        memoryType: edge.memoryType,
+        confidence: edge.confidence,
+      },
+      style: {
+        stroke: isSelected ? "#d8b86a" : "#4f8c8f",
+        strokeWidth: isSelected ? 2.4 : 1.5,
+      },
+      labelStyle: {
+        fill: "#d8b86a",
+        fontSize: 11,
+        fontWeight: 600,
+      },
+      labelBgStyle: {
+        fill: "#071111",
+        fillOpacity: 0.86,
+      },
+      labelBgPadding: [6, 3],
+      labelBgBorderRadius: 4,
+    };
+  });
+}
+
+function preserveDraggedPositions(
+  nextNodes: MemoryFlowNode[],
+  currentNodes: MemoryFlowNode[],
+): MemoryFlowNode[] {
+  const positions = new Map(
+    currentNodes.map((node) => [node.id, node.position] as const),
+  );
+  return nextNodes.map((node) => ({
+    ...node,
+    position: positions.get(node.id) ?? node.position,
+  }));
+}
+
+function normalizeMemoryGraph(value: unknown): StudentMemoryGraph | null {
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  const nodes = Array.isArray(record.nodes)
+    ? record.nodes
+        .map(normalizeMemoryGraphNode)
+        .filter((node): node is MemoryGraphNodeRecord => node !== null)
+    : [];
+  const edges = Array.isArray(record.edges)
+    ? record.edges
+        .map(normalizeMemoryGraphEdge)
+        .filter((edge): edge is MemoryGraphEdgeRecord => edge !== null)
+    : [];
+  const studentId = stringField(record, "studentId");
+  const rootNodeId = stringField(record, "rootNodeId");
+  const selectedNodeId = stringField(record, "selectedNodeId") ?? rootNodeId;
+  if (!studentId || !rootNodeId || !selectedNodeId) {
+    return null;
+  }
+
+  return {
+    studentId,
+    rootNodeId,
+    selectedNodeId,
+    nodes,
+    edges,
+    validAsOf: stringField(record, "validAsOf") ?? "",
+    knownAsOf: stringField(record, "knownAsOf") ?? "",
+  };
+}
+
+function normalizeMemoryGraphNode(value: unknown): MemoryGraphNodeRecord | null {
+  const record = asRecord(value);
+  const id = stringField(record, "id");
+  const label = stringField(record, "label");
+  if (!id || !label) {
+    return null;
+  }
+
+  return {
+    id,
+    nodeType: stringField(record, "nodeType") ?? "entity",
+    kind: stringField(record, "kind") ?? "memory",
+    label,
+    summary: stringField(record, "summary"),
+    expanded: booleanField(record, "expanded") ?? false,
+    factCount: numberField(record, "factCount") ?? 0,
+  };
+}
+
+function normalizeMemoryGraphEdge(value: unknown): MemoryGraphEdgeRecord | null {
+  const record = asRecord(value);
+  const id = stringField(record, "id");
+  const source = stringField(record, "source");
+  const target = stringField(record, "target");
+  if (!id || !source || !target) {
+    return null;
+  }
+
+  return {
+    id,
+    source,
+    target,
+    label: stringField(record, "label") ?? "",
+    assertionId: stringField(record, "assertionId") ?? id,
+    predicate: stringField(record, "predicate") ?? "",
+    content: stringField(record, "content") ?? "",
+    memoryType: stringField(record, "memoryType") ?? "memory",
+    confidence: numberField(record, "confidence") ?? 0,
+    observedAt: stringField(record, "observedAt") ?? "",
+    validFrom: stringField(record, "validFrom"),
+    knownFrom: stringField(record, "knownFrom"),
+  };
 }
 
 function normalizeLesson(value: unknown, fallbackTopic: string): PrimerLesson {
@@ -1498,82 +1975,6 @@ function normalizeMemories(value: unknown): StudentMemory[] | null {
     .filter((memory): memory is StudentMemory => memory !== null);
 
   return normalized.length > 0 ? normalized : null;
-}
-
-function normalizeMemoryProfile(
-  value: unknown,
-  learner: Pick<AuthenticatedStudent, "displayName" | "studentId">,
-): StudentMemoryProfile | null {
-  const record = asRecord(value);
-  const entity = asRecord(record?.entity);
-  if (!record || !entity) {
-    return null;
-  }
-
-  const profile = {
-    entity: {
-      entityId: stringField(entity, "entityId") ?? "",
-      kind: stringField(entity, "kind") ?? "student",
-      canonicalName: stringField(entity, "canonicalName") ?? learner.displayName,
-      identityKey: stringField(entity, "identityKey") ?? learner.studentId,
-    },
-    subjectFacts: normalizeMemoryAssertions(record.subjectFacts, learner.displayName),
-    inboundFacts: normalizeMemoryAssertions(record.inboundFacts, learner.displayName),
-    timeline: normalizeMemoryAssertions(record.timeline, learner.displayName),
-    validAsOf: stringField(record, "validAsOf") ?? "",
-    knownAsOf: stringField(record, "knownAsOf") ?? "",
-  } satisfies StudentMemoryProfile;
-
-  return profile.entity.entityId ? profile : null;
-}
-
-function normalizeMemoryAssertions(
-  value: unknown,
-  fallbackSubject: string,
-): MemoryAssertionRecord[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value
-    .map((item): MemoryAssertionRecord | null => {
-      const record = asRecord(item);
-      const assertionId = stringField(record, "assertionId");
-      const predicate = stringField(record, "predicate");
-      const content = stringField(record, "content");
-      if (!assertionId || !predicate || !content) {
-        return null;
-      }
-
-      return {
-        assertionId,
-        subject: stringField(record, "subject") ?? fallbackSubject,
-        predicate,
-        object: stringField(record, "object"),
-        content,
-        memoryType: stringField(record, "memoryType") ?? "knowledge",
-        confidence: numberField(record, "confidence") ?? 0,
-        salience: numberField(record, "salience") ?? 0,
-        tags: stringArrayField(record, "tags") ?? [],
-        validFrom: stringField(record, "validFrom"),
-        knownFrom: stringField(record, "knownFrom"),
-        observedAt: stringField(record, "observedAt") ?? "",
-        source: stringField(record, "source"),
-      };
-    })
-    .filter((item): item is MemoryAssertionRecord => item !== null);
-}
-
-function formatMemoryDate(value: string): string {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "recently";
-  }
-
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-  }).format(date);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

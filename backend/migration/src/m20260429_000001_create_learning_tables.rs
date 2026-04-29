@@ -13,6 +13,7 @@ impl MigrationTrait for Migration {
             "CREATE EXTENSION IF NOT EXISTS vector",
             "CREATE EXTENSION IF NOT EXISTS age",
             "LOAD 'age'",
+            r#"SET search_path = ag_catalog, "$user", public"#,
             r#"SELECT ag_catalog.create_graph('primer_memory')
                WHERE NOT EXISTS (
                    SELECT 1 FROM ag_catalog.ag_graph WHERE name = 'primer_memory'
