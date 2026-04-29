@@ -25,6 +25,7 @@ export function AuthGate({ onAuthenticated }: AuthGateProps) {
   const [mode, setMode] = useState<AuthMode>("signup");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [activationCode, setActivationCode] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [age, setAge] = useState("");
   const [biography, setBiography] = useState("");
@@ -50,6 +51,7 @@ export function AuthGate({ onAuthenticated }: AuthGateProps) {
               ? {
                   username,
                   password,
+                  activationCode,
                   displayName,
                   age: Number(age),
                   biography,
@@ -143,6 +145,22 @@ export function AuthGate({ onAuthenticated }: AuthGateProps) {
 
           {isSignup ? (
             <>
+              <AuthField
+                icon={KeyRound}
+                label="Activation code"
+                htmlFor="activation-code"
+              >
+                <input
+                  id="activation-code"
+                  value={activationCode}
+                  onChange={(event) => setActivationCode(event.target.value)}
+                  required
+                  type="password"
+                  className="auth-input"
+                  autoComplete="one-time-code"
+                />
+              </AuthField>
+
               <AuthField
                 icon={Sparkles}
                 label="Display name"

@@ -17,6 +17,7 @@ import {
   normalizeStagegateResult,
   stagesForStagegate,
   staticBookPageCount,
+  visibleBookContentEntries,
   type StudentMemoryGraph,
 } from "./primer-flow";
 
@@ -259,10 +260,10 @@ describe("memory contract normalization", () => {
 
 describe("persisted book contract normalization", () => {
   test("calculates the end page after persisted book entries", () => {
-    expect(staticBookPageCount).toBe(12);
-    expect(bookEndPageIndex(0)).toBe(11);
-    expect(bookEndPageIndex(1)).toBe(12);
-    expect(bookEndPageIndex(4)).toBe(15);
+    expect(staticBookPageCount).toBe(10);
+    expect(bookEndPageIndex(0)).toBe(9);
+    expect(bookEndPageIndex(1)).toBe(10);
+    expect(bookEndPageIndex(4)).toBe(13);
   });
 
   test("keeps stagegate attempts out of appended content pages", () => {
@@ -274,9 +275,57 @@ describe("persisted book contract normalization", () => {
 
     expect(entries.filter(isBookContentEntry)).toEqual([{ kind: "lesson" }]);
     expect(bookContentEntryCount(entries)).toBe(1);
-    expect(defaultBookPageIndex(entries)).toBe(11);
+    expect(defaultBookPageIndex(entries)).toBe(9);
     expect(defaultBookPageIndex([{ kind: "lesson" }, { kind: "infographic" }]))
-      .toBe(13);
+      .toBe(11);
+  });
+
+  test("keeps all persisted lesson and infographic entries visible in order", () => {
+    const book = normalizeBookState({
+      studentId: "student-123",
+      bookId: "book-1",
+      entries: [
+        {
+          entryId: "stagegate-1",
+          kind: "stagegate",
+          position: 3,
+          payload: {},
+        },
+        {
+          entryId: "lesson-2",
+          kind: "lesson",
+          topic: "basketball arcs",
+          position: 2,
+          payload: { lesson: { topic: "basketball arcs" } },
+        },
+        {
+          entryId: "lesson-1",
+          kind: "lesson",
+          topic: "reef currents",
+          position: 1,
+          payload: { lesson: { topic: "reef currents" } },
+        },
+        {
+          entryId: "diagram-1",
+          kind: "infographic",
+          topic: "reef currents",
+          position: 4,
+          payload: { artifact: { generated: false } },
+        },
+      ],
+    });
+
+    expect(visibleBookContentEntries(book?.entries ?? []).map((entry) => ({
+      entryId: entry.entryId,
+      kind: entry.kind,
+      topic: entry.topic,
+    }))).toEqual([
+      { entryId: "lesson-1", kind: "lesson", topic: "reef currents" },
+      { entryId: "lesson-2", kind: "lesson", topic: "basketball arcs" },
+      { entryId: "diagram-1", kind: "infographic", topic: "reef currents" },
+    ]);
+    expect(bookContentEntryCount(book?.entries ?? [])).toBe(3);
+    expect(defaultBookPageIndex(book?.entries ?? [])).toBe(12);
   });
 
   test("normalizes persisted book entries and latest interaction state", () => {

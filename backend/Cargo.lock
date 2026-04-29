@@ -1671,11 +1671,13 @@ dependencies = [
  "base64",
  "chrono",
  "dotenvy",
+ "hmac",
  "poem",
  "reqwest",
  "sea-orm",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "uuid",
 ]

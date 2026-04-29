@@ -1,19 +1,23 @@
 use crate::{
-    AppState, db,
+    AppState, auth, db,
     domain::{
-        DEFAULT_STUDENT_PUBLIC_ID, InfographicExplanationRequest, InfographicRequest,
-        LessonStartRequest, LoginRequest, MemoryGraphRequest, MemoryProfileRequest,
-        NarrationRequest, RegisterRequest, StagegateRequest,
+        InfographicExplanationRequest, InfographicRequest, LessonStartRequest, LoginRequest,
+        MemoryGraphRequest, MemoryProfileRequest, NarrationRequest, RegisterRequest,
+        StagegateRequest,
     },
     memory,
     openai::build_infographic_prompt,
     report_card, voiceover_store,
 };
 use poem::{
-    Route, get, handler, post,
+    Route, get, handler,
+    http::{HeaderMap, StatusCode},
+    post,
     web::{Data, Json, Path},
 };
 use serde_json::{Value, json};
+
+type ApiResponse = (StatusCode, Json<Value>);
 
 pub fn api_routes() -> Route {
     Route::new()
@@ -58,55 +62,69 @@ fn health(Data(state): Data<&AppState>) -> Json<Value> {
 async fn register(
     Data(state): Data<&AppState>,
     Json(request): Json<RegisterRequest>,
-) -> Json<Value> {
+) -> ApiResponse {
+    if let Err(error) = auth::validate_activation_code(&request) {
+        return auth_error(error);
+    }
+
     match db::register_local_user(&state.db, request).await {
-        Ok(student) => Json(json!({
+        Ok(student) => ok(json!({
             "student": student,
-            "session": session_for_student(&student.student_id)
+            "session": auth::session_for_student(&student.student_id)
         })),
-        Err(error) => Json(json!({ "error": error })),
+        Err(error) => bad_request(json!({ "error": error })),
     }
 }
 
 #[handler]
-async fn login(Data(state): Data<&AppState>, Json(request): Json<LoginRequest>) -> Json<Value> {
+async fn login(Data(state): Data<&AppState>, Json(request): Json<LoginRequest>) -> ApiResponse {
     match db::login_local_user(&state.db, &request.username, &request.password).await {
-        Ok(student) => Json(json!({
+        Ok(student) => ok(json!({
             "student": student,
-            "session": session_for_student(&student.student_id)
+            "session": auth::session_for_student(&student.student_id)
         })),
-        Err(error) => Json(json!({ "error": error })),
+        Err(error) => (StatusCode::UNAUTHORIZED, Json(json!({ "error": error }))),
     }
 }
 
-fn session_for_student(student_id: &str) -> Value {
-    json!({
-        "token": format!("local-demo:{student_id}"),
-        "type": "local-demo"
-    })
-}
-
 #[handler]
-async fn get_student(Path(student_id): Path<String>, Data(state): Data<&AppState>) -> Json<Value> {
-    let student = match db::find_student(&state.db, &student_id).await {
-        Ok(Some(student)) => Some(student),
-        Ok(None) => db::find_student(&state.db, DEFAULT_STUDENT_PUBLIC_ID)
-            .await
-            .ok()
-            .flatten(),
-        Err(_) => None,
+async fn get_student(
+    Path(student_id): Path<String>,
+    Data(state): Data<&AppState>,
+    headers: &HeaderMap,
+) -> ApiResponse {
+    let authenticated = match authenticated_student(headers) {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
     };
+    if let Err(response) = authorize_path_student(&authenticated, &student_id) {
+        return response;
+    }
 
-    Json(json!({ "student": student }))
+    let student = db::find_student(&state.db, &student_id)
+        .await
+        .ok()
+        .flatten();
+
+    ok(json!({ "student": student }))
 }
 
 #[handler]
 async fn reset_student(
     Path(student_id): Path<String>,
     Data(state): Data<&AppState>,
-) -> Json<Value> {
+    headers: &HeaderMap,
+) -> ApiResponse {
+    let authenticated = match authenticated_student(headers) {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    if let Err(response) = authorize_path_student(&authenticated, &student_id) {
+        return response;
+    }
+
     match db::reset_student_learning_state(&state.db, &student_id).await {
-        Ok(student) => Json(json!({
+        Ok(student) => ok(json!({
             "studentId": student_id,
             "student": student,
             "book": null,
@@ -118,7 +136,7 @@ async fn reset_student(
                 "xpDeleted": true
             }
         })),
-        Err(error) => Json(json!({
+        Err(error) => ok(json!({
             "studentId": student_id,
             "student": null,
             "book": null,
@@ -135,10 +153,16 @@ async fn reset_student(
 }
 
 #[handler]
-async fn list_students(Data(state): Data<&AppState>) -> Json<Value> {
-    match db::list_students(&state.db).await {
-        Ok(students) => Json(json!({ "students": students })),
-        Err(error) => Json(json!({ "error": error.to_string(), "students": [] })),
+async fn list_students(Data(state): Data<&AppState>, headers: &HeaderMap) -> ApiResponse {
+    let authenticated = match authenticated_student(headers) {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+
+    match db::find_student(&state.db, &authenticated.student_id).await {
+        Ok(Some(student)) => ok(json!({ "students": [student] })),
+        Ok(None) => ok(json!({ "students": [] })),
+        Err(error) => ok(json!({ "error": error.to_string(), "students": [] })),
     }
 }
 
@@ -146,18 +170,27 @@ async fn list_students(Data(state): Data<&AppState>) -> Json<Value> {
 async fn get_report_card(
     Path(student_id): Path<String>,
     Data(state): Data<&AppState>,
-) -> Json<Value> {
+    headers: &HeaderMap,
+) -> ApiResponse {
+    let authenticated = match authenticated_student(headers) {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    if let Err(response) = authorize_path_student(&authenticated, &student_id) {
+        return response;
+    }
+
     match report_card::report_card_for_student(&state.db, &student_id, &state.openai).await {
-        Ok(Some(report_card)) => Json(json!({
+        Ok(Some(report_card)) => ok(json!({
             "studentId": student_id,
             "reportCard": report_card,
         })),
-        Ok(None) => Json(json!({
+        Ok(None) => ok(json!({
             "studentId": student_id,
             "reportCard": null,
             "error": "Student report card was not found.",
         })),
-        Err(error) => Json(json!({
+        Err(error) => ok(json!({
             "studentId": student_id,
             "reportCard": null,
             "error": error.to_string(),
@@ -166,15 +199,27 @@ async fn get_report_card(
 }
 
 #[handler]
-async fn get_book(Path(student_id): Path<String>, Data(state): Data<&AppState>) -> Json<Value> {
+async fn get_book(
+    Path(student_id): Path<String>,
+    Data(state): Data<&AppState>,
+    headers: &HeaderMap,
+) -> ApiResponse {
+    let authenticated = match authenticated_student(headers) {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    if let Err(response) = authorize_path_student(&authenticated, &student_id) {
+        return response;
+    }
+
     let student = db::find_student(&state.db, &student_id)
         .await
         .ok()
         .flatten();
 
     match db::book_state_for_student(&state.db, &student_id).await {
-        Ok(book) => Json(json!({ "studentId": student_id, "student": student, "book": book })),
-        Err(error) => Json(json!({
+        Ok(book) => ok(json!({ "studentId": student_id, "student": student, "book": book })),
+        Err(error) => ok(json!({
             "studentId": student_id,
             "student": student,
             "book": null,
@@ -186,24 +231,46 @@ async fn get_book(Path(student_id): Path<String>, Data(state): Data<&AppState>) 
 #[handler]
 async fn start_lesson(
     Data(state): Data<&AppState>,
+    headers: &HeaderMap,
     Json(request): Json<LessonStartRequest>,
-) -> Json<Value> {
-    Json(start_lesson_impl(state, request).await)
+) -> ApiResponse {
+    let authenticated = match authenticated_student(headers) {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let student_id = match authorized_body_student_id(&authenticated, request.student_id.as_deref())
+    {
+        Ok(student_id) => student_id,
+        Err(response) => return response,
+    };
+
+    ok(start_lesson_impl(state, request, student_id).await)
 }
 
 #[handler]
 async fn tutor_respond(
     Data(state): Data<&AppState>,
+    headers: &HeaderMap,
     Json(request): Json<LessonStartRequest>,
-) -> Json<Value> {
-    Json(start_lesson_impl(state, request).await)
+) -> ApiResponse {
+    let authenticated = match authenticated_student(headers) {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let student_id = match authorized_body_student_id(&authenticated, request.student_id.as_deref())
+    {
+        Ok(student_id) => student_id,
+        Err(response) => return response,
+    };
+
+    ok(start_lesson_impl(state, request, student_id).await)
 }
 
-async fn start_lesson_impl(state: &AppState, request: LessonStartRequest) -> Value {
-    let student_id = request
-        .student_id
-        .clone()
-        .unwrap_or_else(|| DEFAULT_STUDENT_PUBLIC_ID.to_string());
+async fn start_lesson_impl(
+    state: &AppState,
+    request: LessonStartRequest,
+    student_id: String,
+) -> Value {
     let student = match db::get_or_seed_student(&state.db, &student_id).await {
         Ok(student) => student,
         Err(error) => return json!({ "error": error.to_string() }),
@@ -285,15 +352,21 @@ async fn start_lesson_impl(state: &AppState, request: LessonStartRequest) -> Val
 #[handler]
 async fn infographic(
     Data(state): Data<&AppState>,
+    headers: &HeaderMap,
     Json(request): Json<InfographicRequest>,
-) -> Json<Value> {
-    let student_id = request
-        .student_id
-        .clone()
-        .unwrap_or_else(|| DEFAULT_STUDENT_PUBLIC_ID.to_string());
+) -> ApiResponse {
+    let authenticated = match authenticated_student(headers) {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let student_id = match authorized_body_student_id(&authenticated, request.student_id.as_deref())
+    {
+        Ok(student_id) => student_id,
+        Err(response) => return response,
+    };
     let student = match db::get_or_seed_student(&state.db, &student_id).await {
         Ok(student) => student,
-        Err(error) => return Json(json!({ "error": error.to_string() })),
+        Err(error) => return ok(json!({ "error": error.to_string() })),
     };
 
     let result = match state.openai.generate_infographic(&student, &request).await {
@@ -317,7 +390,7 @@ async fn infographic(
         }
     };
 
-    Json(json!({
+    ok(json!({
         "studentId": student_id,
         "artifact": result,
         "book": book
@@ -327,15 +400,21 @@ async fn infographic(
 #[handler]
 async fn explain_infographic(
     Data(state): Data<&AppState>,
+    headers: &HeaderMap,
     Json(request): Json<InfographicExplanationRequest>,
-) -> Json<Value> {
-    let student_id = request
-        .student_id
-        .clone()
-        .unwrap_or_else(|| DEFAULT_STUDENT_PUBLIC_ID.to_string());
+) -> ApiResponse {
+    let authenticated = match authenticated_student(headers) {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let student_id = match authorized_body_student_id(&authenticated, request.student_id.as_deref())
+    {
+        Ok(student_id) => student_id,
+        Err(response) => return response,
+    };
     let student = match db::get_or_seed_student(&state.db, &student_id).await {
         Ok(student) => student,
-        Err(error) => return Json(json!({ "error": error.to_string() })),
+        Err(error) => return ok(json!({ "error": error.to_string() })),
     };
 
     let voiceover_identity = voiceover_store::voiceover_identity(&student_id, &request);
@@ -346,7 +425,7 @@ async fn explain_infographic(
             match voiceover_store::read_voiceover_audio(&saved.file_path, &saved.content_type).await
             {
                 Ok(audio_data_url) => {
-                    return Json(json!({
+                    return ok(json!({
                         "studentId": student_id,
                         "explanation": voiceover_store::response_from_saved_explanation(
                             &saved.explanation,
@@ -453,7 +532,7 @@ async fn explain_infographic(
         }
     }
 
-    Json(json!({
+    ok(json!({
         "studentId": student_id,
         "explanation": result
     }))
@@ -462,9 +541,18 @@ async fn explain_infographic(
 #[handler]
 async fn narration_speech(
     Data(state): Data<&AppState>,
+    headers: &HeaderMap,
     Json(request): Json<NarrationRequest>,
-) -> Json<Value> {
-    let student_id = request.student_id.clone();
+) -> ApiResponse {
+    let authenticated = match authenticated_student(headers) {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let student_id = match authorized_body_student_id(&authenticated, request.student_id.as_deref())
+    {
+        Ok(student_id) => student_id,
+        Err(response) => return response,
+    };
     let result = match state.openai.generate_narration(&request).await {
         Ok(result) => result,
         Err(error) => json!({
@@ -476,7 +564,7 @@ async fn narration_speech(
         }),
     };
 
-    Json(json!({
+    ok(json!({
         "studentId": student_id,
         "narration": result
     }))
@@ -485,15 +573,21 @@ async fn narration_speech(
 #[handler]
 async fn stagegate(
     Data(state): Data<&AppState>,
+    headers: &HeaderMap,
     Json(request): Json<StagegateRequest>,
-) -> Json<Value> {
-    let student_id = request
-        .student_id
-        .clone()
-        .unwrap_or_else(|| DEFAULT_STUDENT_PUBLIC_ID.to_string());
+) -> ApiResponse {
+    let authenticated = match authenticated_student(headers) {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let student_id = match authorized_body_student_id(&authenticated, request.student_id.as_deref())
+    {
+        Ok(student_id) => student_id,
+        Err(response) => return response,
+    };
     let student = match db::get_or_seed_student(&state.db, &student_id).await {
         Ok(student) => student,
-        Err(error) => return Json(json!({ "error": error.to_string() })),
+        Err(error) => return ok(json!({ "error": error.to_string() })),
     };
 
     let result = match state.openai.grade_stagegate(&student, &request).await {
@@ -529,7 +623,7 @@ async fn stagegate(
                     None
                 }
             };
-            return Json(json!({
+            return ok(json!({
                 "studentId": student_id,
                 "result": null,
                 "student": student,
@@ -563,7 +657,7 @@ async fn stagegate(
         }
     };
 
-    Json(json!({
+    ok(json!({
         "studentId": student_id,
         "result": result,
         "student": updated_student,
@@ -574,24 +668,30 @@ async fn stagegate(
 #[handler]
 async fn memory_profile(
     Data(state): Data<&AppState>,
+    headers: &HeaderMap,
     Json(request): Json<MemoryProfileRequest>,
-) -> Json<Value> {
-    let student_id = request
-        .student_id
-        .clone()
-        .unwrap_or_else(|| DEFAULT_STUDENT_PUBLIC_ID.to_string());
+) -> ApiResponse {
+    let authenticated = match authenticated_student(headers) {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let student_id = match authorized_body_student_id(&authenticated, request.student_id.as_deref())
+    {
+        Ok(student_id) => student_id,
+        Err(response) => return response,
+    };
 
     match memory::profile_for_student(&state.db, &student_id, request).await {
-        Ok(Some(profile)) => Json(json!({
+        Ok(Some(profile)) => ok(json!({
             "studentId": student_id,
             "profile": profile,
         })),
-        Ok(None) => Json(json!({
+        Ok(None) => ok(json!({
             "studentId": student_id,
             "profile": null,
             "error": "Student memory profile was not found.",
         })),
-        Err(error) => Json(json!({
+        Err(error) => ok(json!({
             "studentId": student_id,
             "profile": null,
             "error": error.to_string(),
@@ -602,24 +702,30 @@ async fn memory_profile(
 #[handler]
 async fn memory_graph(
     Data(state): Data<&AppState>,
+    headers: &HeaderMap,
     Json(request): Json<MemoryGraphRequest>,
-) -> Json<Value> {
-    let student_id = request
-        .student_id
-        .clone()
-        .unwrap_or_else(|| DEFAULT_STUDENT_PUBLIC_ID.to_string());
+) -> ApiResponse {
+    let authenticated = match authenticated_student(headers) {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let student_id = match authorized_body_student_id(&authenticated, request.student_id.as_deref())
+    {
+        Ok(student_id) => student_id,
+        Err(response) => return response,
+    };
 
     match memory::graph_for_student(&state.db, &student_id, request).await {
-        Ok(Some(graph)) => Json(json!({
+        Ok(Some(graph)) => ok(json!({
             "studentId": student_id,
             "graph": graph,
         })),
-        Ok(None) => Json(json!({
+        Ok(None) => ok(json!({
             "studentId": student_id,
             "graph": null,
             "error": "Student memory graph was not found.",
         })),
-        Err(error) => Json(json!({
+        Err(error) => ok(json!({
             "studentId": student_id,
             "graph": null,
             "error": error.to_string(),
@@ -627,11 +733,41 @@ async fn memory_graph(
     }
 }
 
+fn ok(value: Value) -> ApiResponse {
+    (StatusCode::OK, Json(value))
+}
+
+fn bad_request(value: Value) -> ApiResponse {
+    (StatusCode::BAD_REQUEST, Json(value))
+}
+
+fn auth_error(error: auth::AuthError) -> ApiResponse {
+    (error.status, Json(json!({ "error": error.message })))
+}
+
+fn authenticated_student(headers: &HeaderMap) -> Result<auth::AuthenticatedStudent, ApiResponse> {
+    auth::authenticate(headers).map_err(auth_error)
+}
+
+fn authorize_path_student(
+    authenticated: &auth::AuthenticatedStudent,
+    student_id: &str,
+) -> Result<(), ApiResponse> {
+    auth::authorize_student(authenticated, student_id).map_err(auth_error)
+}
+
+fn authorized_body_student_id(
+    authenticated: &auth::AuthenticatedStudent,
+    student_id: Option<&str>,
+) -> Result<String, ApiResponse> {
+    auth::authorized_student_id(authenticated, student_id).map_err(auth_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::openai::OpenAiClient;
-    use poem::{EndpointExt, test::TestClient};
+    use poem::{EndpointExt, http::header::AUTHORIZATION, test::TestClient};
     use sea_orm::{DbBackend, MockDatabase};
 
     #[tokio::test]
@@ -673,6 +809,7 @@ mod tests {
 
         let response = client
             .get("/api/students/student-missing/report-card")
+            .header(AUTHORIZATION, auth_header("student-missing"))
             .send()
             .await;
         response.assert_status_is_ok();
@@ -685,14 +822,109 @@ mod tests {
             .assert_string("Student report card was not found.");
     }
 
+    #[tokio::test]
+    async fn register_requires_activation_code_before_account_creation() {
+        let state = AppState {
+            db: MockDatabase::new(DbBackend::Postgres)
+                .into_connection()
+                .into(),
+            openai: OpenAiClient::for_tests(None),
+        };
+        let app = api_routes().data(state);
+        let client = TestClient::new(app);
+
+        let response = client
+            .post("/api/auth/register")
+            .body_json(&json!({
+                "username": "learner",
+                "password": "correct horse battery staple",
+                "displayName": "Learner",
+                "age": 11,
+                "biography": "Curious about tide pools.",
+                "interests": ["marine biology"]
+            }))
+            .send()
+            .await;
+        response.assert_status(StatusCode::FORBIDDEN);
+        let payload = response.json().await;
+        payload
+            .value()
+            .object()
+            .get("error")
+            .assert_string("Activation code is required.");
+    }
+
+    #[tokio::test]
+    async fn protected_routes_require_bearer_sessions() {
+        let state = AppState {
+            db: MockDatabase::new(DbBackend::Postgres)
+                .into_connection()
+                .into(),
+            openai: OpenAiClient::for_tests(None),
+        };
+        let app = api_routes().data(state);
+        let client = TestClient::new(app);
+
+        let response = client.get("/api/book/student-123").send().await;
+        response.assert_status(StatusCode::UNAUTHORIZED);
+        let payload = response.json().await;
+        payload
+            .value()
+            .object()
+            .get("error")
+            .assert_string("Authorization bearer token is required.");
+    }
+
+    #[tokio::test]
+    async fn protected_routes_reject_cross_student_access() {
+        let state = AppState {
+            db: MockDatabase::new(DbBackend::Postgres)
+                .into_connection()
+                .into(),
+            openai: OpenAiClient::for_tests(None),
+        };
+        let app = api_routes().data(state);
+        let client = TestClient::new(app);
+
+        let response = client
+            .get("/api/book/student-other")
+            .header(AUTHORIZATION, auth_header("student-123"))
+            .send()
+            .await;
+        response.assert_status(StatusCode::FORBIDDEN);
+        let payload = response.json().await;
+        payload
+            .value()
+            .object()
+            .get("error")
+            .assert_string("You are not authorized to access that student.");
+    }
+
     #[test]
-    fn local_demo_session_tokens_are_stable_and_student_scoped() {
+    fn issued_sessions_are_signed_and_student_scoped() {
+        let session = auth::session_for_student("student-123");
+        let token = session
+            .get("token")
+            .and_then(Value::as_str)
+            .expect("session token");
+
+        assert_eq!(session.get("type").and_then(Value::as_str), Some("signed"));
+        assert!(!token.contains("local-demo:student-123"));
         assert_eq!(
-            session_for_student("student-123"),
-            json!({
-                "token": "local-demo:student-123",
-                "type": "local-demo"
-            })
+            auth::authenticate(&auth_headers_for("student-123"))
+                .unwrap()
+                .student_id,
+            "student-123"
         );
+    }
+
+    fn auth_header(student_id: &str) -> String {
+        format!("Bearer {}", auth::issue_session_token(student_id))
+    }
+
+    fn auth_headers_for(student_id: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, auth_header(student_id).parse().unwrap());
+        headers
     }
 }

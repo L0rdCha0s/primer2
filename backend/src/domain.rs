@@ -2,8 +2,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const DEFAULT_STUDENT_PUBLIC_ID: &str = "guest-student";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StudentRecord {
@@ -64,8 +62,9 @@ pub struct ConceptProgress {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StudentBookEntryRecord {
-    pub entry_id: String,
+pub struct StudentBookPageRecord {
+    pub page_id: String,
+    pub lesson_id: String,
     pub kind: String,
     pub topic: Option<String>,
     pub stage_level: Option<String>,
@@ -76,11 +75,28 @@ pub struct StudentBookEntryRecord {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StudentBookLessonRecord {
+    pub lesson_id: String,
+    pub topic: String,
+    pub stage_level: Option<String>,
+    pub position: i32,
+    pub lesson: Value,
+    pub latest_infographic: Option<Value>,
+    pub latest_stagegate: Option<Value>,
+    pub latest_answer: Option<String>,
+    pub pages: Vec<StudentBookPageRecord>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StudentBookState {
     pub student_id: String,
     pub book_id: String,
-    pub entries: Vec<StudentBookEntryRecord>,
-    pub active_lesson: Option<Value>,
+    pub current_lesson_id: Option<String>,
+    pub current_lesson: Option<Value>,
+    pub lessons: Vec<StudentBookLessonRecord>,
     pub latest_infographic: Option<Value>,
     pub latest_stagegate: Option<Value>,
     pub latest_answer: Option<String>,
@@ -92,6 +108,7 @@ pub struct StudentBookState {
 pub struct RegisterRequest {
     pub username: String,
     pub password: String,
+    pub activation_code: Option<String>,
     pub display_name: Option<String>,
     pub age: Option<u8>,
     pub age_band: Option<String>,

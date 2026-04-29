@@ -1,13 +1,13 @@
 use crate::{
     domain::{
         ConceptProgress, InfographicExplanationRequest, InfographicRequest, LessonStartRequest,
-        NarrativeCharacter, RegisterRequest, StagegateRequest, StudentBookEntryRecord,
-        StudentBookState, StudentMemory, StudentRecord,
+        NarrativeCharacter, RegisterRequest, StagegateRequest, StudentBookLessonRecord,
+        StudentBookPageRecord, StudentBookState, StudentMemory, StudentRecord,
     },
     entities::{
-        concept_progress, infographic_voiceover, local_user, narrative_character,
-        narrative_character_biography, student, student_book, student_book_entry, student_memory,
-        student_xp_event,
+        concept_progress, infographic_voiceover, lesson_page, local_user, narrative_character,
+        narrative_character_biography, student, student_book, student_book_lesson,
+        student_memory, student_xp_event,
     },
     memory,
 };
@@ -115,32 +115,62 @@ pub async fn init_database(db: &DatabaseConnection) -> Result<(), DbErr> {
             student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
             title text NOT NULL,
             status text NOT NULL DEFAULT 'active',
-            active_lesson jsonb,
+            current_lesson_id uuid,
+            created_at timestamptz NOT NULL,
+            updated_at timestamptz NOT NULL,
+            UNIQUE (student_id)
+        )"#,
+        "DROP TABLE IF EXISTS student_book_entries",
+        "ALTER TABLE student_books DROP COLUMN IF EXISTS active_lesson",
+        "ALTER TABLE student_books DROP COLUMN IF EXISTS latest_infographic",
+        "ALTER TABLE student_books DROP COLUMN IF EXISTS latest_stagegate",
+        "ALTER TABLE student_books DROP COLUMN IF EXISTS latest_answer",
+        "ALTER TABLE student_books ADD COLUMN IF NOT EXISTS current_lesson_id uuid",
+        r#"CREATE TABLE IF NOT EXISTS student_book_lessons (
+            id uuid PRIMARY KEY,
+            book_id uuid NOT NULL REFERENCES student_books(id) ON DELETE CASCADE,
+            student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+            topic text NOT NULL,
+            stage_level text,
+            position integer NOT NULL,
+            lesson jsonb NOT NULL DEFAULT '{}'::jsonb,
             latest_infographic jsonb,
             latest_stagegate jsonb,
             latest_answer text,
             created_at timestamptz NOT NULL,
             updated_at timestamptz NOT NULL,
-            UNIQUE (student_id)
+            UNIQUE (book_id, position)
         )"#,
-        "ALTER TABLE student_books ADD COLUMN IF NOT EXISTS active_lesson jsonb",
-        "ALTER TABLE student_books ADD COLUMN IF NOT EXISTS latest_infographic jsonb",
-        "ALTER TABLE student_books ADD COLUMN IF NOT EXISTS latest_stagegate jsonb",
-        "ALTER TABLE student_books ADD COLUMN IF NOT EXISTS latest_answer text",
-        r#"CREATE TABLE IF NOT EXISTS student_book_entries (
+        r#"CREATE TABLE IF NOT EXISTS lesson_pages (
             id uuid PRIMARY KEY,
+            lesson_id uuid NOT NULL REFERENCES student_book_lessons(id) ON DELETE CASCADE,
             book_id uuid NOT NULL REFERENCES student_books(id) ON DELETE CASCADE,
             student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-            entry_kind text NOT NULL,
+            page_kind text NOT NULL,
             topic text,
             stage_level text,
             position integer NOT NULL,
             payload jsonb NOT NULL DEFAULT '{}'::jsonb,
             created_at timestamptz NOT NULL,
-            UNIQUE (book_id, position)
+            UNIQUE (lesson_id, position)
         )"#,
-        "CREATE INDEX IF NOT EXISTS idx_student_book_entries_student_position ON student_book_entries (student_id, position)",
-        "CREATE INDEX IF NOT EXISTS idx_student_book_entries_book_kind_created ON student_book_entries (book_id, entry_kind, created_at DESC)",
+        r#"DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'fk_student_books_current_lesson'
+            ) THEN
+                ALTER TABLE student_books
+                    ADD CONSTRAINT fk_student_books_current_lesson
+                    FOREIGN KEY (current_lesson_id)
+                    REFERENCES student_book_lessons(id)
+                    ON DELETE SET NULL;
+            END IF;
+        END $$"#,
+        "CREATE INDEX IF NOT EXISTS idx_student_book_lessons_book_position ON student_book_lessons (book_id, position)",
+        "CREATE INDEX IF NOT EXISTS idx_student_book_lessons_student_position ON student_book_lessons (student_id, position)",
+        "CREATE INDEX IF NOT EXISTS idx_lesson_pages_lesson_position ON lesson_pages (lesson_id, position)",
+        "CREATE INDEX IF NOT EXISTS idx_lesson_pages_book_kind_created ON lesson_pages (book_id, page_kind, created_at DESC)",
         r#"CREATE TABLE IF NOT EXISTS infographic_voiceovers (
             id uuid PRIMARY KEY,
             student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
@@ -198,15 +228,6 @@ pub async fn init_database(db: &DatabaseConnection) -> Result<(), DbErr> {
     memory::init_schema(db).await?;
 
     Ok(())
-}
-
-pub async fn list_students(db: &DatabaseConnection) -> Result<Vec<StudentRecord>, DbErr> {
-    let rows = student::Entity::find().all(db).await?;
-    let mut students = Vec::with_capacity(rows.len());
-    for row in rows {
-        students.push(student_record(db, &row).await?);
-    }
-    Ok(students)
 }
 
 pub async fn find_student(
@@ -560,11 +581,44 @@ pub async fn update_lesson_book_state(
     let student = get_or_seed_student_row(db, public_id).await?;
     let book = get_or_create_student_book(db, &student).await?;
     let observed_at = now();
+    let stage_level = lesson.get("stageLevel").and_then(Value::as_str);
+    let lesson_model = student_book_lesson::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        book_id: Set(book.id),
+        student_id: Set(student.id),
+        topic: Set(topic.to_string()),
+        stage_level: Set(stage_level.map(ToString::to_string)),
+        position: Set(next_lesson_position(db, book.id).await?),
+        lesson: Set(lesson.clone()),
+        latest_infographic: Set(None),
+        latest_stagegate: Set(None),
+        latest_answer: Set(None),
+        created_at: Set(observed_at),
+        updated_at: Set(observed_at),
+    }
+    .insert(db)
+    .await?;
+
+    append_lesson_page(
+        db,
+        &book,
+        &lesson_model,
+        &student,
+        "lesson",
+        Some(topic),
+        stage_level,
+        json!({
+            "lesson": lesson.clone(),
+            "request": {
+                "topic": request.topic.clone(),
+                "question": request.question.clone()
+            }
+        }),
+    )
+    .await?;
+
     let mut active_book: student_book::ActiveModel = book.into();
-    active_book.active_lesson = Set(Some(lesson.clone()));
-    active_book.latest_infographic = Set(None);
-    active_book.latest_stagegate = Set(None);
-    active_book.latest_answer = Set(None);
+    active_book.current_lesson_id = Set(Some(lesson_model.id));
     active_book.updated_at = Set(observed_at);
     let updated_book = active_book.update(db).await?;
 
@@ -575,9 +629,10 @@ pub async fn update_lesson_book_state(
         LESSON_STARTED_XP,
         "lesson_started",
         Some(topic),
-        lesson.get("stageLevel").and_then(Value::as_str),
+        stage_level,
         json!({
             "bookId": updated_book.id,
+            "lessonId": lesson_model.id,
             "request": {
                 "topic": request.topic.clone(),
                 "question": request.question.clone()
@@ -592,14 +647,47 @@ pub async fn update_lesson_book_state(
 pub async fn update_infographic_book_state(
     db: &DatabaseConnection,
     public_id: &str,
-    _request: &InfographicRequest,
+    request: &InfographicRequest,
     artifact: &Value,
 ) -> Result<StudentBookState, DbErr> {
     let student = get_or_seed_student_row(db, public_id).await?;
     let book = get_or_create_student_book(db, &student).await?;
     let observed_at = now();
+    let lesson = current_or_placeholder_lesson(
+        db,
+        &book,
+        &student,
+        &request.topic,
+        None,
+        json!({ "topic": request.topic.clone() }),
+    )
+    .await?;
+
+    append_lesson_page(
+        db,
+        &book,
+        &lesson,
+        &student,
+        "infographic",
+        Some(&request.topic),
+        None,
+        json!({
+            "artifact": artifact.clone(),
+            "request": {
+                "topic": request.topic.clone(),
+                "lessonSummary": request.lesson_summary.clone(),
+                "infographicPrompt": request.infographic_prompt.clone(),
+                "size": request.size.clone()
+            }
+        }),
+    )
+    .await?;
+    let mut active_lesson: student_book_lesson::ActiveModel = lesson.into();
+    active_lesson.latest_infographic = Set(Some(artifact.clone()));
+    active_lesson.updated_at = Set(observed_at);
+    active_lesson.update(db).await?;
+
     let mut active_book: student_book::ActiveModel = book.into();
-    active_book.latest_infographic = Set(Some(artifact.clone()));
     active_book.updated_at = Set(observed_at);
     let updated_book = active_book.update(db).await?;
 
@@ -718,9 +806,22 @@ pub async fn append_stagegate_book_entry(
     let student = get_or_seed_student_row(db, public_id).await?;
     let book = get_or_create_student_book(db, &student).await?;
     let stage_level = request.stage_level.as_deref().unwrap_or("intuition");
-    append_book_entry(
+    let lesson = current_or_placeholder_lesson(
         db,
         &book,
+        &student,
+        &request.topic,
+        Some(stage_level),
+        json!({
+            "topic": request.topic.clone(),
+            "stageLevel": stage_level
+        }),
+    )
+    .await?;
+    append_lesson_page(
+        db,
+        &book,
+        &lesson,
         &student,
         "stagegate",
         Some(&request.topic),
@@ -736,9 +837,13 @@ pub async fn append_stagegate_book_entry(
     )
     .await?;
     let observed_at = now();
+    let mut active_lesson: student_book_lesson::ActiveModel = lesson.into();
+    active_lesson.latest_stagegate = Set(Some(result.clone()));
+    active_lesson.latest_answer = Set(Some(request.answer.clone()));
+    active_lesson.updated_at = Set(observed_at);
+    active_lesson.update(db).await?;
+
     let mut active_book: student_book::ActiveModel = book.into();
-    active_book.latest_stagegate = Set(Some(result.clone()));
-    active_book.latest_answer = Set(Some(request.answer.clone()));
     active_book.updated_at = Set(observed_at);
     let updated_book = active_book.update(db).await?;
 
@@ -754,8 +859,12 @@ pub async fn reset_student_learning_state(
 
     let tx = db.begin().await?;
 
-    student_book_entry::Entity::delete_many()
-        .filter(student_book_entry::Column::StudentId.eq(student_id))
+    lesson_page::Entity::delete_many()
+        .filter(lesson_page::Column::StudentId.eq(student_id))
+        .exec(&tx)
+        .await?;
+    student_book_lesson::Entity::delete_many()
+        .filter(student_book_lesson::Column::StudentId.eq(student_id))
         .exec(&tx)
         .await?;
     student_book::Entity::delete_many()
@@ -1053,13 +1162,18 @@ async fn book_state_for_book(
     student: &student::Model,
     book: &student_book::Model,
 ) -> Result<StudentBookState, DbErr> {
-    let rows = student_book_entry::Entity::find()
-        .filter(student_book_entry::Column::BookId.eq(book.id))
-        .order_by_asc(student_book_entry::Column::Position)
+    let lessons = student_book_lesson::Entity::find()
+        .filter(student_book_lesson::Column::BookId.eq(book.id))
+        .order_by_asc(student_book_lesson::Column::Position)
+        .all(db)
+        .await?;
+    let pages = lesson_page::Entity::find()
+        .filter(lesson_page::Column::BookId.eq(book.id))
+        .order_by_asc(lesson_page::Column::Position)
         .all(db)
         .await?;
 
-    Ok(book_state_from_rows(student, book, rows))
+    Ok(book_state_from_lessons(student, book, lessons, pages))
 }
 
 async fn get_or_create_student_book(
@@ -1080,10 +1194,7 @@ async fn get_or_create_student_book(
         student_id: Set(student.id),
         title: Set(format!("{}'s Primer", student.display_name)),
         status: Set("active".to_string()),
-        active_lesson: Set(None),
-        latest_infographic: Set(None),
-        latest_stagegate: Set(None),
-        latest_answer: Set(None),
+        current_lesson_id: Set(None),
         created_at: Set(observed_at),
         updated_at: Set(observed_at),
     }
@@ -1091,22 +1202,67 @@ async fn get_or_create_student_book(
     .await
 }
 
-async fn append_book_entry(
+async fn current_or_placeholder_lesson(
     db: &DatabaseConnection,
     book: &student_book::Model,
     student: &student::Model,
-    entry_kind: &str,
-    topic: Option<&str>,
+    topic: &str,
     stage_level: Option<&str>,
-    payload: Value,
-) -> Result<student_book_entry::Model, DbErr> {
+    lesson: Value,
+) -> Result<student_book_lesson::Model, DbErr> {
+    if let Some(lesson_id) = book.current_lesson_id {
+        if let Some(lesson) = student_book_lesson::Entity::find_by_id(lesson_id)
+            .one(db)
+            .await?
+        {
+            return Ok(lesson);
+        }
+    }
+
     let observed_at = now();
-    let position = next_book_position(db, book.id).await?;
-    let entry = student_book_entry::ActiveModel {
+    let lesson = student_book_lesson::ActiveModel {
         id: Set(Uuid::new_v4()),
         book_id: Set(book.id),
         student_id: Set(student.id),
-        entry_kind: Set(entry_kind.to_string()),
+        topic: Set(topic.to_string()),
+        stage_level: Set(stage_level.map(ToString::to_string)),
+        position: Set(next_lesson_position(db, book.id).await?),
+        lesson: Set(lesson),
+        latest_infographic: Set(None),
+        latest_stagegate: Set(None),
+        latest_answer: Set(None),
+        created_at: Set(observed_at),
+        updated_at: Set(observed_at),
+    }
+    .insert(db)
+    .await?;
+
+    let mut active_book: student_book::ActiveModel = book.clone().into();
+    active_book.current_lesson_id = Set(Some(lesson.id));
+    active_book.updated_at = Set(observed_at);
+    active_book.update(db).await?;
+
+    Ok(lesson)
+}
+
+async fn append_lesson_page(
+    db: &DatabaseConnection,
+    book: &student_book::Model,
+    lesson: &student_book_lesson::Model,
+    student: &student::Model,
+    page_kind: &str,
+    topic: Option<&str>,
+    stage_level: Option<&str>,
+    payload: Value,
+) -> Result<lesson_page::Model, DbErr> {
+    let observed_at = now();
+    let position = next_lesson_page_position(db, lesson.id).await?;
+    let page = lesson_page::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        lesson_id: Set(lesson.id),
+        book_id: Set(book.id),
+        student_id: Set(student.id),
+        page_kind: Set(page_kind.to_string()),
         topic: Set(topic.map(ToString::to_string)),
         stage_level: Set(stage_level.map(ToString::to_string)),
         position: Set(position),
@@ -1116,21 +1272,34 @@ async fn append_book_entry(
     .insert(db)
     .await?;
 
-    let mut active_book: student_book::ActiveModel = book.clone().into();
-    active_book.updated_at = Set(observed_at);
-    active_book.update(db).await?;
+    let mut active_lesson: student_book_lesson::ActiveModel = lesson.clone().into();
+    active_lesson.updated_at = Set(observed_at);
+    active_lesson.update(db).await?;
 
-    Ok(entry)
+    Ok(page)
 }
 
-async fn next_book_position(db: &DatabaseConnection, book_id: Uuid) -> Result<i32, DbErr> {
-    let latest = student_book_entry::Entity::find()
-        .filter(student_book_entry::Column::BookId.eq(book_id))
-        .order_by_desc(student_book_entry::Column::Position)
+async fn next_lesson_position(db: &DatabaseConnection, book_id: Uuid) -> Result<i32, DbErr> {
+    let latest = student_book_lesson::Entity::find()
+        .filter(student_book_lesson::Column::BookId.eq(book_id))
+        .order_by_desc(student_book_lesson::Column::Position)
         .one(db)
         .await?;
 
-    Ok(latest.map(|entry| entry.position + 1).unwrap_or(1))
+    Ok(latest.map(|lesson| lesson.position + 1).unwrap_or(1))
+}
+
+async fn next_lesson_page_position(
+    db: &DatabaseConnection,
+    lesson_id: Uuid,
+) -> Result<i32, DbErr> {
+    let latest = lesson_page::Entity::find()
+        .filter(lesson_page::Column::LessonId.eq(lesson_id))
+        .order_by_desc(lesson_page::Column::Position)
+        .one(db)
+        .await?;
+
+    Ok(latest.map(|page| page.position + 1).unwrap_or(1))
 }
 
 async fn award_xp_event(
@@ -1264,79 +1433,67 @@ fn xp_key_component(value: &str) -> String {
     }
 }
 
-fn book_state_from_rows(
+fn book_state_from_lessons(
     student: &student::Model,
     book: &student_book::Model,
-    rows: Vec<student_book_entry::Model>,
+    lessons: Vec<student_book_lesson::Model>,
+    pages: Vec<lesson_page::Model>,
 ) -> StudentBookState {
-    let all_entries = rows
+    let current_lesson = book
+        .current_lesson_id
+        .and_then(|current_lesson_id| {
+            lessons
+                .iter()
+                .find(|lesson| lesson.id == current_lesson_id)
+                .cloned()
+        })
+        .or_else(|| lessons.last().cloned());
+    let current_lesson_id = current_lesson
+        .as_ref()
+        .map(|lesson| lesson.id.to_string());
+    let current_lesson_payload = current_lesson
+        .as_ref()
+        .map(|lesson| lesson.lesson.clone());
+    let latest_infographic = current_lesson
+        .as_ref()
+        .and_then(|lesson| lesson.latest_infographic.clone());
+    let latest_stagegate = current_lesson
+        .as_ref()
+        .and_then(|lesson| lesson.latest_stagegate.clone());
+    let latest_answer = current_lesson
+        .as_ref()
+        .and_then(|lesson| lesson.latest_answer.clone());
+    let mut pages_by_lesson = pages
         .into_iter()
-        .map(student_book_entry_record)
-        .collect::<Vec<_>>();
-    let has_current_state = book.active_lesson.is_some()
-        || book.latest_infographic.is_some()
-        || book.latest_stagegate.is_some()
-        || book.latest_answer.is_some();
-    let (active_lesson, latest_infographic, latest_stagegate, latest_answer) = if has_current_state
-    {
-        (
-            book.active_lesson.clone(),
-            book.latest_infographic.clone(),
-            book.latest_stagegate.clone(),
-            book.latest_answer.clone(),
-        )
-    } else {
-        let mut active_lesson = None;
-        let mut latest_infographic = None;
-        let mut latest_stagegate = None;
-        let mut latest_answer = None;
-
-        for entry in &all_entries {
-            match entry.kind.as_str() {
-                "lesson" => {
-                    active_lesson = entry
-                        .payload
-                        .get("lesson")
-                        .cloned()
-                        .or_else(|| Some(entry.payload.clone()));
-                    latest_infographic = None;
-                    latest_stagegate = None;
-                    latest_answer = None;
-                }
-                "infographic" => {
-                    latest_infographic = entry
-                        .payload
-                        .get("artifact")
-                        .cloned()
-                        .or_else(|| Some(entry.payload.clone()));
-                }
-                "stagegate" => {
-                    latest_stagegate = entry
-                        .payload
-                        .get("result")
-                        .cloned()
-                        .or_else(|| Some(entry.payload.clone()));
-                    latest_answer = entry
-                        .payload
-                        .get("request")
-                        .and_then(|request| request.get("answer"))
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string);
-                }
-                _ => {}
+        .map(lesson_page_record)
+        .fold(
+            std::collections::BTreeMap::<String, Vec<StudentBookPageRecord>>::new(),
+            |mut grouped, page| {
+                grouped
+                    .entry(page.lesson_id.clone())
+                    .or_default()
+                    .push(page);
+                grouped
+            },
+        );
+    let lessons = lessons
+        .into_iter()
+        .map(|lesson| {
+            let lesson_id = lesson.id.to_string();
+            StudentBookLessonRecord {
+                lesson_id: lesson_id.clone(),
+                topic: lesson.topic,
+                stage_level: lesson.stage_level,
+                position: lesson.position,
+                lesson: lesson.lesson,
+                latest_infographic: lesson.latest_infographic,
+                latest_stagegate: lesson.latest_stagegate,
+                latest_answer: lesson.latest_answer,
+                pages: pages_by_lesson.remove(&lesson_id).unwrap_or_default(),
+                created_at: lesson.created_at.to_rfc3339(),
+                updated_at: lesson.updated_at.to_rfc3339(),
             }
-        }
-
-        (
-            active_lesson,
-            latest_infographic,
-            latest_stagegate,
-            latest_answer,
-        )
-    };
-    let entries = all_entries
-        .into_iter()
-        .filter(|entry| entry.kind == "stagegate")
+        })
         .collect::<Vec<_>>();
 
     let has_passed_stagegate = latest_stagegate
@@ -1348,8 +1505,9 @@ fn book_state_from_rows(
     StudentBookState {
         student_id: student.public_id.clone(),
         book_id: book.id.to_string(),
-        entries,
-        active_lesson,
+        current_lesson_id,
+        current_lesson: current_lesson_payload,
+        lessons,
         latest_infographic,
         latest_stagegate,
         latest_answer,
@@ -1357,10 +1515,11 @@ fn book_state_from_rows(
     }
 }
 
-fn student_book_entry_record(row: student_book_entry::Model) -> StudentBookEntryRecord {
-    StudentBookEntryRecord {
-        entry_id: row.id.to_string(),
-        kind: row.entry_kind,
+fn lesson_page_record(row: lesson_page::Model) -> StudentBookPageRecord {
+    StudentBookPageRecord {
+        page_id: row.id.to_string(),
+        lesson_id: row.lesson_id.to_string(),
+        kind: row.page_kind,
         topic: row.topic,
         stage_level: row.stage_level,
         position: row.position,
@@ -1980,10 +2139,11 @@ mod tests {
     }
 
     #[test]
-    fn book_state_from_rows_exposes_latest_persisted_book_content() {
+    fn book_state_from_lessons_exposes_current_lesson_and_pages() {
         let observed_at = now();
         let student_id = Uuid::new_v4();
         let book_id = Uuid::new_v4();
+        let lesson_id = Uuid::new_v4();
         let student = student::Model {
             id: student_id,
             public_id: "student-123".to_string(),
@@ -2004,19 +2164,40 @@ mod tests {
             student_id,
             title: "Mina's Primer".to_string(),
             status: "active".to_string(),
-            active_lesson: None,
-            latest_infographic: None,
-            latest_stagegate: None,
-            latest_answer: None,
+            current_lesson_id: Some(lesson_id),
             created_at: observed_at,
             updated_at: observed_at,
         };
-        let rows = vec![
-            student_book_entry::Model {
+        let lessons = vec![student_book_lesson::Model {
+            id: lesson_id,
+            book_id,
+            student_id,
+            topic: "reef currents".to_string(),
+            stage_level: Some("intuition".to_string()),
+            position: 1,
+            lesson: json!({
+                "topic": "reef currents",
+                "stageLevel": "intuition"
+            }),
+            latest_infographic: Some(json!({
+                "generated": true,
+                "model": "gpt-image-2"
+            })),
+            latest_stagegate: Some(json!({
+                "passed": true,
+                "score": 0.88
+            })),
+            latest_answer: Some("Currents move when forces push water.".to_string()),
+            created_at: observed_at,
+            updated_at: observed_at,
+        }];
+        let pages = vec![
+            lesson_page::Model {
                 id: Uuid::new_v4(),
+                lesson_id,
                 book_id,
                 student_id,
-                entry_kind: "lesson".to_string(),
+                page_kind: "lesson".to_string(),
                 topic: Some("reef currents".to_string()),
                 stage_level: Some("intuition".to_string()),
                 position: 1,
@@ -2028,11 +2209,12 @@ mod tests {
                 }),
                 created_at: observed_at,
             },
-            student_book_entry::Model {
+            lesson_page::Model {
                 id: Uuid::new_v4(),
+                lesson_id,
                 book_id,
                 student_id,
-                entry_kind: "infographic".to_string(),
+                page_kind: "infographic".to_string(),
                 topic: Some("reef currents".to_string()),
                 stage_level: None,
                 position: 2,
@@ -2044,11 +2226,12 @@ mod tests {
                 }),
                 created_at: observed_at,
             },
-            student_book_entry::Model {
+            lesson_page::Model {
                 id: Uuid::new_v4(),
+                lesson_id,
                 book_id,
                 student_id,
-                entry_kind: "stagegate".to_string(),
+                page_kind: "stagegate".to_string(),
                 topic: Some("reef currents".to_string()),
                 stage_level: Some("intuition".to_string()),
                 position: 3,
@@ -2065,13 +2248,22 @@ mod tests {
             },
         ];
 
-        let state = book_state_from_rows(&student, &book, rows);
+        let state = book_state_from_lessons(&student, &book, lessons, pages);
 
         assert_eq!(state.student_id, "student-123");
-        assert_eq!(state.entries.len(), 1);
-        assert_eq!(state.entries[0].kind, "stagegate");
+        assert_eq!(state.current_lesson_id.as_deref(), Some(&lesson_id.to_string()));
+        assert_eq!(state.lessons.len(), 1);
         assert_eq!(
-            state.active_lesson.unwrap()["topic"],
+            state
+                .lessons[0]
+                .pages
+                .iter()
+                .map(|page| page.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lesson", "infographic", "stagegate"]
+        );
+        assert_eq!(
+            state.current_lesson.unwrap()["topic"],
             json!("reef currents")
         );
         assert_eq!(
@@ -2086,10 +2278,12 @@ mod tests {
     }
 
     #[test]
-    fn current_book_state_keeps_non_stagegate_rows_out_of_the_visible_book() {
+    fn current_book_state_keeps_lesson_history_outside_current_lesson() {
         let observed_at = now();
         let student_id = Uuid::new_v4();
         let book_id = Uuid::new_v4();
+        let old_lesson_id = Uuid::new_v4();
+        let current_lesson_id = Uuid::new_v4();
         let student = student::Model {
             id: student_id,
             public_id: "student-123".to_string(),
@@ -2110,39 +2304,68 @@ mod tests {
             student_id,
             title: "Mina's Primer".to_string(),
             status: "active".to_string(),
-            active_lesson: Some(json!({
-                "topic": "basketball arcs",
-                "stageLevel": "intuition"
-            })),
-            latest_infographic: None,
-            latest_stagegate: Some(json!({
-                "passed": false,
-                "score": 0.4
-            })),
-            latest_answer: Some("It loops back.".to_string()),
+            current_lesson_id: Some(current_lesson_id),
             created_at: observed_at,
             updated_at: observed_at,
         };
-        let rows = vec![
-            student_book_entry::Model {
-                id: Uuid::new_v4(),
+        let lessons = vec![
+            student_book_lesson::Model {
+                id: old_lesson_id,
                 book_id,
                 student_id,
-                entry_kind: "lesson".to_string(),
+                topic: "old lesson".to_string(),
+                stage_level: Some("intuition".to_string()),
+                position: 1,
+                lesson: json!({ "topic": "old lesson" }),
+                latest_infographic: None,
+                latest_stagegate: None,
+                latest_answer: None,
+                created_at: observed_at,
+                updated_at: observed_at,
+            },
+            student_book_lesson::Model {
+                id: current_lesson_id,
+                book_id,
+                student_id,
+                topic: "basketball arcs".to_string(),
+                stage_level: Some("intuition".to_string()),
+                position: 2,
+                lesson: json!({
+                    "topic": "basketball arcs",
+                    "stageLevel": "intuition"
+                }),
+                latest_infographic: None,
+                latest_stagegate: Some(json!({
+                    "passed": false,
+                    "score": 0.4
+                })),
+                latest_answer: Some("It loops back.".to_string()),
+                created_at: observed_at,
+                updated_at: observed_at,
+            },
+        ];
+        let pages = vec![
+            lesson_page::Model {
+                id: Uuid::new_v4(),
+                lesson_id: old_lesson_id,
+                book_id,
+                student_id,
+                page_kind: "lesson".to_string(),
                 topic: Some("old lesson".to_string()),
                 stage_level: Some("intuition".to_string()),
                 position: 1,
                 payload: json!({ "lesson": { "topic": "old lesson" } }),
                 created_at: observed_at,
             },
-            student_book_entry::Model {
+            lesson_page::Model {
                 id: Uuid::new_v4(),
+                lesson_id: current_lesson_id,
                 book_id,
                 student_id,
-                entry_kind: "stagegate".to_string(),
+                page_kind: "stagegate".to_string(),
                 topic: Some("basketball arcs".to_string()),
                 stage_level: Some("intuition".to_string()),
-                position: 2,
+                position: 1,
                 payload: json!({
                     "request": {
                         "answer": "It loops back."
@@ -2156,12 +2379,19 @@ mod tests {
             },
         ];
 
-        let state = book_state_from_rows(&student, &book, rows);
+        let state = book_state_from_lessons(&student, &book, lessons, pages);
 
-        assert_eq!(state.entries.len(), 1);
-        assert_eq!(state.entries[0].kind, "stagegate");
+        assert_eq!(state.lessons.len(), 2);
         assert_eq!(
-            state.active_lesson.unwrap()["topic"],
+            state
+                .lessons
+                .iter()
+                .map(|lesson| lesson.topic.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old lesson", "basketball arcs"]
+        );
+        assert_eq!(
+            state.current_lesson.unwrap()["topic"],
             json!("basketball arcs")
         );
         assert!(!state.has_passed_stagegate);

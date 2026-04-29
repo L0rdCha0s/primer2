@@ -1,10 +1,11 @@
 pub mod concept_progress;
 pub mod infographic_voiceover;
+pub mod lesson_page;
 pub mod local_user;
 pub mod narrative_character;
 pub mod narrative_character_biography;
 pub mod student;
 pub mod student_book;
-pub mod student_book_entry;
+pub mod student_book_lesson;
 pub mod student_memory;
 pub mod student_xp_event;

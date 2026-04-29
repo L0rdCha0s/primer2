@@ -59,8 +59,9 @@ export type PrimerLesson = {
   model?: string;
 };
 
-export type StudentBookEntry = {
-  entryId: string;
+export type StudentBookPage = {
+  pageId: string;
+  lessonId: string;
   kind: "lesson" | "infographic" | "stagegate" | string;
   topic?: string;
   stageLevel?: string;
@@ -69,18 +70,37 @@ export type StudentBookEntry = {
   createdAt: string;
 };
 
+export type StudentBookLesson = {
+  lessonId: string;
+  topic: string;
+  stageLevel?: string;
+  position: number;
+  lesson: unknown;
+  latestInfographic?: unknown;
+  latestStagegate?: unknown;
+  latestAnswer?: string;
+  pages: StudentBookPage[];
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type StudentBookState = {
   studentId: string;
   bookId: string;
-  entries: StudentBookEntry[];
-  activeLesson?: unknown;
+  currentLessonId?: string;
+  currentLesson?: unknown;
+  lessons: StudentBookLesson[];
   latestInfographic?: unknown;
   latestStagegate?: unknown;
   latestAnswer?: string;
   hasPassedStagegate: boolean;
 };
 
-export const staticBookPageCount = 12;
+export const staticBookPageCount = 10;
+export type BookContentKind = "lesson" | "infographic";
+export type StudentBookContentPage = StudentBookPage & {
+  kind: BookContentKind;
+};
 
 export function bookEndPageIndex(entryCount: number): number {
   const safeEntryCount = Number.isFinite(entryCount)
@@ -90,29 +110,46 @@ export function bookEndPageIndex(entryCount: number): number {
   return staticBookPageCount + safeEntryCount - 1;
 }
 
-export function isBookContentEntry(
-  entry: Pick<StudentBookEntry, "kind">,
-): entry is Pick<StudentBookEntry, "kind"> & {
-  kind: "lesson" | "infographic";
-} {
-  return entry.kind === "lesson" || entry.kind === "infographic";
+export function isBookContentPage<T extends Pick<StudentBookPage, "kind">>(
+  page: T,
+): page is T & { kind: BookContentKind } {
+  return page.kind === "lesson" || page.kind === "infographic";
 }
 
-export function bookContentEntryCount(
-  entries: Array<Pick<StudentBookEntry, "kind">>,
+export function bookContentPageCount(
+  pages: Array<Pick<StudentBookPage, "kind">>,
 ): number {
-  return entries.filter(isBookContentEntry).length;
+  return pages.filter(isBookContentPage).length;
+}
+
+export function visibleBookContentPages(
+  lessons: StudentBookLesson[],
+): StudentBookContentPage[] {
+  return lessons
+    .flatMap((lesson) =>
+      lesson.pages.map((page) => ({
+        ...page,
+        lessonPosition: lesson.position,
+      })),
+    )
+    .filter(isBookContentPage)
+    .sort(
+      (left, right) =>
+        left.lessonPosition - right.lessonPosition ||
+        left.position - right.position,
+    )
+    .map(({ lessonPosition: _lessonPosition, ...page }) => page);
 }
 
 export function defaultBookPageIndex(
-  entries: Array<Pick<StudentBookEntry, "kind">>,
+  pages: Array<Pick<StudentBookPage, "kind">>,
 ): number {
-  const latestEntry = entries.at(-1);
-  if (latestEntry?.kind === "stagegate") {
+  const latestPage = pages.at(-1);
+  if (latestPage?.kind === "stagegate") {
     return staticBookPageCount - 1;
   }
 
-  return bookEndPageIndex(bookContentEntryCount(entries));
+  return bookEndPageIndex(bookContentPageCount(pages));
 }
 
 type BackendMemory = {
@@ -477,17 +514,18 @@ export function normalizeBookState(value: unknown): StudentBookState | null {
     return null;
   }
 
-  const entries = Array.isArray(record.entries)
-    ? record.entries
-        .map(normalizeBookEntry)
-        .filter((entry): entry is StudentBookEntry => entry !== null)
+  const lessons = Array.isArray(record.lessons)
+    ? record.lessons
+        .map(normalizeBookLesson)
+        .filter((lesson): lesson is StudentBookLesson => lesson !== null)
     : [];
 
   return {
     studentId,
     bookId,
-    entries,
-    activeLesson: record.activeLesson,
+    currentLessonId: stringField(record, "currentLessonId"),
+    currentLesson: record.currentLesson,
+    lessons,
     latestInfographic: record.latestInfographic,
     latestStagegate: record.latestStagegate,
     latestAnswer: stringField(record, "latestAnswer"),
@@ -495,17 +533,49 @@ export function normalizeBookState(value: unknown): StudentBookState | null {
   };
 }
 
-function normalizeBookEntry(value: unknown): StudentBookEntry | null {
+function normalizeBookLesson(value: unknown): StudentBookLesson | null {
   const record = asRecord(value);
-  const entryId = stringField(record, "entryId");
+  const lessonId = stringField(record, "lessonId");
+  const topic = stringField(record, "topic");
+  const position = numberField(record, "position");
+  if (!lessonId || !topic || typeof position !== "number") {
+    return null;
+  }
+
+  const pages = Array.isArray(record.pages)
+    ? record.pages
+        .map(normalizeBookPage)
+        .filter((page): page is StudentBookPage => page !== null)
+    : [];
+
+  return {
+    lessonId,
+    topic,
+    stageLevel: stringField(record, "stageLevel"),
+    position,
+    lesson: record.lesson,
+    latestInfographic: record.latestInfographic,
+    latestStagegate: record.latestStagegate,
+    latestAnswer: stringField(record, "latestAnswer"),
+    pages,
+    createdAt: stringField(record, "createdAt") ?? "",
+    updatedAt: stringField(record, "updatedAt") ?? "",
+  };
+}
+
+function normalizeBookPage(value: unknown): StudentBookPage | null {
+  const record = asRecord(value);
+  const pageId = stringField(record, "pageId");
+  const lessonId = stringField(record, "lessonId");
   const kind = stringField(record, "kind");
   const position = numberField(record, "position");
-  if (!entryId || !kind || typeof position !== "number") {
+  if (!pageId || !lessonId || !kind || typeof position !== "number") {
     return null;
   }
 
   return {
-    entryId,
+    pageId,
+    lessonId,
     kind,
     topic: stringField(record, "topic"),
     stageLevel: stringField(record, "stageLevel"),

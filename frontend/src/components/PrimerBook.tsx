@@ -39,10 +39,7 @@ import {
 } from "lucide-react";
 import { AuthGate } from "@/components/AuthGate";
 import { LessonGenerationOverlay } from "@/components/LessonGenerationOverlay";
-import {
-  ReportCardParentPage,
-  ReportCardStudentPage,
-} from "@/components/ReportCardPages";
+import { ReportCardDialog } from "@/components/ReportCardPages";
 import HTMLFlipBook from "react-pageflip";
 import {
   type AuthPayload,
@@ -66,9 +63,13 @@ import {
   type PrimerLesson,
   type Stage,
   type StagegateResult,
+  type StudentBookContentEntry,
+  type StudentBookEntry,
   type StudentBookState,
   type StudentMemory,
   type StudentMemoryGraph,
+  bookContentEntryCount,
+  bookEndPageIndex,
   buildLessonStartBody,
   defaultBookPageIndex,
   emptyStagegateResult,
@@ -82,6 +83,7 @@ import {
   normalizeStagegateResult,
   stagesForStagegate,
   staticBookPageCount,
+  visibleBookContentEntries,
 } from "@/lib/primer-flow";
 import {
   type StudentReportCard,
@@ -218,8 +220,8 @@ type MemoryEdgeData = Record<string, unknown> & {
 type MemoryFlowNode = ReactFlowNode<MemoryNodeData>;
 type MemoryFlowEdge = Edge<MemoryEdgeData>;
 
-const chooseTopicPageIndex = 5;
-const storyPageIndex = 6;
+const chooseTopicPageIndex = 3;
+const storyPageIndex = 4;
 
 type BookPageProps = {
   children: ReactNode;
@@ -409,10 +411,15 @@ async function fetchStudentMemoryGraph(
 }
 
 function restoredBookTargetPage(book: StudentBookState): number {
+  const contentEntryCount = bookContentEntryCount(book.entries);
   if (book.latestStagegate) {
     return book.hasPassedStagegate
-      ? staticBookPageCount
+      ? staticBookPageCount + contentEntryCount
       : staticBookPageCount - 1;
+  }
+
+  if (contentEntryCount > 0) {
+    return bookEndPageIndex(contentEntryCount);
   }
 
   if (book.activeLesson) {
@@ -438,6 +445,7 @@ export function PrimerBook() {
   const [currentPage, setCurrentPage] = useState(0);
   const [topic, setTopic] = useState("");
   const [lesson, setLesson] = useState<PrimerLesson>(initialLesson);
+  const [bookEntries, setBookEntries] = useState<StudentBookEntry[]>([]);
   const [remoteMemories, setRemoteMemories] = useState<StudentMemory[] | null>(
     null,
   );
@@ -446,6 +454,7 @@ export function PrimerBook() {
     "Report card not loaded.",
   );
   const [isReportCardRefreshing, setIsReportCardRefreshing] = useState(false);
+  const [isReportOpen, setIsReportOpen] = useState(false);
   const [memoryGraph, setMemoryGraph] = useState<StudentMemoryGraph | null>(
     null,
   );
@@ -526,6 +535,7 @@ export function PrimerBook() {
       if (options?.turnToEnd) {
         pendingBookEndPageRef.current = restoredBookTargetPage(book);
       }
+      setBookEntries(book.entries);
       if (book.activeLesson) {
         const savedLesson = normalizeLesson(
           book.activeLesson,
@@ -616,12 +626,14 @@ export function PrimerBook() {
     setIsLessonGenerating(false);
     setIsInfographicGenerating(false);
     setInfographicArtifact(null);
+    setBookEntries([]);
     setSelectionInfographics([]);
     setSelectedTextAction(null);
     setStagegateResult(emptyStagegateResult);
     setAnswer("");
     setReportCard(null);
     setReportCardStatus("Report card not loaded.");
+    setIsReportOpen(false);
     setLessonStatus("Loading the saved Primer book...");
 
     void fetchStudentBookState(learner, session, controller.signal)
@@ -748,7 +760,6 @@ export function PrimerBook() {
     options: {
       learner?: AuthenticatedStudent;
       session?: AuthSession | null;
-      turnToReport?: boolean;
     } = {},
   ) {
     const learner = options.learner ?? authenticatedStudent;
@@ -775,9 +786,6 @@ export function PrimerBook() {
           ? "Report card refreshed with OpenAI narrative."
           : "Report card refreshed from saved learning evidence.",
       );
-      if (options.turnToReport) {
-        goToPage(3);
-      }
     } catch (error) {
       setReportCardStatus(`Could not refresh report card: ${String(error)}`);
     } finally {
@@ -786,8 +794,8 @@ export function PrimerBook() {
   }
 
   function openReportCard() {
-    goToPage(3);
-    void loadReportCard({ turnToReport: true });
+    setIsReportOpen(true);
+    void loadReportCard();
   }
 
   useEffect(() => {
@@ -894,6 +902,41 @@ export function PrimerBook() {
   }, [hasPassedStagegate]);
 
   const hasNextTopicPage = hasPassedStagegate;
+  const visibleBookEntries = useMemo(
+    () => visibleBookContentEntries(bookEntries),
+    [bookEntries],
+  );
+  const persistedBookPages = useMemo(() => {
+    return visibleBookEntries.reduce<{
+      lessonCount: number;
+      pages: Array<{
+        entry: StudentBookContentEntry;
+        lessonOrdinal: number;
+        pageIndex: number;
+      }>;
+    }>(
+      (current, entry, index) => {
+        const lessonCount =
+          entry.kind === "lesson"
+            ? current.lessonCount + 1
+            : current.lessonCount;
+
+        return {
+          lessonCount,
+          pages: [
+            ...current.pages,
+            {
+              entry,
+              lessonOrdinal: lessonCount,
+              pageIndex: staticBookPageCount + index,
+            },
+          ],
+        };
+      },
+      { lessonCount: 0, pages: [] },
+    ).pages;
+  }, [visibleBookEntries]);
+  const nextTopicPageIndex = staticBookPageCount + persistedBookPages.length;
   const selectionInfographicsByPage = useMemo(() => {
     const byPage = new Map<number, SelectionInfographic[]>();
     for (const infographic of selectionInfographics) {
@@ -903,7 +946,7 @@ export function PrimerBook() {
     }
     return byPage;
   }, [selectionInfographics]);
-  const pageCount = staticBookPageCount + (hasNextTopicPage ? 1 : 0);
+  const pageCount = nextTopicPageIndex + (hasNextTopicPage ? 1 : 0);
 
   useEffect(() => {
     const targetPage = pendingBookEndPageRef.current;
@@ -1628,8 +1671,10 @@ export function PrimerBook() {
       setCurrentPage(0);
       setTopic(resetStudent.interests[0] ?? "");
       setLesson(initialLesson);
+      setBookEntries([]);
       setReportCard(null);
       setReportCardStatus("Report card not loaded.");
+      setIsReportOpen(false);
       setHasAsked(true);
       setHasGeneratedInfographic(false);
       setHasPassedStagegate(false);
@@ -1737,6 +1782,7 @@ export function PrimerBook() {
     setReportCard(null);
     setReportCardStatus("Report card not loaded.");
     setIsReportCardRefreshing(false);
+    setIsReportOpen(false);
     setMemoryGraph(null);
     setIsMemoryOpen(false);
     setIsResetDialogOpen(false);
@@ -1747,6 +1793,7 @@ export function PrimerBook() {
     setCurrentPage(0);
     setTopic("");
     setLesson(initialLesson);
+    setBookEntries([]);
     setHasAsked(false);
     setHasGeneratedInfographic(false);
     setHasPassedStagegate(false);
@@ -1801,8 +1848,8 @@ export function PrimerBook() {
             type="button"
             aria-label="Open report card"
             onClick={openReportCard}
-            disabled={isReportCardRefreshing}
-            className="inline-flex h-10 items-center gap-2 rounded-full border border-cyan-100/15 bg-black/28 px-2.5 text-sm text-cyan-50/78 shadow-2xl shadow-black/20 transition hover:text-cyan-50 disabled:cursor-wait disabled:opacity-60 sm:px-3"
+            aria-busy={isReportCardRefreshing}
+            className="inline-flex h-10 items-center gap-2 rounded-full border border-cyan-100/15 bg-black/28 px-2.5 text-sm text-cyan-50/78 shadow-2xl shadow-black/20 transition hover:text-cyan-50 sm:px-3"
           >
             <MapIcon className="h-4 w-4" />
             <span className="hidden sm:inline">Report</span>
@@ -1922,36 +1969,6 @@ export function PrimerBook() {
                   pageIndex={3}
                   pageNumber={3}
                 >
-                  <ReportCardStudentPage
-                    isRefreshing={isReportCardRefreshing}
-                    onRefresh={() => void loadReportCard()}
-                    reportCard={reportCard}
-                    status={reportCardStatus}
-                  />
-                </BookPage>
-
-                <BookPage
-                  inlineInfographics={inlineInfographicsForPage(4)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(4)}
-                  onOpenInfographic={openInfographicImage}
-                  pageIndex={4}
-                  pageNumber={4}
-                >
-                  <ReportCardParentPage
-                    isRefreshing={isReportCardRefreshing}
-                    onRefresh={() => void loadReportCard()}
-                    reportCard={reportCard}
-                    status={reportCardStatus}
-                  />
-                </BookPage>
-
-                <BookPage
-                  inlineInfographics={inlineInfographicsForPage(5)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(5)}
-                  onOpenInfographic={openInfographicImage}
-                  pageIndex={5}
-                  pageNumber={5}
-                >
                   <AskPage
                     hasAsked={hasAsked}
                     lessonStatus={lessonStatus}
@@ -1963,21 +1980,21 @@ export function PrimerBook() {
                 </BookPage>
 
                 <BookPage
-                  inlineInfographics={inlineInfographicsForPage(6)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(6)}
+                  inlineInfographics={inlineInfographicsForPage(4)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(4)}
                   onOpenInfographic={openInfographicImage}
-                  pageIndex={6}
-                  pageNumber={6}
+                  pageIndex={4}
+                  pageNumber={4}
                 >
                   <StoryPage lesson={lesson} />
                 </BookPage>
 
                 <BookPage
-                  inlineInfographics={inlineInfographicsForPage(7)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(7)}
+                  inlineInfographics={inlineInfographicsForPage(5)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(5)}
                   onOpenInfographic={openInfographicImage}
-                  pageIndex={7}
-                  pageNumber={7}
+                  pageIndex={5}
+                  pageNumber={5}
                 >
                   <InfographicPage
                     artifact={infographicArtifact}
@@ -1994,11 +2011,11 @@ export function PrimerBook() {
                 </BookPage>
 
                 <BookPage
-                  inlineInfographics={inlineInfographicsForPage(8)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(8)}
+                  inlineInfographics={inlineInfographicsForPage(6)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(6)}
                   onOpenInfographic={openInfographicImage}
-                  pageIndex={8}
-                  pageNumber={8}
+                  pageIndex={6}
+                  pageNumber={6}
                 >
                   <VoiceoverPage
                     lesson={lesson}
@@ -2010,21 +2027,21 @@ export function PrimerBook() {
                 </BookPage>
 
                 <BookPage
-                  inlineInfographics={inlineInfographicsForPage(9)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(9)}
+                  inlineInfographics={inlineInfographicsForPage(7)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(7)}
                   onOpenInfographic={openInfographicImage}
-                  pageIndex={9}
-                  pageNumber={9}
+                  pageIndex={7}
+                  pageNumber={7}
                 >
                   <FollowUpPage lesson={lesson} />
                 </BookPage>
 
                 <BookPage
-                  inlineInfographics={inlineInfographicsForPage(10)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(10)}
+                  inlineInfographics={inlineInfographicsForPage(8)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(8)}
                   onOpenInfographic={openInfographicImage}
-                  pageIndex={10}
-                  pageNumber={10}
+                  pageIndex={8}
+                  pageNumber={8}
                 >
                   <StagegatePage
                     answer={answer}
@@ -2038,10 +2055,10 @@ export function PrimerBook() {
 
                 <BookPage
                   density="hard"
-                  inlineInfographics={inlineInfographicsForPage(11)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(11)}
+                  inlineInfographics={inlineInfographicsForPage(9)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(9)}
                   onOpenInfographic={openInfographicImage}
-                  pageIndex={11}
+                  pageIndex={9}
                   tone="deep"
                 >
                   <UnlockPage
@@ -2049,23 +2066,44 @@ export function PrimerBook() {
                     hasPassed={hasPassedStagegate}
                     lesson={lesson}
                     lessonStatus={lessonStatus}
-                    onStartNextLesson={() => goToPage(staticBookPageCount)}
+                    onStartNextLesson={() => goToPage(nextTopicPageIndex)}
                   />
                 </BookPage>
+
+                {persistedBookPages.map(
+                  ({ entry, lessonOrdinal, pageIndex }) => (
+                    <BookPage
+                      key={entry.entryId}
+                      inlineInfographics={inlineInfographicsForPage(pageIndex)}
+                      onLayoutChange={() => scheduleBookLayoutRefresh(pageIndex)}
+                      onOpenInfographic={openInfographicImage}
+                      pageIndex={pageIndex}
+                      pageNumber={pageIndex}
+                    >
+                      <PersistedBookEntryPage
+                        entry={entry}
+                        fallbackTopic={firstTopicHint(learner)}
+                        lessonOrdinal={lessonOrdinal}
+                        onImageLoad={() => scheduleBookLayoutRefresh(pageIndex)}
+                        onOpenInfographic={openInfographicImage}
+                      />
+                    </BookPage>
+                  ),
+                )}
 
                 {hasNextTopicPage
                   ? [
                       <BookPage
                         key="next-topic"
                         inlineInfographics={inlineInfographicsForPage(
-                          staticBookPageCount,
+                          nextTopicPageIndex,
                         )}
                         onLayoutChange={() =>
-                          scheduleBookLayoutRefresh(staticBookPageCount)
+                          scheduleBookLayoutRefresh(nextTopicPageIndex)
                         }
                         onOpenInfographic={openInfographicImage}
-                        pageIndex={staticBookPageCount}
-                        pageNumber={staticBookPageCount}
+                        pageIndex={nextTopicPageIndex}
+                        pageNumber={nextTopicPageIndex}
                       >
                         <AskPage
                           hasAsked={hasAsked}
@@ -2163,6 +2201,15 @@ export function PrimerBook() {
           onClose={() => setIsMemoryOpen(false)}
           onRefresh={() => void loadMemoryGraph(selectedMemoryNodeId ?? undefined)}
           onWalkNode={walkMemoryNode}
+        />
+      ) : null}
+      {isReportOpen ? (
+        <ReportCardDialog
+          isRefreshing={isReportCardRefreshing}
+          onClose={() => setIsReportOpen(false)}
+          onRefresh={() => void loadReportCard()}
+          reportCard={reportCard}
+          status={reportCardStatus}
         />
       ) : null}
     </main>
@@ -2871,6 +2918,177 @@ function UnlockPage({
       </div>
     </div>
   );
+}
+
+function PersistedBookEntryPage({
+  entry,
+  fallbackTopic,
+  lessonOrdinal,
+  onImageLoad,
+  onOpenInfographic,
+}: {
+  entry: StudentBookContentEntry;
+  fallbackTopic: string;
+  lessonOrdinal: number;
+  onImageLoad: () => void;
+  onOpenInfographic: (image: EnlargedInfographic) => void;
+}) {
+  if (entry.kind === "lesson") {
+    return (
+      <LessonHistoryPage
+        entry={entry}
+        fallbackTopic={fallbackTopic}
+        lessonOrdinal={lessonOrdinal}
+      />
+    );
+  }
+
+  return (
+    <InfographicHistoryPage
+      artifact={artifactFromBookEntry(entry)}
+      entry={entry}
+      onImageLoad={onImageLoad}
+      onOpenInfographic={onOpenInfographic}
+    />
+  );
+}
+
+function LessonHistoryPage({
+  entry,
+  fallbackTopic,
+  lessonOrdinal,
+}: {
+  entry: StudentBookContentEntry;
+  fallbackTopic: string;
+  lessonOrdinal: number;
+}) {
+  const lesson = lessonFromBookEntry(entry, fallbackTopic);
+
+  return (
+    <div className="flex h-full flex-col overflow-hidden">
+      <Kicker icon={BookOpen}>Lesson {lessonOrdinal}</Kicker>
+      <h2 className="mt-3 text-3xl font-semibold leading-tight text-stone-950">
+        {lesson.topic}
+      </h2>
+      <p className="mt-2 text-xs uppercase text-stone-500">
+        Saved {savedEntryLabel(entry.createdAt)}
+      </p>
+      <div className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
+        <p className="text-base leading-7 text-stone-800">
+          {lesson.storyScene}
+        </p>
+        <div className="border-l-2 border-[#1e6f73] bg-white/55 px-4 py-3">
+          <p className="text-xs uppercase text-stone-500">Plain explanation</p>
+          <p className="mt-2 text-sm leading-6 text-stone-800">
+            {lesson.plainExplanation}
+          </p>
+        </div>
+        <div className="rounded-[8px] border border-stone-300 bg-white/55 px-4 py-3">
+          <p className="text-xs uppercase text-stone-500">Connection</p>
+          <p className="mt-2 text-sm leading-6 text-stone-700">
+            {lesson.analogy}
+          </p>
+        </div>
+        <div className="rounded-[8px] bg-[#173b3b] px-4 py-3 text-stone-50">
+          <p className="text-xs uppercase text-cyan-100/75">Stagegate prompt</p>
+          <p className="mt-2 text-sm leading-6">{lesson.stagegatePrompt}</p>
+        </div>
+        {lesson.keyTerms.length > 0 ? (
+          <div className="grid gap-2">
+            {lesson.keyTerms.slice(0, 4).map((term) => (
+              <div
+                key={term.term}
+                className="rounded-[8px] border border-stone-300 bg-white/60 px-3 py-2"
+              >
+                <p className="text-sm font-semibold text-stone-950">
+                  {term.term}
+                </p>
+                <p className="mt-1 text-xs leading-5 text-stone-600">
+                  {term.definition}
+                </p>
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function InfographicHistoryPage({
+  artifact,
+  entry,
+  onImageLoad,
+  onOpenInfographic,
+}: {
+  artifact: InfographicArtifact | null;
+  entry: StudentBookContentEntry;
+  onImageLoad: () => void;
+  onOpenInfographic: (image: EnlargedInfographic) => void;
+}) {
+  const imageSrc = artifactImageSrc(artifact);
+  const topic = entry.topic ?? "saved lesson";
+
+  return (
+    <div className="flex h-full flex-col overflow-hidden">
+      <Kicker icon={Sparkles}>Saved infographic</Kicker>
+      <h2 className="mt-3 text-3xl font-semibold leading-tight text-stone-950">
+        {topic}
+      </h2>
+      <p className="mt-2 text-xs uppercase text-stone-500">
+        Saved {savedEntryLabel(entry.createdAt)}
+      </p>
+      <p className="mt-4 text-sm leading-6 text-stone-600">
+        {artifact?.generated
+          ? `Generated with ${artifact.model ?? "gpt-image-2"}.`
+          : (artifact?.message ?? "The saved infographic used the fallback path.")}
+      </p>
+      {imageSrc ? (
+        <InfographicImageButton
+          alt={`Saved infographic for ${topic}`}
+          className="mt-4 block aspect-square w-full overflow-hidden rounded-[8px] border border-stone-300 bg-white"
+          imageClassName="h-full w-full object-cover"
+          onImageLoad={onImageLoad}
+          onOpen={onOpenInfographic}
+          src={imageSrc}
+          title={`${topic} infographic`}
+        />
+      ) : (
+        <div className="mt-4 flex aspect-square w-full items-center justify-center rounded-[8px] border border-stone-300 bg-white/55 text-[#1e6f73]">
+          <Sparkles className="h-10 w-10" />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function lessonFromBookEntry(
+  entry: StudentBookContentEntry,
+  fallbackTopic: string,
+) {
+  const payloadLesson = recordValue(entry.payload)?.lesson ?? entry.payload;
+  return normalizeLesson(payloadLesson, entry.topic ?? fallbackTopic);
+}
+
+function artifactFromBookEntry(
+  entry: StudentBookContentEntry,
+): InfographicArtifact | null {
+  const payloadArtifact = recordValue(entry.payload)?.artifact ?? entry.payload;
+  return recordValue(payloadArtifact) as InfographicArtifact | null;
+}
+
+function savedEntryLabel(value: string) {
+  if (!value) {
+    return "in this Primer";
+  }
+
+  return value.replace("T", " ").replace(/\.\d+Z$/, " UTC").replace(/Z$/, " UTC");
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function InlineSelectionInfographics({

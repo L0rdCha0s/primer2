@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     db,
-    domain::{StudentBookEntryRecord, StudentMemory},
+    domain::{StudentBookPageRecord, StudentMemory},
     entities::{concept_progress, student},
     memory,
     openai::OpenAiClient,
@@ -163,9 +163,14 @@ async fn build_deterministic_report_card(
         .order_by_asc(concept_progress::Column::Level)
         .all(db)
         .await?;
-    let book_entries = db::book_state_for_student(db, public_id)
+    let book_pages = db::book_state_for_student(db, public_id)
         .await?
-        .map(|book| book.entries)
+        .map(|book| {
+            book.lessons
+                .into_iter()
+                .flat_map(|lesson| lesson.pages)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let memories = memory::student_memories(db, student_row.id)
         .await
@@ -174,7 +179,7 @@ async fn build_deterministic_report_card(
     Ok(Some(deterministic_report_from_parts(
         &student_row,
         progress_rows,
-        book_entries,
+        book_pages,
         memories,
     )))
 }
@@ -182,11 +187,11 @@ async fn build_deterministic_report_card(
 fn deterministic_report_from_parts(
     student: &student::Model,
     progress_rows: Vec<concept_progress::Model>,
-    book_entries: Vec<StudentBookEntryRecord>,
+    book_pages: Vec<StudentBookPageRecord>,
     memories: Vec<StudentMemory>,
 ) -> StudentReportCard {
     let learned_topics = build_learned_topics(progress_rows);
-    let stagegate_summary = build_stagegate_summary(&book_entries);
+    let stagegate_summary = build_stagegate_summary(&book_pages);
     let year_level = curriculum_year_for_age(
         student.age_years.and_then(|age| u8::try_from(age).ok()),
         &student.age_band,
@@ -354,11 +359,11 @@ fn topic_status(statuses: &[String]) -> String {
     }
 }
 
-fn build_stagegate_summary(entries: &[StudentBookEntryRecord]) -> StagegateSummary {
-    let attempts = entries
+fn build_stagegate_summary(pages: &[StudentBookPageRecord]) -> StagegateSummary {
+    let attempts = pages
         .iter()
-        .filter(|entry| entry.kind == "stagegate")
-        .filter_map(stagegate_attempt_from_entry)
+        .filter(|page| page.kind == "stagegate")
+        .filter_map(stagegate_attempt_from_page)
         .collect::<Vec<_>>();
     let total_attempts = attempts.len();
     let passed_attempts = attempts.iter().filter(|attempt| attempt.passed).count();
@@ -377,9 +382,9 @@ fn build_stagegate_summary(entries: &[StudentBookEntryRecord]) -> StagegateSumma
     }
 }
 
-fn stagegate_attempt_from_entry(entry: &StudentBookEntryRecord) -> Option<StagegateAttempt> {
-    let result = entry.payload.get("result")?;
-    let request = entry.payload.get("request");
+fn stagegate_attempt_from_page(page: &StudentBookPageRecord) -> Option<StagegateAttempt> {
+    let result = page.payload.get("result")?;
+    let request = page.payload.get("request");
     let score = result
         .get("score")
         .and_then(Value::as_f64)
@@ -391,7 +396,7 @@ fn stagegate_attempt_from_entry(entry: &StudentBookEntryRecord) -> Option<Stageg
         .unwrap_or(score >= 0.75);
 
     Some(StagegateAttempt {
-        topic: entry
+        topic: page
             .topic
             .clone()
             .or_else(|| {
@@ -401,7 +406,7 @@ fn stagegate_attempt_from_entry(entry: &StudentBookEntryRecord) -> Option<Stageg
                     .map(ToString::to_string)
             })
             .unwrap_or_else(|| "untitled topic".to_string()),
-        stage_level: entry
+        stage_level: page
             .stage_level
             .clone()
             .or_else(|| {
@@ -754,9 +759,10 @@ mod tests {
     }
 
     #[test]
-    fn aggregates_stagegate_attempts_from_book_entries() {
-        let entries = vec![StudentBookEntryRecord {
-            entry_id: "entry-1".to_string(),
+    fn aggregates_stagegate_attempts_from_lesson_pages() {
+        let pages = vec![StudentBookPageRecord {
+            page_id: "page-1".to_string(),
+            lesson_id: "lesson-1".to_string(),
             kind: "stagegate".to_string(),
             topic: Some("reef currents".to_string()),
             stage_level: Some("intuition".to_string()),
@@ -778,7 +784,7 @@ mod tests {
             created_at: "2026-04-29T00:00:00Z".to_string(),
         }];
 
-        let summary = build_stagegate_summary(&entries);
+        let summary = build_stagegate_summary(&pages);
 
         assert_eq!(summary.total_attempts, 1);
         assert_eq!(summary.passed_attempts, 1);

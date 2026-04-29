@@ -10,11 +10,10 @@ import {
 describe("auth helpers", () => {
   test("builds bearer headers only when a token is present", () => {
     expect(authHeaders(null)).toEqual({});
-    expect(authHeaders({ token: "", type: "local-demo" })).toEqual({});
-    expect(authHeaders({ token: "local-demo:student-1", type: "local-demo" }))
-      .toEqual({
-        Authorization: "Bearer local-demo:student-1",
-      });
+    expect(authHeaders({ token: "", type: "signed" })).toEqual({});
+    expect(authHeaders({ token: "signed-session-token", type: "signed" })).toEqual({
+      Authorization: "Bearer signed-session-token",
+    });
   });
 
   test("splits signup interests into trimmed non-empty entries", () => {
