@@ -1,0 +1,83 @@
+#!/bin/bash
+set -euxo pipefail
+
+exec > >(tee /var/log/primer-postgres-bootstrap.log | logger -t primer-postgres-bootstrap -s 2>/dev/console) 2>&1
+
+dnf update -y
+dnf install -y awscli docker
+systemctl enable --now docker
+
+mkdir -p /opt/primer-postgres/init /var/lib/primer-postgres/data
+chmod 700 /var/lib/primer-postgres/data
+
+DB_PASSWORD="$(aws secretsmanager get-secret-value \
+  --region "${aws_region}" \
+  --secret-id "${db_password_secret_arn}" \
+  --query SecretString \
+  --output text)"
+
+cat >/opt/primer-postgres/Dockerfile <<'DOCKERFILE'
+FROM pgvector/pgvector:pg16
+
+ARG AGE_BRANCH=PG16
+ARG PG_MAJOR=16
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bison \
+        build-essential \
+        ca-certificates \
+        flex \
+        git \
+        postgresql-server-dev-$${PG_MAJOR} \
+    && git clone --depth 1 --branch "$${AGE_BRANCH}" https://github.com/apache/age.git /tmp/age \
+    && make -C /tmp/age PG_CONFIG=/usr/lib/postgresql/$${PG_MAJOR}/bin/pg_config install \
+    && mkdir -p /usr/lib/postgresql/$${PG_MAJOR}/lib/plugins \
+    && ln -sf /usr/lib/postgresql/$${PG_MAJOR}/lib/age.so /usr/lib/postgresql/$${PG_MAJOR}/lib/plugins/age.so \
+    && rm -rf /tmp/age /var/lib/apt/lists/*
+DOCKERFILE
+
+cat >/opt/primer-postgres/init/001-extensions.sql <<'SQL'
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS age;
+
+LOAD 'age';
+
+GRANT USAGE ON SCHEMA ag_catalog TO ${db_user};
+
+SET search_path = ag_catalog, "$user", public;
+
+SELECT ag_catalog.create_graph('primer_memory')
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM ag_catalog.ag_graph
+    WHERE name = 'primer_memory'
+);
+SQL
+
+docker build --build-arg AGE_BRANCH="${age_branch}" -t primer-postgres-age:pg16 /opt/primer-postgres
+
+if docker ps -a --format '{{.Names}}' | grep -qx primer-postgres; then
+  docker rm -f primer-postgres
+fi
+
+docker run -d \
+  --name primer-postgres \
+  --restart unless-stopped \
+  -e POSTGRES_DB="${db_name}" \
+  -e POSTGRES_USER="${db_user}" \
+  -e POSTGRES_PASSWORD="$DB_PASSWORD" \
+  -p "${postgres_port}:5432" \
+  -v /var/lib/primer-postgres/data:/var/lib/postgresql/data \
+  -v /opt/primer-postgres/init:/docker-entrypoint-initdb.d:ro \
+  primer-postgres-age:pg16
+
+for attempt in $(seq 1 60); do
+  if docker exec primer-postgres pg_isready -U "${db_user}" -d "${db_name}"; then
+    exit 0
+  fi
+  sleep 5
+done
+
+docker logs primer-postgres
+exit 1

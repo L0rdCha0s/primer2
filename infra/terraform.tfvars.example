@@ -1,0 +1,16 @@
+aws_region  = "ap-southeast-2"
+environment = "dev"
+
+# Use an ACM certificate ARN to enable HTTPS.
+# certificate_arn      = "arn:aws:acm:ap-southeast-2:123456789012:certificate/..."
+# public_app_base_url  = "https://primer.example.com"
+# frontend_api_base_url = "https://primer.example.com"
+
+# Store OPENAI_API_KEY in Secrets Manager and put its ARN here.
+# Leave unset to keep the backend's no-key demo fallback path.
+# openai_api_key_secret_arn = "arn:aws:secretsmanager:ap-southeast-2:123456789012:secret:/primerlab/dev/openai/api-key-AbCdEf"
+
+primer_activation_code = "X4G6S2HjK"
+
+# Keep the database private. Add a VPN or bastion CIDR only if you really need direct psql access.
+# postgres_admin_cidr_blocks = ["10.0.0.0/8"]

@@ -20,6 +20,16 @@ out
 # production
 build
 target
+backend/local-artifacts/
+
+# terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
 
 # misc
 .DS_Store

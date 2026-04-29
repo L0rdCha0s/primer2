@@ -1,6 +1,6 @@
-# PrimerLab Build Instructions
+# Primer Build Instructions
 
-We are building PrimerLab, a hackathon MVP for an adaptive story-driven tutor inspired by The Primer.
+We are building Primer, a hackathon MVP for an adaptive story-driven tutor inspired by The Primer in The Diamond Age. The 'hero piece' is the skeumorphic book with turnable pages, and we need to make sure that rendering looks great with correct layout
 
 ## Repo Layout
 
@@ -13,7 +13,7 @@ We are building PrimerLab, a hackathon MVP for an adaptive story-driven tutor in
 - The primary student surface is a real-book style `react-pageflip` view.
 - Render lesson text, memory state, stagegates, and infographics inside book pages.
 - Infographic generation is a backend tool call using OpenAI image generation (`gpt-image-2`) with graceful fallback if no key is present.
-- Keep demo seed data in `frontend/src/lib/demo-data.ts`.
+- Do not add frontend demo seed data for learner state; generate the opening lesson from the authenticated student profile through the backend.
 - This repo uses a current Next.js version. Before changing framework behavior, read the relevant local docs in `frontend/node_modules/next/dist/docs/`.
 
 ## Backend
@@ -33,15 +33,18 @@ We are building PrimerLab, a hackathon MVP for an adaptive story-driven tutor in
 
 ## Done When
 
+- `npm --prefix frontend run test` passes.
 - `npm --prefix frontend run lint` passes.
 - `npm --prefix frontend run build` passes.
+- `cargo test --manifest-path backend/Cargo.toml` passes.
 - `cargo check --manifest-path backend/Cargo.toml` passes.
 - `cargo check --manifest-path backend/migration/Cargo.toml` passes.
-- Main demo path works: load Mina, page through the book, view the lightning infographic, submit the stagegate, and see Level 2 unlock.
+- Main demo path works: sign up a student with a biography, load the generated opening book, view or fall back from the infographic tool, submit the stagegate, and see Level 2 unlock.
 
 ## Not Negotiable
 - Ensure that all modules in the frontend and backend are kept small and tight, and focused. Modularise wherre things grow beyond control
 - Ensure the API logs detailed information about all requests to the CLI stdout so we can see what's happening, and so you can debug in test mode
+- For every code task, run the relevant backend and frontend test suites before calling the task done. Default to `npm --prefix frontend run test` and `cargo test --manifest-path backend/Cargo.toml`, plus the Done When checks for touched areas; explicitly report any command that could not be run.
 
 ## System
 - We have a psql client at /Applications/Postgres.app/Contents/Versions/latest/bin/psql that you can use to connect to our docker postgresql instance.

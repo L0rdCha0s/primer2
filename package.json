@@ -11,6 +11,9 @@
     "dev:test:backend": "./run-test.sh",
     "build:frontend": "npm --prefix frontend run build",
     "lint:frontend": "npm --prefix frontend run lint",
+    "test": "npm run test:frontend && npm run test:backend",
+    "test:frontend": "npm --prefix frontend run test",
+    "test:backend": "cargo test --manifest-path backend/Cargo.toml",
     "check:backend": "cargo check --manifest-path backend/Cargo.toml",
     "check:migration": "cargo check --manifest-path backend/migration/Cargo.toml"
   }
