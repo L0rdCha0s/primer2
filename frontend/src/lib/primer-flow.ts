@@ -128,17 +128,24 @@ export function visibleBookContentPages(
   return lessons
     .flatMap((lesson) =>
       lesson.pages.map((page) => ({
-        ...page,
+        page,
         lessonPosition: lesson.position,
       })),
     )
-    .filter(isBookContentPage)
+    .filter(
+      (
+        item,
+      ): item is {
+        page: StudentBookContentPage;
+        lessonPosition: number;
+      } => isBookContentPage(item.page),
+    )
     .sort(
       (left, right) =>
         left.lessonPosition - right.lessonPosition ||
-        left.position - right.position,
+        left.page.position - right.page.position,
     )
-    .map(({ lessonPosition: _lessonPosition, ...page }) => page);
+    .map(({ page }) => page);
 }
 
 export function defaultBookPageIndex(
@@ -535,6 +542,10 @@ export function normalizeBookState(value: unknown): StudentBookState | null {
 
 function normalizeBookLesson(value: unknown): StudentBookLesson | null {
   const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
   const lessonId = stringField(record, "lessonId");
   const topic = stringField(record, "topic");
   const position = numberField(record, "position");

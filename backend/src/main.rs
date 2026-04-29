@@ -30,6 +30,10 @@ async fn main() -> Result<(), std::io::Error> {
     db::init_database(&db)
         .await
         .expect("failed to initialize Primer database schema and extensions");
+    let demo_seed = db::seed_demo_student_from_env(&db)
+        .await
+        .expect("failed to seed Primer demo student");
+    println!("[primerlab-api] {}", demo_seed.log_message());
 
     let state = AppState {
         db: Arc::new(db),

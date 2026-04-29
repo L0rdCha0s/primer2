@@ -63,12 +63,12 @@ import {
   type PrimerLesson,
   type Stage,
   type StagegateResult,
-  type StudentBookContentEntry,
-  type StudentBookEntry,
+  type StudentBookContentPage,
+  type StudentBookLesson,
   type StudentBookState,
   type StudentMemory,
   type StudentMemoryGraph,
-  bookContentEntryCount,
+  bookContentPageCount,
   bookEndPageIndex,
   buildLessonStartBody,
   defaultBookPageIndex,
@@ -83,7 +83,7 @@ import {
   normalizeStagegateResult,
   stagesForStagegate,
   staticBookPageCount,
-  visibleBookContentEntries,
+  visibleBookContentPages,
 } from "@/lib/primer-flow";
 import {
   type StudentReportCard,
@@ -411,22 +411,24 @@ async function fetchStudentMemoryGraph(
 }
 
 function restoredBookTargetPage(book: StudentBookState): number {
-  const contentEntryCount = bookContentEntryCount(book.entries);
+  const contentPageCount = bookContentPageCount(
+    visibleBookContentPages(book.lessons),
+  );
   if (book.latestStagegate) {
     return book.hasPassedStagegate
-      ? staticBookPageCount + contentEntryCount
+      ? staticBookPageCount + contentPageCount
       : staticBookPageCount - 1;
   }
 
-  if (contentEntryCount > 0) {
-    return bookEndPageIndex(contentEntryCount);
+  if (contentPageCount > 0) {
+    return bookEndPageIndex(contentPageCount);
   }
 
-  if (book.activeLesson) {
+  if (book.currentLesson) {
     return chooseTopicPageIndex;
   }
 
-  return defaultBookPageIndex(book.entries);
+  return defaultBookPageIndex(visibleBookContentPages(book.lessons));
 }
 
 export function PrimerBook() {
@@ -445,7 +447,7 @@ export function PrimerBook() {
   const [currentPage, setCurrentPage] = useState(0);
   const [topic, setTopic] = useState("");
   const [lesson, setLesson] = useState<PrimerLesson>(initialLesson);
-  const [bookEntries, setBookEntries] = useState<StudentBookEntry[]>([]);
+  const [bookLessons, setBookLessons] = useState<StudentBookLesson[]>([]);
   const [remoteMemories, setRemoteMemories] = useState<StudentMemory[] | null>(
     null,
   );
@@ -535,10 +537,10 @@ export function PrimerBook() {
       if (options?.turnToEnd) {
         pendingBookEndPageRef.current = restoredBookTargetPage(book);
       }
-      setBookEntries(book.entries);
-      if (book.activeLesson) {
+      setBookLessons(book.lessons);
+      if (book.currentLesson) {
         const savedLesson = normalizeLesson(
-          book.activeLesson,
+          book.currentLesson,
           firstTopicHint(learner),
         );
         setLesson(savedLesson);
@@ -570,7 +572,7 @@ export function PrimerBook() {
       }
       setAnswer(book.latestAnswer ?? "");
 
-      return Boolean(book.activeLesson);
+      return Boolean(book.currentLesson);
     },
     [],
   );
@@ -626,7 +628,7 @@ export function PrimerBook() {
     setIsLessonGenerating(false);
     setIsInfographicGenerating(false);
     setInfographicArtifact(null);
-    setBookEntries([]);
+    setBookLessons([]);
     setSelectionInfographics([]);
     setSelectedTextAction(null);
     setStagegateResult(emptyStagegateResult);
@@ -902,22 +904,22 @@ export function PrimerBook() {
   }, [hasPassedStagegate]);
 
   const hasNextTopicPage = hasPassedStagegate;
-  const visibleBookEntries = useMemo(
-    () => visibleBookContentEntries(bookEntries),
-    [bookEntries],
+  const visibleBookPages = useMemo(
+    () => visibleBookContentPages(bookLessons),
+    [bookLessons],
   );
   const persistedBookPages = useMemo(() => {
-    return visibleBookEntries.reduce<{
+    return visibleBookPages.reduce<{
       lessonCount: number;
       pages: Array<{
-        entry: StudentBookContentEntry;
+        page: StudentBookContentPage;
         lessonOrdinal: number;
         pageIndex: number;
       }>;
     }>(
-      (current, entry, index) => {
+      (current, page, index) => {
         const lessonCount =
-          entry.kind === "lesson"
+          page.kind === "lesson"
             ? current.lessonCount + 1
             : current.lessonCount;
 
@@ -926,7 +928,7 @@ export function PrimerBook() {
           pages: [
             ...current.pages,
             {
-              entry,
+              page,
               lessonOrdinal: lessonCount,
               pageIndex: staticBookPageCount + index,
             },
@@ -935,7 +937,7 @@ export function PrimerBook() {
       },
       { lessonCount: 0, pages: [] },
     ).pages;
-  }, [visibleBookEntries]);
+  }, [visibleBookPages]);
   const nextTopicPageIndex = staticBookPageCount + persistedBookPages.length;
   const selectionInfographicsByPage = useMemo(() => {
     const byPage = new Map<number, SelectionInfographic[]>();
@@ -1671,7 +1673,7 @@ export function PrimerBook() {
       setCurrentPage(0);
       setTopic(resetStudent.interests[0] ?? "");
       setLesson(initialLesson);
-      setBookEntries([]);
+      setBookLessons([]);
       setReportCard(null);
       setReportCardStatus("Report card not loaded.");
       setIsReportOpen(false);
@@ -1793,7 +1795,7 @@ export function PrimerBook() {
     setCurrentPage(0);
     setTopic("");
     setLesson(initialLesson);
-    setBookEntries([]);
+    setBookLessons([]);
     setHasAsked(false);
     setHasGeneratedInfographic(false);
     setHasPassedStagegate(false);
@@ -2071,17 +2073,17 @@ export function PrimerBook() {
                 </BookPage>
 
                 {persistedBookPages.map(
-                  ({ entry, lessonOrdinal, pageIndex }) => (
+                  ({ page, lessonOrdinal, pageIndex }) => (
                     <BookPage
-                      key={entry.entryId}
+                      key={page.pageId}
                       inlineInfographics={inlineInfographicsForPage(pageIndex)}
                       onLayoutChange={() => scheduleBookLayoutRefresh(pageIndex)}
                       onOpenInfographic={openInfographicImage}
                       pageIndex={pageIndex}
                       pageNumber={pageIndex}
                     >
-                      <PersistedBookEntryPage
-                        entry={entry}
+                      <PersistedBookPage
+                        page={page}
                         fallbackTopic={firstTopicHint(learner)}
                         lessonOrdinal={lessonOrdinal}
                         onImageLoad={() => scheduleBookLayoutRefresh(pageIndex)}
@@ -2920,23 +2922,23 @@ function UnlockPage({
   );
 }
 
-function PersistedBookEntryPage({
-  entry,
+function PersistedBookPage({
+  page,
   fallbackTopic,
   lessonOrdinal,
   onImageLoad,
   onOpenInfographic,
 }: {
-  entry: StudentBookContentEntry;
+  page: StudentBookContentPage;
   fallbackTopic: string;
   lessonOrdinal: number;
   onImageLoad: () => void;
   onOpenInfographic: (image: EnlargedInfographic) => void;
 }) {
-  if (entry.kind === "lesson") {
+  if (page.kind === "lesson") {
     return (
       <LessonHistoryPage
-        entry={entry}
+        page={page}
         fallbackTopic={fallbackTopic}
         lessonOrdinal={lessonOrdinal}
       />
@@ -2945,8 +2947,8 @@ function PersistedBookEntryPage({
 
   return (
     <InfographicHistoryPage
-      artifact={artifactFromBookEntry(entry)}
-      entry={entry}
+      artifact={artifactFromBookPage(page)}
+      page={page}
       onImageLoad={onImageLoad}
       onOpenInfographic={onOpenInfographic}
     />
@@ -2954,15 +2956,15 @@ function PersistedBookEntryPage({
 }
 
 function LessonHistoryPage({
-  entry,
+  page,
   fallbackTopic,
   lessonOrdinal,
 }: {
-  entry: StudentBookContentEntry;
+  page: StudentBookContentPage;
   fallbackTopic: string;
   lessonOrdinal: number;
 }) {
-  const lesson = lessonFromBookEntry(entry, fallbackTopic);
+  const lesson = lessonFromBookPage(page, fallbackTopic);
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -2971,7 +2973,7 @@ function LessonHistoryPage({
         {lesson.topic}
       </h2>
       <p className="mt-2 text-xs uppercase text-stone-500">
-        Saved {savedEntryLabel(entry.createdAt)}
+        Saved {savedEntryLabel(page.createdAt)}
       </p>
       <div className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
         <p className="text-base leading-7 text-stone-800">
@@ -3017,17 +3019,17 @@ function LessonHistoryPage({
 
 function InfographicHistoryPage({
   artifact,
-  entry,
+  page,
   onImageLoad,
   onOpenInfographic,
 }: {
   artifact: InfographicArtifact | null;
-  entry: StudentBookContentEntry;
+  page: StudentBookContentPage;
   onImageLoad: () => void;
   onOpenInfographic: (image: EnlargedInfographic) => void;
 }) {
   const imageSrc = artifactImageSrc(artifact);
-  const topic = entry.topic ?? "saved lesson";
+  const topic = page.topic ?? "saved lesson";
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -3036,7 +3038,7 @@ function InfographicHistoryPage({
         {topic}
       </h2>
       <p className="mt-2 text-xs uppercase text-stone-500">
-        Saved {savedEntryLabel(entry.createdAt)}
+        Saved {savedEntryLabel(page.createdAt)}
       </p>
       <p className="mt-4 text-sm leading-6 text-stone-600">
         {artifact?.generated
@@ -3062,18 +3064,18 @@ function InfographicHistoryPage({
   );
 }
 
-function lessonFromBookEntry(
-  entry: StudentBookContentEntry,
+function lessonFromBookPage(
+  page: StudentBookContentPage,
   fallbackTopic: string,
 ) {
-  const payloadLesson = recordValue(entry.payload)?.lesson ?? entry.payload;
-  return normalizeLesson(payloadLesson, entry.topic ?? fallbackTopic);
+  const payloadLesson = recordValue(page.payload)?.lesson ?? page.payload;
+  return normalizeLesson(payloadLesson, page.topic ?? fallbackTopic);
 }
 
-function artifactFromBookEntry(
-  entry: StudentBookContentEntry,
+function artifactFromBookPage(
+  page: StudentBookContentPage,
 ): InfographicArtifact | null {
-  const payloadArtifact = recordValue(entry.payload)?.artifact ?? entry.payload;
+  const payloadArtifact = recordValue(page.payload)?.artifact ?? page.payload;
   return recordValue(payloadArtifact) as InfographicArtifact | null;
 }
 
@@ -3384,7 +3386,7 @@ function ResetStudentDialog({
               Start {learner.displayName}&apos;s Primer over?
             </h2>
             <p className="mt-3 text-sm leading-6 text-stone-300">
-              This deletes this student&apos;s books, book entries, progress,
+              This deletes this student&apos;s books, lesson pages, progress,
               story continuity, and memories. The signup profile and login stay
               in place so a fresh opening lesson can be generated immediately.
             </p>

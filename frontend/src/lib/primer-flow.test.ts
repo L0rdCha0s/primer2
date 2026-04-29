@@ -3,12 +3,12 @@ import { describe, expect, test } from "vitest";
 import {
   buildLessonStartBody,
   bookEndPageIndex,
-  bookContentEntryCount,
+  bookContentPageCount,
   defaultBookPageIndex,
   emptyStagegateResult,
   firstTopicHint,
   initialLesson,
-  isBookContentEntry,
+  isBookContentPage,
   mergeMemoryGraph,
   normalizeBookState,
   normalizeLesson,
@@ -17,7 +17,7 @@ import {
   normalizeStagegateResult,
   stagesForStagegate,
   staticBookPageCount,
-  visibleBookContentEntries,
+  visibleBookContentPages,
   type StudentMemoryGraph,
 } from "./primer-flow";
 
@@ -259,7 +259,7 @@ describe("memory contract normalization", () => {
 });
 
 describe("persisted book contract normalization", () => {
-  test("calculates the end page after persisted book entries", () => {
+  test("calculates the end page after persisted lesson pages", () => {
     expect(staticBookPageCount).toBe(10);
     expect(bookEndPageIndex(0)).toBe(9);
     expect(bookEndPageIndex(1)).toBe(10);
@@ -267,72 +267,94 @@ describe("persisted book contract normalization", () => {
   });
 
   test("keeps stagegate attempts out of appended content pages", () => {
-    const entries = [
+    const pages = [
       { kind: "lesson" },
       { kind: "stagegate" },
       { kind: "stagegate" },
     ];
 
-    expect(entries.filter(isBookContentEntry)).toEqual([{ kind: "lesson" }]);
-    expect(bookContentEntryCount(entries)).toBe(1);
-    expect(defaultBookPageIndex(entries)).toBe(9);
+    expect(pages.filter(isBookContentPage)).toEqual([{ kind: "lesson" }]);
+    expect(bookContentPageCount(pages)).toBe(1);
+    expect(defaultBookPageIndex(pages)).toBe(9);
     expect(defaultBookPageIndex([{ kind: "lesson" }, { kind: "infographic" }]))
       .toBe(11);
   });
 
-  test("keeps all persisted lesson and infographic entries visible in order", () => {
+  test("keeps all persisted lesson and infographic pages visible in order", () => {
     const book = normalizeBookState({
       studentId: "student-123",
       bookId: "book-1",
-      entries: [
+      lessons: [
         {
-          entryId: "stagegate-1",
-          kind: "stagegate",
-          position: 3,
-          payload: {},
-        },
-        {
-          entryId: "lesson-2",
-          kind: "lesson",
+          lessonId: "lesson-2",
           topic: "basketball arcs",
           position: 2,
-          payload: { lesson: { topic: "basketball arcs" } },
+          lesson: { topic: "basketball arcs" },
+          pages: [
+            {
+              pageId: "lesson-page-2",
+              lessonId: "lesson-2",
+              kind: "lesson",
+              topic: "basketball arcs",
+              position: 1,
+              payload: { lesson: { topic: "basketball arcs" } },
+            },
+          ],
         },
         {
-          entryId: "lesson-1",
-          kind: "lesson",
+          lessonId: "lesson-1",
           topic: "reef currents",
           position: 1,
-          payload: { lesson: { topic: "reef currents" } },
-        },
-        {
-          entryId: "diagram-1",
-          kind: "infographic",
-          topic: "reef currents",
-          position: 4,
-          payload: { artifact: { generated: false } },
+          lesson: { topic: "reef currents" },
+          pages: [
+            {
+              pageId: "stagegate-1",
+              lessonId: "lesson-1",
+              kind: "stagegate",
+              position: 3,
+              payload: {},
+            },
+            {
+              pageId: "lesson-page-1",
+              lessonId: "lesson-1",
+              kind: "lesson",
+              topic: "reef currents",
+              position: 1,
+              payload: { lesson: { topic: "reef currents" } },
+            },
+            {
+              pageId: "diagram-1",
+              lessonId: "lesson-1",
+              kind: "infographic",
+              topic: "reef currents",
+              position: 2,
+              payload: { artifact: { generated: false } },
+            },
+          ],
         },
       ],
     });
 
-    expect(visibleBookContentEntries(book?.entries ?? []).map((entry) => ({
-      entryId: entry.entryId,
-      kind: entry.kind,
-      topic: entry.topic,
+    const visiblePages = visibleBookContentPages(book?.lessons ?? []);
+    expect(visiblePages.map((page) => ({
+      pageId: page.pageId,
+      kind: page.kind,
+      topic: page.topic,
     }))).toEqual([
-      { entryId: "lesson-1", kind: "lesson", topic: "reef currents" },
-      { entryId: "lesson-2", kind: "lesson", topic: "basketball arcs" },
-      { entryId: "diagram-1", kind: "infographic", topic: "reef currents" },
+      { pageId: "lesson-page-1", kind: "lesson", topic: "reef currents" },
+      { pageId: "diagram-1", kind: "infographic", topic: "reef currents" },
+      { pageId: "lesson-page-2", kind: "lesson", topic: "basketball arcs" },
     ]);
-    expect(bookContentEntryCount(book?.entries ?? [])).toBe(3);
-    expect(defaultBookPageIndex(book?.entries ?? [])).toBe(12);
+    expect(bookContentPageCount(visiblePages)).toBe(3);
+    expect(defaultBookPageIndex(visiblePages)).toBe(12);
   });
 
-  test("normalizes persisted book entries and latest interaction state", () => {
+  test("normalizes persisted book lessons, pages, and latest interaction state", () => {
     const book = normalizeBookState({
       studentId: "student-123",
       bookId: "book-1",
-      activeLesson: {
+      currentLessonId: "lesson-1",
+      currentLesson: {
         topic: "reef currents",
         stageLevel: "intuition",
       },
@@ -346,21 +368,34 @@ describe("persisted book contract normalization", () => {
       },
       latestAnswer: "Forces push water.",
       hasPassedStagegate: true,
-      entries: [
+      lessons: [
         {
-          entryId: "entry-1",
-          kind: "lesson",
+          lessonId: "lesson-1",
           topic: "reef currents",
           stageLevel: "intuition",
           position: 1,
-          payload: { lesson: { topic: "reef currents" } },
+          lesson: { topic: "reef currents" },
           createdAt: "2026-04-29T00:00:00Z",
-        },
-        {
-          entryId: "entry-bad",
-          kind: "lesson",
-          position: "2",
-          payload: {},
+          updatedAt: "2026-04-29T00:00:00Z",
+          pages: [
+            {
+              pageId: "page-1",
+              lessonId: "lesson-1",
+              kind: "lesson",
+              topic: "reef currents",
+              stageLevel: "intuition",
+              position: 1,
+              payload: { lesson: { topic: "reef currents" } },
+              createdAt: "2026-04-29T00:00:00Z",
+            },
+            {
+              pageId: "page-bad",
+              lessonId: "lesson-1",
+              kind: "lesson",
+              position: "2",
+              payload: {},
+            },
+          ],
         },
       ],
     });
@@ -370,13 +405,22 @@ describe("persisted book contract normalization", () => {
       bookId: "book-1",
       hasPassedStagegate: true,
       latestAnswer: "Forces push water.",
-      entries: [
+      currentLessonId: "lesson-1",
+      lessons: [
         {
-          entryId: "entry-1",
-          kind: "lesson",
+          lessonId: "lesson-1",
           topic: "reef currents",
           stageLevel: "intuition",
           position: 1,
+          pages: [
+            {
+              pageId: "page-1",
+              kind: "lesson",
+              topic: "reef currents",
+              stageLevel: "intuition",
+              position: 1,
+            },
+          ],
         },
       ],
     });

@@ -425,7 +425,7 @@ fn stagegate_attempt_from_page(page: &StudentBookPageRecord) -> Option<Stagegate
             .to_string(),
         mastery_evidence: string_array(result.get("masteryEvidence").unwrap_or(&Value::Null)),
         gaps: string_array(result.get("gaps").unwrap_or(&Value::Null)),
-        submitted_at: entry.created_at.clone(),
+        submitted_at: page.created_at.clone(),
     })
 }
 

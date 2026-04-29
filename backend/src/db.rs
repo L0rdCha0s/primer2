@@ -6,8 +6,8 @@ use crate::{
     },
     entities::{
         concept_progress, infographic_voiceover, lesson_page, local_user, narrative_character,
-        narrative_character_biography, student, student_book, student_book_lesson,
-        student_memory, student_xp_event,
+        narrative_character_biography, student, student_book, student_book_lesson, student_memory,
+        student_xp_event,
     },
     memory,
 };
@@ -18,7 +18,8 @@ use argon2::{
 use chrono::{DateTime, FixedOffset, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend, DbErr,
-    EntityTrait, QueryFilter, QueryOrder, Set, Statement, TransactionTrait, Value as SeaOrmValue,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
+    Value as SeaOrmValue,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -26,6 +27,34 @@ use uuid::Uuid;
 const LESSON_STARTED_XP: i32 = 10;
 const STAGEGATE_SUBMITTED_XP: i32 = 10;
 const STAGEGATE_PASSED_XP: i32 = 40;
+const DEMO_SEED_ENV: &str = "PRIMER_DEMO_SEED_ON_EMPTY_DATABASE";
+const DEMO_USERNAME: &str = "jack";
+const DEMO_PASSWORD: &str = "12345678";
+const DEMO_STUDENT_PUBLIC_ID: &str = "student-jack";
+const DEMO_BIOGRAPHY: &str =
+    "Jack is 13 and interested in basketball, maths, and entrepreneurship.";
+const DEMO_AGE: u8 = 13;
+const DEMO_AGE_BAND: &str = "11-13";
+const DEMO_INTERESTS: [&str; 3] = ["basketball", "maths", "entrepreneurship"];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DemoSeedOutcome {
+    Disabled,
+    Seeded,
+    SkippedExistingUsers,
+}
+
+impl DemoSeedOutcome {
+    pub fn log_message(self) -> &'static str {
+        match self {
+            Self::Disabled => "startup demo seed disabled",
+            Self::Seeded => "seeded demo student jack",
+            Self::SkippedExistingUsers => {
+                "startup demo seed skipped because local users already exist"
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct InfographicVoiceoverRecord {
@@ -230,6 +259,16 @@ pub async fn init_database(db: &DatabaseConnection) -> Result<(), DbErr> {
     Ok(())
 }
 
+pub async fn seed_demo_student_from_env(
+    db: &DatabaseConnection,
+) -> Result<DemoSeedOutcome, String> {
+    if !demo_seed_enabled_value(std::env::var(DEMO_SEED_ENV).ok().as_deref()) {
+        return Ok(DemoSeedOutcome::Disabled);
+    }
+
+    seed_demo_student_on_empty_database(db).await
+}
+
 pub async fn find_student(
     db: &DatabaseConnection,
     public_id: &str,
@@ -362,6 +401,100 @@ pub async fn register_local_user(
     student_record(db, &student)
         .await
         .map_err(|error| error.to_string())
+}
+
+async fn seed_demo_student_on_empty_database(
+    db: &DatabaseConnection,
+) -> Result<DemoSeedOutcome, String> {
+    let user_count = local_user::Entity::find()
+        .count(db)
+        .await
+        .map_err(|error| error.to_string())?;
+    if user_count > 0 {
+        return Ok(DemoSeedOutcome::SkippedExistingUsers);
+    }
+
+    let interests = DEMO_INTERESTS
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let student = get_or_create_student(
+        db,
+        DEMO_STUDENT_PUBLIC_ID,
+        "Jack",
+        Some(DEMO_AGE),
+        DEMO_AGE_BAND,
+        Some(DEMO_BIOGRAPHY.to_string()),
+        interests.clone(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
+    if local_user::Entity::find()
+        .filter(local_user::Column::Username.eq(DEMO_USERNAME))
+        .one(db)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        local_user::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            username: Set(DEMO_USERNAME.to_string()),
+            password_hash: Set(hash_password(DEMO_PASSWORD)?),
+            student_id: Set(student.id),
+            created_at: Set(now()),
+        }
+        .insert(db)
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    for interest in &interests {
+        seed_memory(
+            db,
+            &student,
+            "interest",
+            &format!("Learner is interested in {interest}."),
+            0.95,
+            json!(["interest", interest]),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    seed_memory(
+        db,
+        &student,
+        "preference",
+        &format!("Signup biography: {DEMO_BIOGRAPHY}"),
+        0.96,
+        json!(["profile", "biography", "signup"]),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
+    seed_memory(
+        db,
+        &student,
+        "preference",
+        &format!(
+            "Use examples and story choices connected to {} when they fit the lesson.",
+            format_interest_list(&interests)
+        ),
+        0.9,
+        json!(["personalization", "interests"]),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
+    Ok(DemoSeedOutcome::Seeded)
+}
+
+fn demo_seed_enabled_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 pub async fn login_local_user(
@@ -1289,10 +1422,7 @@ async fn next_lesson_position(db: &DatabaseConnection, book_id: Uuid) -> Result<
     Ok(latest.map(|lesson| lesson.position + 1).unwrap_or(1))
 }
 
-async fn next_lesson_page_position(
-    db: &DatabaseConnection,
-    lesson_id: Uuid,
-) -> Result<i32, DbErr> {
+async fn next_lesson_page_position(db: &DatabaseConnection, lesson_id: Uuid) -> Result<i32, DbErr> {
     let latest = lesson_page::Entity::find()
         .filter(lesson_page::Column::LessonId.eq(lesson_id))
         .order_by_desc(lesson_page::Column::Position)
@@ -1448,12 +1578,8 @@ fn book_state_from_lessons(
                 .cloned()
         })
         .or_else(|| lessons.last().cloned());
-    let current_lesson_id = current_lesson
-        .as_ref()
-        .map(|lesson| lesson.id.to_string());
-    let current_lesson_payload = current_lesson
-        .as_ref()
-        .map(|lesson| lesson.lesson.clone());
+    let current_lesson_id = current_lesson.as_ref().map(|lesson| lesson.id.to_string());
+    let current_lesson_payload = current_lesson.as_ref().map(|lesson| lesson.lesson.clone());
     let latest_infographic = current_lesson
         .as_ref()
         .and_then(|lesson| lesson.latest_infographic.clone());
@@ -1463,19 +1589,16 @@ fn book_state_from_lessons(
     let latest_answer = current_lesson
         .as_ref()
         .and_then(|lesson| lesson.latest_answer.clone());
-    let mut pages_by_lesson = pages
-        .into_iter()
-        .map(lesson_page_record)
-        .fold(
-            std::collections::BTreeMap::<String, Vec<StudentBookPageRecord>>::new(),
-            |mut grouped, page| {
-                grouped
-                    .entry(page.lesson_id.clone())
-                    .or_default()
-                    .push(page);
-                grouped
-            },
-        );
+    let mut pages_by_lesson = pages.into_iter().map(lesson_page_record).fold(
+        std::collections::BTreeMap::<String, Vec<StudentBookPageRecord>>::new(),
+        |mut grouped, page| {
+            grouped
+                .entry(page.lesson_id.clone())
+                .or_default()
+                .push(page);
+            grouped
+        },
+    );
     let lessons = lessons
         .into_iter()
         .map(|lesson| {
@@ -2111,6 +2234,17 @@ mod tests {
     }
 
     #[test]
+    fn demo_seed_env_accepts_only_explicit_truthy_values() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(demo_seed_enabled_value(Some(value)));
+        }
+
+        for value in [None, Some(""), Some("0"), Some("false"), Some("disabled")] {
+            assert!(!demo_seed_enabled_value(value));
+        }
+    }
+
+    #[test]
     fn character_helpers_normalize_topics_and_arrays_for_memory_updates() {
         assert_eq!(
             topic_terms(Some("Marine-biology, marine biology, AI!")),
@@ -2251,11 +2385,14 @@ mod tests {
         let state = book_state_from_lessons(&student, &book, lessons, pages);
 
         assert_eq!(state.student_id, "student-123");
-        assert_eq!(state.current_lesson_id.as_deref(), Some(&lesson_id.to_string()));
+        let lesson_id_string = lesson_id.to_string();
+        assert_eq!(
+            state.current_lesson_id.as_deref(),
+            Some(lesson_id_string.as_str())
+        );
         assert_eq!(state.lessons.len(), 1);
         assert_eq!(
-            state
-                .lessons[0]
+            state.lessons[0]
                 .pages
                 .iter()
                 .map(|page| page.kind.as_str())
