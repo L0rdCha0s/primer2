@@ -80,7 +80,7 @@ export type StudentBookState = {
   hasPassedStagegate: boolean;
 };
 
-export const staticBookPageCount = 10;
+export const staticBookPageCount = 12;
 
 export function bookEndPageIndex(entryCount: number): number {
   const safeEntryCount = Number.isFinite(entryCount)

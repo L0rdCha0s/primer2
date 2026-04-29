@@ -12,7 +12,6 @@ import {
   useNodesState,
 } from "@xyflow/react";
 import {
-  Atom,
   Bolt,
   BookOpen,
   Brain,
@@ -23,7 +22,6 @@ import {
   Compass,
   Cog,
   Feather,
-  Leaf,
   Lock,
   LogOut,
   Map as MapIcon,
@@ -31,7 +29,6 @@ import {
   Mic,
   Play,
   RotateCcw,
-  Search,
   Sparkles,
   Square,
   TriangleAlert,
@@ -41,6 +38,11 @@ import {
   X,
 } from "lucide-react";
 import { AuthGate } from "@/components/AuthGate";
+import { LessonGenerationOverlay } from "@/components/LessonGenerationOverlay";
+import {
+  ReportCardParentPage,
+  ReportCardStudentPage,
+} from "@/components/ReportCardPages";
 import HTMLFlipBook from "react-pageflip";
 import {
   type AuthPayload,
@@ -64,7 +66,6 @@ import {
   type PrimerLesson,
   type Stage,
   type StagegateResult,
-  type StudentBookEntry,
   type StudentBookState,
   type StudentMemory,
   type StudentMemoryGraph,
@@ -73,7 +74,6 @@ import {
   emptyStagegateResult,
   firstTopicHint,
   initialLesson,
-  isBookContentEntry,
   mergeMemoryGraph,
   normalizeBookState,
   normalizeLesson,
@@ -83,6 +83,10 @@ import {
   stagesForStagegate,
   staticBookPageCount,
 } from "@/lib/primer-flow";
+import {
+  type StudentReportCard,
+  fetchStudentReportCard,
+} from "@/lib/report-card";
 import {
   type ComponentType,
   type CSSProperties,
@@ -162,12 +166,21 @@ type NarrationPayload = {
 
 type InfographicExplanationPayload = {
   aiMode?: string;
+  cached?: boolean;
   error?: string;
   explanation?: string;
   generated?: boolean;
   keyObservations?: string[];
   message?: string;
   model?: string;
+  persistedVoiceover?: {
+    cacheKey?: string;
+    contentType?: string;
+    error?: string;
+    filePath?: string;
+    reused?: boolean;
+    saved?: boolean;
+  };
   speech?: NarrationPayload | null;
   speechGenerated?: boolean;
   speechModel?: string;
@@ -204,6 +217,9 @@ type MemoryEdgeData = Record<string, unknown> & {
 
 type MemoryFlowNode = ReactFlowNode<MemoryNodeData>;
 type MemoryFlowEdge = Edge<MemoryEdgeData>;
+
+const chooseTopicPageIndex = 5;
+const storyPageIndex = 6;
 
 type BookPageProps = {
   children: ReactNode;
@@ -302,7 +318,20 @@ const pageFlipInteractiveHandlers = {
 
 const pageTurnStyle: CSSProperties = {};
 
-const termIcons = [Atom, Sparkles, Cog, Brain, MapIcon, Leaf, Search];
+const infographicSparkles = [
+  { x: "16%", y: "24%", delay: "0s", size: "0.42rem" },
+  { x: "32%", y: "16%", delay: "0.16s", size: "0.56rem" },
+  { x: "52%", y: "20%", delay: "0.34s", size: "0.36rem" },
+  { x: "76%", y: "26%", delay: "0.5s", size: "0.5rem" },
+  { x: "22%", y: "48%", delay: "0.68s", size: "0.34rem" },
+  { x: "43%", y: "42%", delay: "0.86s", size: "0.66rem" },
+  { x: "65%", y: "48%", delay: "1.04s", size: "0.4rem" },
+  { x: "84%", y: "58%", delay: "1.2s", size: "0.52rem" },
+  { x: "18%", y: "76%", delay: "1.38s", size: "0.48rem" },
+  { x: "39%", y: "82%", delay: "1.54s", size: "0.32rem" },
+  { x: "60%", y: "74%", delay: "1.72s", size: "0.58rem" },
+  { x: "78%", y: "82%", delay: "1.9s", size: "0.38rem" },
+];
 
 async function requestLessonStart(
   learner: AuthenticatedStudent,
@@ -379,6 +408,20 @@ async function fetchStudentMemoryGraph(
   return normalizeMemoryGraph(payload.graph);
 }
 
+function restoredBookTargetPage(book: StudentBookState): number {
+  if (book.latestStagegate) {
+    return book.hasPassedStagegate
+      ? staticBookPageCount
+      : staticBookPageCount - 1;
+  }
+
+  if (book.activeLesson) {
+    return chooseTopicPageIndex;
+  }
+
+  return defaultBookPageIndex(book.entries);
+}
+
 export function PrimerBook() {
   const bookRef = useRef<FlipBookRef | null>(null);
   const bookShellRef = useRef<HTMLDivElement | null>(null);
@@ -395,10 +438,14 @@ export function PrimerBook() {
   const [currentPage, setCurrentPage] = useState(0);
   const [topic, setTopic] = useState("");
   const [lesson, setLesson] = useState<PrimerLesson>(initialLesson);
-  const [bookEntries, setBookEntries] = useState<StudentBookEntry[]>([]);
   const [remoteMemories, setRemoteMemories] = useState<StudentMemory[] | null>(
     null,
   );
+  const [reportCard, setReportCard] = useState<StudentReportCard | null>(null);
+  const [reportCardStatus, setReportCardStatus] = useState(
+    "Report card not loaded.",
+  );
+  const [isReportCardRefreshing, setIsReportCardRefreshing] = useState(false);
   const [memoryGraph, setMemoryGraph] = useState<StudentMemoryGraph | null>(
     null,
   );
@@ -421,6 +468,7 @@ export function PrimerBook() {
   const [infographicStatus, setInfographicStatus] = useState(
     "No generated infographic yet.",
   );
+  const [isInfographicGenerating, setIsInfographicGenerating] = useState(false);
   const [infographicArtifact, setInfographicArtifact] =
     useState<InfographicArtifact | null>(null);
   const [selectionInfographics, setSelectionInfographics] = useState<
@@ -443,7 +491,7 @@ export function PrimerBook() {
   const [stagegateResult, setStagegateResult] =
     useState<StagegateResult>(emptyStagegateResult);
   const [isStagegateSubmitting, setIsStagegateSubmitting] = useState(false);
-  const [isStartingNextLesson, setIsStartingNextLesson] = useState(false);
+  const [isLessonGenerating, setIsLessonGenerating] = useState(false);
   const [answer, setAnswer] = useState("");
   const [isNarrating, setIsNarrating] = useState(false);
   const [isNarrationLoading, setIsNarrationLoading] = useState(false);
@@ -475,11 +523,9 @@ export function PrimerBook() {
         return false;
       }
 
-      if (options?.turnToEnd && book.entries.length > 0) {
-        pendingBookEndPageRef.current = defaultBookPageIndex(book.entries);
+      if (options?.turnToEnd) {
+        pendingBookEndPageRef.current = restoredBookTargetPage(book);
       }
-      setBookEntries(book.entries);
-
       if (book.activeLesson) {
         const savedLesson = normalizeLesson(
           book.activeLesson,
@@ -488,6 +534,7 @@ export function PrimerBook() {
         setLesson(savedLesson);
         setTopic(savedLesson.topic);
         setHasAsked(true);
+        setIsLessonGenerating(false);
       }
 
       const infographic = book.latestInfographic as
@@ -499,9 +546,7 @@ export function PrimerBook() {
         infographic
           ? infographic.generated
             ? `Generated with ${infographic.model ?? "gpt-image-2"}.`
-            : (infographic.message ??
-              infographic.prompt ??
-              "Infographic fallback was saved.")
+            : (infographic.message ?? "Infographic fallback was saved.")
           : "No generated infographic yet.",
       );
 
@@ -568,13 +613,15 @@ export function PrimerBook() {
     setHasGeneratedInfographic(false);
     setHasPassedStagegate(false);
     setIsStagegateSubmitting(false);
-    setIsStartingNextLesson(false);
+    setIsLessonGenerating(false);
+    setIsInfographicGenerating(false);
     setInfographicArtifact(null);
     setSelectionInfographics([]);
     setSelectedTextAction(null);
     setStagegateResult(emptyStagegateResult);
     setAnswer("");
-    setBookEntries([]);
+    setReportCard(null);
+    setReportCardStatus("Report card not loaded.");
     setLessonStatus("Loading the saved Primer book...");
 
     void fetchStudentBookState(learner, session, controller.signal)
@@ -596,6 +643,7 @@ export function PrimerBook() {
         }
 
         setLessonStatus("Asking OpenAI Responses to choose the opening path...");
+        setIsLessonGenerating(true);
         return requestLessonStart(
           restoredStudent,
           session,
@@ -640,6 +688,11 @@ export function PrimerBook() {
 
         if (!cancelled) {
           setLessonStatus(`Could not reach backend: ${String(error)}`);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsLessonGenerating(false);
         }
       });
 
@@ -690,6 +743,92 @@ export function PrimerBook() {
 
     return () => window.clearInterval(timer);
   }, [isInfographicExplanationLoading]);
+
+  async function loadReportCard(
+    options: {
+      learner?: AuthenticatedStudent;
+      session?: AuthSession | null;
+      turnToReport?: boolean;
+    } = {},
+  ) {
+    const learner = options.learner ?? authenticatedStudent;
+    if (!learner) {
+      return;
+    }
+
+    const reportSession = "session" in options ? options.session ?? null : session;
+
+    setIsReportCardRefreshing(true);
+    setReportCardStatus("Refreshing report card...");
+
+    try {
+      const nextReport = await fetchStudentReportCard(learner, reportSession);
+      if (!nextReport) {
+        setReportCard(null);
+        setReportCardStatus("No report-card evidence is available yet.");
+        return;
+      }
+
+      setReportCard(nextReport);
+      setReportCardStatus(
+        nextReport.aiMode === "openai_responses"
+          ? "Report card refreshed with OpenAI narrative."
+          : "Report card refreshed from saved learning evidence.",
+      );
+      if (options.turnToReport) {
+        goToPage(3);
+      }
+    } catch (error) {
+      setReportCardStatus(`Could not refresh report card: ${String(error)}`);
+    } finally {
+      setIsReportCardRefreshing(false);
+    }
+  }
+
+  function openReportCard() {
+    goToPage(3);
+    void loadReportCard({ turnToReport: true });
+  }
+
+  useEffect(() => {
+    const learner = authenticatedStudent;
+    if (!learner) {
+      return;
+    }
+
+    const controller = new AbortController();
+    let cancelled = false;
+    const loadingTimer = window.setTimeout(() => {
+      if (!cancelled) {
+        setReportCardStatus("Loading report card...");
+      }
+    }, 0);
+
+    void fetchStudentReportCard(learner, session, controller.signal)
+      .then((nextReport) => {
+        if (cancelled) {
+          return;
+        }
+        setReportCard(nextReport);
+        setReportCardStatus(
+          nextReport
+            ? "Report card loaded from saved learning evidence."
+            : "No report-card evidence is available yet.",
+        );
+      })
+      .catch((error) => {
+        if (cancelled || (error instanceof DOMException && error.name === "AbortError")) {
+          return;
+        }
+        setReportCardStatus(`Could not load report card: ${String(error)}`);
+      });
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(loadingTimer);
+      controller.abort();
+    };
+  }, [authenticatedStudent, session]);
 
   async function loadMemoryGraph(nodeId?: string) {
     if (!authenticatedStudent) {
@@ -754,10 +893,7 @@ export function PrimerBook() {
     return stagesForStagegate(hasPassedStagegate);
   }, [hasPassedStagegate]);
 
-  const contentBookEntries = useMemo(
-    () => bookEntries.filter(isBookContentEntry),
-    [bookEntries],
-  );
+  const hasNextTopicPage = hasPassedStagegate;
   const selectionInfographicsByPage = useMemo(() => {
     const byPage = new Map<number, SelectionInfographic[]>();
     for (const infographic of selectionInfographics) {
@@ -767,7 +903,7 @@ export function PrimerBook() {
     }
     return byPage;
   }, [selectionInfographics]);
-  const pageCount = staticBookPageCount + contentBookEntries.length;
+  const pageCount = staticBookPageCount + (hasNextTopicPage ? 1 : 0);
 
   useEffect(() => {
     const targetPage = pendingBookEndPageRef.current;
@@ -802,7 +938,7 @@ export function PrimerBook() {
         window.clearTimeout(timer);
       }
     };
-  }, [authenticatedStudent, contentBookEntries.length, pageCount]);
+  }, [authenticatedStudent, hasNextTopicPage, pageCount]);
 
   function flipNext() {
     bookRef.current?.pageFlip()?.flipNext("bottom");
@@ -908,7 +1044,12 @@ export function PrimerBook() {
   }
 
   async function generateInfographicForSelection() {
-    if (!authenticatedStudent || !selectedTextAction) {
+    if (
+      !authenticatedStudent ||
+      !selectedTextAction ||
+      isSelectionInfographicLoading ||
+      isInfographicGenerating
+    ) {
       return;
     }
 
@@ -1080,6 +1221,66 @@ export function PrimerBook() {
     }
   }
 
+  async function playInfographicExplanationAudio(
+    explanation: InfographicExplanationPayload,
+    options?: { fromSavedFile?: boolean },
+  ) {
+    const audioDataUrl = explanation.speech?.audioDataUrl;
+    if (!explanation.speechGenerated || !audioDataUrl) {
+      setInfographicExplanationStatus(
+        explanation.speech?.message ??
+          explanation.speech?.error ??
+          "GPT-5.5 explained the diagram, but TTS was unavailable.",
+      );
+      return false;
+    }
+
+    const voice = explanation.voice ?? explanation.speech?.voice ?? "fable";
+    const audio = new Audio(audioDataUrl);
+    narrationAudioRef.current = audio;
+    audio.onended = () => {
+      narrationAudioRef.current = null;
+      setIsInfographicExplanationPlaying(false);
+      const persisted = explanation.persistedVoiceover;
+      const replayNote =
+        options?.fromSavedFile || explanation.cached || persisted?.reused
+          ? " Replayed from the saved backend file."
+          : persisted?.saved
+            ? " Saved on the backend for next time."
+            : persisted?.error
+              ? " Backend storage could not save it."
+              : "";
+      setInfographicExplanationStatus(
+        `Diagram explained with ${explanation.model ?? "GPT-5.5"} and ${voice} voice.${replayNote}`,
+      );
+    };
+    audio.onerror = () => {
+      narrationAudioRef.current = null;
+      setIsInfographicExplanationPlaying(false);
+      setInfographicExplanationStatus("Could not play the diagram narration.");
+    };
+
+    setIsNarrating(false);
+    setIsInfographicExplanationPlaying(true);
+    setInfographicExplanationStatus(
+      `Playing ${
+        options?.fromSavedFile || explanation.cached ? "saved " : ""
+      }diagram explanation with ${voice} voice.`,
+    );
+
+    try {
+      await audio.play();
+      return true;
+    } catch (error) {
+      clearNarrationAudio();
+      setIsNarrating(false);
+      setInfographicExplanationStatus(
+        `Could not play the diagram narration: ${String(error)}`,
+      );
+      return false;
+    }
+  }
+
   async function explainEnlargedInfographic() {
     if (!authenticatedStudent || !enlargedInfographic) {
       return;
@@ -1093,6 +1294,17 @@ export function PrimerBook() {
       clearNarrationAudio();
       setIsNarrating(false);
       setInfographicExplanationStatus("Diagram narration stopped.");
+      return;
+    }
+
+    if (infographicExplanation?.speech?.audioDataUrl) {
+      await playInfographicExplanationAudio(infographicExplanation, {
+        fromSavedFile: Boolean(
+          infographicExplanation.cached ||
+            infographicExplanation.persistedVoiceover?.saved ||
+            infographicExplanation.persistedVoiceover?.reused,
+        ),
+      });
       return;
     }
 
@@ -1139,41 +1351,11 @@ export function PrimerBook() {
       }
 
       setInfographicExplanation(explanation);
-      const audioDataUrl = explanation.speech?.audioDataUrl;
-      if (!explanation.speechGenerated || !audioDataUrl) {
-        setInfographicExplanationStatus(
-          explanation.speech?.message ??
-            explanation.speech?.error ??
-            "GPT-5.5 explained the diagram, but TTS was unavailable.",
-        );
-        return;
-      }
-
-      const audio = new Audio(audioDataUrl);
-      narrationAudioRef.current = audio;
-      audio.onended = () => {
-        narrationAudioRef.current = null;
-        setIsInfographicExplanationPlaying(false);
-        setInfographicExplanationStatus(
-          `Diagram explained with ${explanation.model ?? "GPT-5.5"} and ${
-            explanation.voice ?? explanation.speech?.voice ?? "fable"
-          } voice.`,
-        );
-      };
-      audio.onerror = () => {
-        narrationAudioRef.current = null;
-        setIsInfographicExplanationPlaying(false);
-        setInfographicExplanationStatus("Could not play the diagram narration.");
-      };
-
-      setIsNarrating(false);
-      setIsInfographicExplanationPlaying(true);
-      setInfographicExplanationStatus(
-        `Playing diagram explanation with ${
-          explanation.voice ?? explanation.speech?.voice ?? "fable"
-        } voice.`,
-      );
-      await audio.play();
+      await playInfographicExplanationAudio(explanation, {
+        fromSavedFile: Boolean(
+          explanation.cached || explanation.persistedVoiceover?.reused,
+        ),
+      });
     } catch (error) {
       if (infographicExplanationRequestIdRef.current !== requestId) {
         return;
@@ -1206,8 +1388,10 @@ export function PrimerBook() {
     infographicExplanationRequestIdRef.current += 1;
     setTopic(cleanTopic);
     setLessonStatus("Asking OpenAI Responses to guide this path...");
+    setIsLessonGenerating(true);
     setHasAsked(true);
     setHasGeneratedInfographic(false);
+    setIsInfographicGenerating(false);
     setInfographicArtifact(null);
     setSelectionInfographics([]);
     setSelectedTextAction(null);
@@ -1257,34 +1441,31 @@ export function PrimerBook() {
           ? "Guided by OpenAI Responses."
           : "Guided by the student profile.",
       );
+      void loadReportCard({ learner: responseStudent });
       if (isMemoryOpen) {
         void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
       }
-      goToPage(4);
+      goToPage(storyPageIndex);
     } catch (error) {
       setLessonStatus(`Could not reach backend: ${String(error)}`);
-    }
-  }
-
-  async function startNextLesson() {
-    if (isStartingNextLesson) {
-      return;
-    }
-
-    setIsStartingNextLesson(true);
-    try {
-      await startTopic(lesson.topic, { keepStagegateVisibleUntilLoaded: true });
     } finally {
-      setIsStartingNextLesson(false);
+      setIsLessonGenerating(false);
     }
   }
 
   async function generateInfographic() {
-    if (!authenticatedStudent) {
+    if (
+      !authenticatedStudent ||
+      isInfographicGenerating ||
+      isSelectionInfographicLoading
+    ) {
       return;
     }
 
-    setInfographicStatus("Calling gpt-image-2 for an infographic...");
+    setIsInfographicGenerating(true);
+    setHasGeneratedInfographic(false);
+    setInfographicArtifact(null);
+    setInfographicStatus("Generating infographic...");
 
     try {
       const response = await fetch(`${apiBaseUrl}/api/artifact/infographic`, {
@@ -1311,6 +1492,8 @@ export function PrimerBook() {
       );
     } catch (error) {
       setInfographicStatus(`Could not reach backend: ${String(error)}`);
+    } finally {
+      setIsInfographicGenerating(false);
     }
   }
 
@@ -1340,6 +1523,7 @@ export function PrimerBook() {
       if (payload.error || !payload.result) {
         setRemoteMemories(normalizeMemories(responseStudent.memories));
         hydratePersistedBook(normalizeBookState(payload.book), responseStudent);
+        void loadReportCard({ learner: responseStudent });
         setHasPassedStagegate(false);
         setStagegateResult({
           ...emptyStagegateResult,
@@ -1367,6 +1551,7 @@ export function PrimerBook() {
       setRemoteMemories(normalizeMemories(responseStudent.memories));
       setHasPassedStagegate(normalizedResult.passed);
       hydratePersistedBook(normalizeBookState(payload.book), responseStudent);
+      void loadReportCard({ learner: responseStudent });
       shouldTurnToUnlock = normalizedResult.passed;
       if (isMemoryOpen) {
         void loadMemoryGraph(selectedMemoryNodeId ?? undefined);
@@ -1443,12 +1628,14 @@ export function PrimerBook() {
       setCurrentPage(0);
       setTopic(resetStudent.interests[0] ?? "");
       setLesson(initialLesson);
-      setBookEntries([]);
+      setReportCard(null);
+      setReportCardStatus("Report card not loaded.");
       setHasAsked(true);
       setHasGeneratedInfographic(false);
       setHasPassedStagegate(false);
       setIsStagegateSubmitting(false);
-      setIsStartingNextLesson(false);
+      setIsLessonGenerating(false);
+      setIsInfographicGenerating(false);
       setInfographicArtifact(null);
       setSelectionInfographics([]);
       setSelectedTextAction(null);
@@ -1464,6 +1651,7 @@ export function PrimerBook() {
       setLessonStatus(
         "Student record reset. Generating a fresh opening path...",
       );
+      setIsLessonGenerating(true);
       setIsResetDialogOpen(false);
       goToPage(0);
 
@@ -1501,12 +1689,17 @@ export function PrimerBook() {
           ? "Fresh opening path generated by OpenAI Responses."
           : "Fresh opening path generated from the student profile.",
       );
+      void loadReportCard({
+        learner: lessonStudent,
+        session: currentSession,
+      });
     } catch (error) {
       const message = `Could not reset the student record: ${String(error)}`;
       setResetError(message);
       setLessonStatus(message);
     } finally {
       setIsResettingStudent(false);
+      setIsLessonGenerating(false);
     }
   }
 
@@ -1541,6 +1734,9 @@ export function PrimerBook() {
     setAuthenticatedStudent(null);
     setSession(null);
     setRemoteMemories(null);
+    setReportCard(null);
+    setReportCardStatus("Report card not loaded.");
+    setIsReportCardRefreshing(false);
     setMemoryGraph(null);
     setIsMemoryOpen(false);
     setIsResetDialogOpen(false);
@@ -1551,12 +1747,12 @@ export function PrimerBook() {
     setCurrentPage(0);
     setTopic("");
     setLesson(initialLesson);
-    setBookEntries([]);
     setHasAsked(false);
     setHasGeneratedInfographic(false);
     setHasPassedStagegate(false);
     setIsStagegateSubmitting(false);
-    setIsStartingNextLesson(false);
+    setIsLessonGenerating(false);
+    setIsInfographicGenerating(false);
     setInfographicArtifact(null);
     setSelectionInfographics([]);
     setSelectedTextAction(null);
@@ -1603,6 +1799,16 @@ export function PrimerBook() {
           <XpBadge xpTotal={learner.xpTotal} />
           <button
             type="button"
+            aria-label="Open report card"
+            onClick={openReportCard}
+            disabled={isReportCardRefreshing}
+            className="inline-flex h-10 items-center gap-2 rounded-full border border-cyan-100/15 bg-black/28 px-2.5 text-sm text-cyan-50/78 shadow-2xl shadow-black/20 transition hover:text-cyan-50 disabled:cursor-wait disabled:opacity-60 sm:px-3"
+          >
+            <MapIcon className="h-4 w-4" />
+            <span className="hidden sm:inline">Report</span>
+          </button>
+          <button
+            type="button"
             aria-label="Open memory graph"
             onClick={openMemoryGraph}
             className="inline-flex h-10 items-center gap-2 rounded-full border border-cyan-100/15 bg-black/28 px-2.5 text-sm text-cyan-50/78 shadow-2xl shadow-black/20 transition hover:text-cyan-50 sm:px-3"
@@ -1642,6 +1848,13 @@ export function PrimerBook() {
           onTouchEndCapture={scheduleSelectionCapture}
         >
           <div className="absolute inset-x-8 top-1/2 h-10 -translate-y-1/2 rounded-full bg-black/35 blur-3xl" />
+          {isLessonGenerating ? (
+            <LessonGenerationOverlay
+              learnerName={learner.displayName}
+              status={lessonStatus}
+              topicHint={topic || lesson.topic || firstTopicHint(learner)}
+            />
+          ) : null}
           <HTMLFlipBook
             ref={bookRef}
             className="primer-flipbook mx-auto"
@@ -1709,6 +1922,36 @@ export function PrimerBook() {
                   pageIndex={3}
                   pageNumber={3}
                 >
+                  <ReportCardStudentPage
+                    isRefreshing={isReportCardRefreshing}
+                    onRefresh={() => void loadReportCard()}
+                    reportCard={reportCard}
+                    status={reportCardStatus}
+                  />
+                </BookPage>
+
+                <BookPage
+                  inlineInfographics={inlineInfographicsForPage(4)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(4)}
+                  onOpenInfographic={openInfographicImage}
+                  pageIndex={4}
+                  pageNumber={4}
+                >
+                  <ReportCardParentPage
+                    isRefreshing={isReportCardRefreshing}
+                    onRefresh={() => void loadReportCard()}
+                    reportCard={reportCard}
+                    status={reportCardStatus}
+                  />
+                </BookPage>
+
+                <BookPage
+                  inlineInfographics={inlineInfographicsForPage(5)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(5)}
+                  onOpenInfographic={openInfographicImage}
+                  pageIndex={5}
+                  pageNumber={5}
+                >
                   <AskPage
                     hasAsked={hasAsked}
                     lessonStatus={lessonStatus}
@@ -1720,25 +1963,28 @@ export function PrimerBook() {
                 </BookPage>
 
                 <BookPage
-                  inlineInfographics={inlineInfographicsForPage(4)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(4)}
+                  inlineInfographics={inlineInfographicsForPage(6)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(6)}
                   onOpenInfographic={openInfographicImage}
-                  pageIndex={4}
-                  pageNumber={4}
+                  pageIndex={6}
+                  pageNumber={6}
                 >
                   <StoryPage lesson={lesson} />
                 </BookPage>
 
                 <BookPage
-                  inlineInfographics={inlineInfographicsForPage(5)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(5)}
+                  inlineInfographics={inlineInfographicsForPage(7)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(7)}
                   onOpenInfographic={openInfographicImage}
-                  pageIndex={5}
-                  pageNumber={5}
+                  pageIndex={7}
+                  pageNumber={7}
                 >
                   <InfographicPage
                     artifact={infographicArtifact}
                     infographicStatus={infographicStatus}
+                    isGenerating={
+                      isInfographicGenerating || isSelectionInfographicLoading
+                    }
                     lesson={lesson}
                     hasGeneratedInfographic={hasGeneratedInfographic}
                     onGenerate={() => void generateInfographic()}
@@ -1748,11 +1994,11 @@ export function PrimerBook() {
                 </BookPage>
 
                 <BookPage
-                  inlineInfographics={inlineInfographicsForPage(6)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(6)}
+                  inlineInfographics={inlineInfographicsForPage(8)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(8)}
                   onOpenInfographic={openInfographicImage}
-                  pageIndex={6}
-                  pageNumber={6}
+                  pageIndex={8}
+                  pageNumber={8}
                 >
                   <VoiceoverPage
                     lesson={lesson}
@@ -1764,21 +2010,21 @@ export function PrimerBook() {
                 </BookPage>
 
                 <BookPage
-                  inlineInfographics={inlineInfographicsForPage(7)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(7)}
+                  inlineInfographics={inlineInfographicsForPage(9)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(9)}
                   onOpenInfographic={openInfographicImage}
-                  pageIndex={7}
-                  pageNumber={7}
+                  pageIndex={9}
+                  pageNumber={9}
                 >
                   <FollowUpPage lesson={lesson} />
                 </BookPage>
 
                 <BookPage
-                  inlineInfographics={inlineInfographicsForPage(8)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(8)}
+                  inlineInfographics={inlineInfographicsForPage(10)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(10)}
                   onOpenInfographic={openInfographicImage}
-                  pageIndex={8}
-                  pageNumber={8}
+                  pageIndex={10}
+                  pageNumber={10}
                 >
                   <StagegatePage
                     answer={answer}
@@ -1792,10 +2038,10 @@ export function PrimerBook() {
 
                 <BookPage
                   density="hard"
-                  inlineInfographics={inlineInfographicsForPage(9)}
-                  onLayoutChange={() => scheduleBookLayoutRefresh(9)}
+                  inlineInfographics={inlineInfographicsForPage(11)}
+                  onLayoutChange={() => scheduleBookLayoutRefresh(11)}
                   onOpenInfographic={openInfographicImage}
-                  pageIndex={9}
+                  pageIndex={11}
                   tone="deep"
                 >
                   <UnlockPage
@@ -1803,30 +2049,43 @@ export function PrimerBook() {
                     hasPassed={hasPassedStagegate}
                     lesson={lesson}
                     lessonStatus={lessonStatus}
-                    isStartingNextLesson={isStartingNextLesson}
-                    onStartNextLesson={() => void startNextLesson()}
+                    onStartNextLesson={() => goToPage(staticBookPageCount)}
                   />
                 </BookPage>
 
-                {contentBookEntries.map((entry, index) => (
-                  <BookPage
-                    key={entry.entryId}
-                    inlineInfographics={inlineInfographicsForPage(
-                      staticBookPageCount + index,
-                    )}
-                    onLayoutChange={() =>
-                      scheduleBookLayoutRefresh(staticBookPageCount + index)
-                    }
-                    onOpenInfographic={openInfographicImage}
-                    pageIndex={staticBookPageCount + index}
-                    pageNumber={staticBookPageCount + index}
-                  >
-                    <SavedBookEntryPage
-                      entry={entry}
-                      onOpenInfographic={openInfographicImage}
-                    />
-                  </BookPage>
-                ))}
+                {hasNextTopicPage
+                  ? [
+                      <BookPage
+                        key="next-topic"
+                        inlineInfographics={inlineInfographicsForPage(
+                          staticBookPageCount,
+                        )}
+                        onLayoutChange={() =>
+                          scheduleBookLayoutRefresh(staticBookPageCount)
+                        }
+                        onOpenInfographic={openInfographicImage}
+                        pageIndex={staticBookPageCount}
+                        pageNumber={staticBookPageCount}
+                      >
+                        <AskPage
+                          hasAsked={hasAsked}
+                          lessonStatus="Level complete. Choose the next thing to explore."
+                          suggestedTopics={lesson.suggestedTopics}
+                          topic={topic}
+                          onAsk={(nextTopic) =>
+                            void startTopic(nextTopic, {
+                              keepStagegateVisibleUntilLoaded: true,
+                            })
+                          }
+                          onChooseTopic={(nextTopic) =>
+                            void startTopic(nextTopic, {
+                              keepStagegateVisibleUntilLoaded: true,
+                            })
+                          }
+                        />
+                      </BookPage>,
+                    ]
+                  : []}
           </HTMLFlipBook>
 
           <div className="relative z-20 mt-3 flex flex-wrap items-center justify-center gap-2 sm:mt-4 sm:gap-3">
@@ -2188,6 +2447,7 @@ function StoryPage({ lesson }: { lesson: PrimerLesson }) {
 function InfographicPage({
   artifact,
   infographicStatus,
+  isGenerating,
   lesson,
   hasGeneratedInfographic,
   onGenerate,
@@ -2196,6 +2456,7 @@ function InfographicPage({
 }: {
   artifact: InfographicArtifact | null;
   infographicStatus: string;
+  isGenerating: boolean;
   lesson: PrimerLesson;
   hasGeneratedInfographic: boolean;
   onGenerate: () => void;
@@ -2212,9 +2473,19 @@ function InfographicPage({
           {...pageFlipInteractiveHandlers}
           type="button"
           onClick={onGenerate}
-          className="rounded-full bg-[#d8b86a] px-3 py-1.5 text-xs font-semibold text-[#1c211d]"
+          disabled={isGenerating}
+          className="inline-flex h-10 min-w-[8rem] items-center justify-center gap-2 rounded-full bg-[#d8b86a] px-4 text-xs font-semibold text-[#1c211d] transition hover:bg-[#e4c77a] disabled:cursor-wait disabled:opacity-75"
         >
-          {hasGeneratedInfographic ? "Regenerate" : "Generate"}
+          {isGenerating ? (
+            <>
+              <Sparkles className="h-3.5 w-3.5 animate-pulse" />
+              Generating
+            </>
+          ) : hasGeneratedInfographic ? (
+            "Regenerate"
+          ) : (
+            "Generate"
+          )}
         </button>
       </div>
       <h2 className="mt-3 text-2xl font-semibold text-stone-950">
@@ -2224,51 +2495,50 @@ function InfographicPage({
       {imageSrc ? (
         <InfographicImageButton
           alt={`Generated infographic for ${lesson.topic}`}
-          className="mt-4 block overflow-hidden rounded-[8px] border border-stone-300 bg-white"
-          imageClassName="aspect-square w-full object-cover"
+          className="mt-4 block aspect-square w-full overflow-hidden rounded-[8px] border border-stone-300 bg-white"
+          imageClassName="h-full w-full object-cover"
           onImageLoad={onImageLoad}
           onOpen={onOpenInfographic}
           src={imageSrc}
           title={`${lesson.topic} infographic`}
         />
       ) : (
-        <>
-          <div className="mt-4 rounded-[8px] border border-stone-300 bg-white/70 p-4">
-            <p className="text-xs uppercase text-stone-500">
-              Prompt sent to gpt-image-2
-            </p>
-            <p className="mt-2 text-sm leading-6 text-stone-800">
-              {lesson.infographicPrompt}
-            </p>
-          </div>
-          <div className="mt-4 grid grid-cols-2 gap-3">
-            {lesson.keyTerms.slice(0, 4).map((term, index) => {
-              const Icon = termIcons[index % termIcons.length];
+        <InfographicFrame isGenerating={isGenerating} />
+      )}
+    </div>
+  );
+}
 
-              return (
-                <div
-                  key={term.term}
-                  className="min-h-[112px] rounded-[8px] border border-stone-300 bg-white/70 p-3"
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex h-8 w-8 items-center justify-center rounded-full bg-[#1e6f73] text-white">
-                      <Icon className="h-4 w-4" strokeWidth={1.8} />
-                    </div>
-                    <span className="text-xs font-semibold text-stone-400">
-                      0{index + 1}
-                    </span>
-                  </div>
-                  <p className="mt-2 text-sm font-semibold leading-5 text-stone-950">
-                    {term.term}
-                  </p>
-                  <p className="mt-1 line-clamp-2 text-xs leading-5 text-stone-600">
-                    {term.definition}
-                  </p>
-                </div>
-              );
-            })}
-          </div>
-        </>
+function InfographicFrame({ isGenerating }: { isGenerating: boolean }) {
+  return (
+    <div
+      aria-label={
+        isGenerating
+          ? "Generating infographic"
+          : "Generated infographic will appear here"
+      }
+      aria-live="polite"
+      role={isGenerating ? "status" : undefined}
+      className="infographic-empty-frame mt-4 flex aspect-square w-full items-center justify-center overflow-hidden rounded-[8px] border border-stone-300 bg-white/55"
+    >
+      {isGenerating ? (
+        <div className="infographic-spark-field" aria-hidden="true">
+          {infographicSparkles.map((sparkle) => (
+            <span
+              key={`${sparkle.x}-${sparkle.y}`}
+              className="infographic-spark-dot"
+              style={{
+                animationDelay: sparkle.delay,
+                height: sparkle.size,
+                left: sparkle.x,
+                top: sparkle.y,
+                width: sparkle.size,
+              }}
+            />
+          ))}
+        </div>
+      ) : (
+        <span className="sr-only">Generated infographic will appear here.</span>
       )}
     </div>
   );
@@ -2518,14 +2788,12 @@ function StagegateGuidancePanel({ result }: { result: StagegateResult }) {
 function UnlockPage({
   result,
   hasPassed,
-  isStartingNextLesson,
   lesson,
   lessonStatus,
   onStartNextLesson,
 }: {
   result: StagegateResult;
   hasPassed: boolean;
-  isStartingNextLesson: boolean;
   lesson: PrimerLesson;
   lessonStatus: string;
   onStartNextLesson: () => void;
@@ -2586,21 +2854,11 @@ function UnlockPage({
             <button
               {...pageFlipInteractiveHandlers}
               type="button"
-              disabled={isStartingNextLesson}
               onClick={onStartNextLesson}
-              className="mt-3 inline-flex h-10 w-full items-center justify-center gap-2 rounded-full bg-[#173b3b] px-4 text-sm font-semibold text-cyan-50 transition hover:bg-[#1f4f4f] disabled:cursor-wait disabled:opacity-75"
+              className="mt-3 inline-flex h-10 w-full items-center justify-center gap-2 rounded-full bg-[#173b3b] px-4 text-sm font-semibold text-cyan-50 transition hover:bg-[#1f4f4f]"
             >
-              {isStartingNextLesson ? (
-                <>
-                  <Cog className="h-4 w-4 animate-spin" />
-                  Starting next lesson
-                </>
-              ) : (
-                <>
-                  <Play className="h-4 w-4" />
-                  Start next lesson
-                </>
-              )}
+              <Play className="h-4 w-4" />
+              Choose next topic
             </button>
             <p
               aria-live="polite"
@@ -2613,91 +2871,6 @@ function UnlockPage({
       </div>
     </div>
   );
-}
-
-function SavedBookEntryPage({
-  entry,
-  onOpenInfographic,
-}: {
-  entry: StudentBookEntry;
-  onOpenInfographic: (image: EnlargedInfographic) => void;
-}) {
-  const createdAt = entry.createdAt
-    ? new Date(entry.createdAt).toLocaleString()
-    : "Saved in the book";
-
-  if (entry.kind === "lesson") {
-    const savedLesson = normalizeLesson(
-      entry.payload.lesson,
-      entry.topic ?? "saved lesson",
-    );
-
-    return (
-      <div className="flex h-full flex-col">
-        <Kicker icon={BookOpen}>Saved lesson</Kicker>
-        <h2 className="mt-4 text-3xl font-semibold leading-tight text-stone-950">
-          {savedLesson.topic}
-        </h2>
-        <p className="mt-2 text-xs uppercase text-stone-500">{createdAt}</p>
-        <p className="mt-5 text-base leading-7 text-stone-800">
-          {savedLesson.storyScene}
-        </p>
-        <div className="mt-5 border-l-2 border-[#1e6f73] bg-white/55 px-4 py-3">
-          <p className="text-xs uppercase text-stone-500">Explanation</p>
-          <p className="mt-2 text-sm leading-6 text-stone-800">
-            {savedLesson.plainExplanation}
-          </p>
-        </div>
-        <div className="mt-auto flex flex-wrap gap-2">
-          {savedLesson.keyTerms.slice(0, 4).map((term) => (
-            <span
-              key={term.term}
-              className="rounded-full border border-stone-300 bg-white/62 px-3 py-1.5 text-xs font-semibold text-stone-700"
-            >
-              {term.term}
-            </span>
-          ))}
-        </div>
-      </div>
-    );
-  }
-
-  if (entry.kind === "infographic") {
-    const artifact = entry.payload.artifact as InfographicArtifact | undefined;
-    const imageSrc = artifactImageSrc(artifact);
-
-    return (
-      <div className="flex h-full flex-col">
-        <Kicker icon={Sparkles}>Saved diagram</Kicker>
-        <h2 className="mt-4 text-3xl font-semibold leading-tight text-stone-950">
-          {entry.topic ?? "Generated infographic"}
-        </h2>
-        <p className="mt-2 text-xs uppercase text-stone-500">{createdAt}</p>
-        {imageSrc ? (
-          <InfographicImageButton
-            alt={`Saved infographic for ${entry.topic ?? "this lesson"}`}
-            className="mt-5 block overflow-hidden rounded-[8px] border border-stone-300 bg-white"
-            imageClassName="aspect-square w-full object-cover"
-            onOpen={onOpenInfographic}
-            src={imageSrc}
-            title={entry.topic ?? "Saved infographic"}
-          />
-        ) : (
-          <div className="mt-5 rounded-[8px] border border-stone-300 bg-white/70 p-4">
-            <p className="text-xs uppercase text-stone-500">Fallback artifact</p>
-            <p className="mt-2 text-sm leading-6 text-stone-800">
-              {artifact?.message ??
-                artifact?.error ??
-                artifact?.prompt ??
-                "No generated image was returned."}
-            </p>
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  return null;
 }
 
 function InlineSelectionInfographics({
@@ -2858,6 +3031,12 @@ function InfographicLightbox({
   status: string;
 }) {
   const observations = explanation?.keyObservations ?? [];
+  const hasSavedVoiceover = Boolean(
+    explanation?.speech?.audioDataUrl &&
+      (explanation.cached ||
+        explanation.persistedVoiceover?.saved ||
+        explanation.persistedVoiceover?.reused),
+  );
 
   return (
     <div
@@ -2912,13 +3091,14 @@ function InfographicLightbox({
             ) : (
               <>
                 <Volume2 className="h-4 w-4" />
-                Explain aloud
+                {hasSavedVoiceover ? "Replay saved audio" : "Explain aloud"}
               </>
             )}
           </button>
           <p className="mt-3 text-xs leading-5 text-cyan-50/58">
-            GPT-5.5 reads the image with vision input. The voice is
-            AI-generated.
+            {hasSavedVoiceover
+              ? "Saved audio replays from the backend filesystem without regenerating."
+              : "GPT-5.5 reads the image with vision input. The voice is AI-generated."}
           </p>
 
           {explanation?.explanation ? (

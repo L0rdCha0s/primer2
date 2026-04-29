@@ -7,7 +7,7 @@ use crate::{
     },
     memory,
     openai::build_infographic_prompt,
-    report_card,
+    report_card, voiceover_store,
 };
 use poem::{
     Route, get, handler, post,
@@ -251,7 +251,7 @@ async fn start_lesson_impl(state: &AppState, request: LessonStartRequest) -> Val
             Err(_) => student,
         };
     let mut response_student = updated_student;
-    let book = match db::append_lesson_book_entry(
+    let book = match db::update_lesson_book_state(
         &state.db,
         &student_id,
         lesson_topic,
@@ -268,7 +268,7 @@ async fn start_lesson_impl(state: &AppState, request: LessonStartRequest) -> Val
         }
         Err(error) => {
             println!(
-                "[primerlab-api] book lesson persistence failed for student={student_id}: {error}"
+                "[primerlab-api] current lesson persistence failed for student={student_id}: {error}"
             );
             None
         }
@@ -305,13 +305,13 @@ async fn infographic(
             "prompt": build_infographic_prompt(&student, &request)
         }),
     };
-    let book = match db::append_infographic_book_entry(&state.db, &student_id, &request, &result)
+    let book = match db::update_infographic_book_state(&state.db, &student_id, &request, &result)
         .await
     {
         Ok(book) => Some(book),
         Err(error) => {
             println!(
-                "[primerlab-api] book infographic persistence failed for student={student_id}: {error}"
+                "[primerlab-api] current infographic persistence failed for student={student_id}: {error}"
             );
             None
         }
@@ -338,7 +338,40 @@ async fn explain_infographic(
         Err(error) => return Json(json!({ "error": error.to_string() })),
     };
 
-    let result = match state.openai.explain_infographic(&student, &request).await {
+    let voiceover_identity = voiceover_store::voiceover_identity(&student_id, &request);
+    match db::find_infographic_voiceover(&state.db, &student_id, &voiceover_identity.cache_key)
+        .await
+    {
+        Ok(Some(saved)) => {
+            match voiceover_store::read_voiceover_audio(&saved.file_path, &saved.content_type).await
+            {
+                Ok(audio_data_url) => {
+                    return Json(json!({
+                        "studentId": student_id,
+                        "explanation": voiceover_store::response_from_saved_explanation(
+                            &saved.explanation,
+                            audio_data_url,
+                            &saved.file_path,
+                            &saved.content_type,
+                        )
+                    }));
+                }
+                Err(error) => {
+                    println!(
+                        "[primerlab-api] saved infographic voiceover could not be read for student={student_id}: {error}"
+                    );
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            println!(
+                "[primerlab-api] saved infographic voiceover lookup failed for student={student_id}: {error}"
+            );
+        }
+    }
+
+    let mut result = match state.openai.explain_infographic(&student, &request).await {
         Ok(result) => result,
         Err(error) => json!({
             "aiMode": "openai_error",
@@ -350,6 +383,75 @@ async fn explain_infographic(
             "voice": state.openai.speech_voice()
         }),
     };
+    if result
+        .get("generated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && result
+            .get("speechGenerated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        if let Some(audio_data_url) = result
+            .get("speech")
+            .and_then(|speech| speech.get("audioDataUrl"))
+            .and_then(Value::as_str)
+        {
+            match voiceover_store::write_voiceover_audio(
+                &student_id,
+                &voiceover_identity.cache_key,
+                audio_data_url,
+            )
+            .await
+            {
+                Ok(saved_file) => {
+                    let persisted_payload =
+                        voiceover_store::persisted_explanation_payload(&result, &saved_file);
+                    match db::save_infographic_voiceover(
+                        &state.db,
+                        &student_id,
+                        &request,
+                        &voiceover_identity.cache_key,
+                        &voiceover_identity.image_hash,
+                        voiceover_identity.image_length,
+                        &persisted_payload,
+                        &saved_file.content_type,
+                        &saved_file.relative_path,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            result["cached"] = json!(false);
+                            result["persistedVoiceover"] = json!({
+                                "saved": true,
+                                "cacheKey": voiceover_identity.cache_key,
+                                "filePath": saved_file.relative_path,
+                                "contentType": saved_file.content_type
+                            });
+                        }
+                        Err(error) => {
+                            println!(
+                                "[primerlab-api] saved infographic voiceover DB reference failed for student={student_id}: {error}"
+                            );
+                            result["persistedVoiceover"] = json!({
+                                "saved": false,
+                                "error": error.to_string()
+                            });
+                        }
+                    }
+                }
+                Err(error) => {
+                    println!(
+                        "[primerlab-api] saved infographic voiceover write failed for student={student_id}: {error}"
+                    );
+                    result["persistedVoiceover"] = json!({
+                        "saved": false,
+                        "error": error
+                    });
+                }
+            }
+        }
+    }
 
     Json(json!({
         "studentId": student_id,

@@ -6,6 +6,7 @@ mod openai;
 mod report_card;
 mod request_logging;
 mod routes;
+mod voiceover_store;
 
 use openai::OpenAiClient;
 use poem::{EndpointExt, Server, listener::TcpListener, middleware::Cors};

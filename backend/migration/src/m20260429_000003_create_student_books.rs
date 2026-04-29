@@ -13,6 +13,10 @@ impl MigrationTrait for Migration {
                 student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
                 title text NOT NULL,
                 status text NOT NULL DEFAULT 'active',
+                active_lesson jsonb,
+                latest_infographic jsonb,
+                latest_stagegate jsonb,
+                latest_answer text,
                 created_at timestamptz NOT NULL,
                 updated_at timestamptz NOT NULL,
                 UNIQUE (student_id)

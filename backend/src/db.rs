@@ -1,12 +1,13 @@
 use crate::{
     domain::{
-        ConceptProgress, InfographicRequest, LessonStartRequest, NarrativeCharacter,
-        RegisterRequest, StagegateRequest, StudentBookEntryRecord, StudentBookState, StudentMemory,
-        StudentRecord,
+        ConceptProgress, InfographicExplanationRequest, InfographicRequest, LessonStartRequest,
+        NarrativeCharacter, RegisterRequest, StagegateRequest, StudentBookEntryRecord,
+        StudentBookState, StudentMemory, StudentRecord,
     },
     entities::{
-        concept_progress, local_user, narrative_character, narrative_character_biography, student,
-        student_book, student_book_entry, student_memory, student_xp_event,
+        concept_progress, infographic_voiceover, local_user, narrative_character,
+        narrative_character_biography, student, student_book, student_book_entry, student_memory,
+        student_xp_event,
     },
     memory,
 };
@@ -25,6 +26,13 @@ use uuid::Uuid;
 const LESSON_STARTED_XP: i32 = 10;
 const STAGEGATE_SUBMITTED_XP: i32 = 10;
 const STAGEGATE_PASSED_XP: i32 = 40;
+
+#[derive(Clone, Debug)]
+pub struct InfographicVoiceoverRecord {
+    pub explanation: Value,
+    pub content_type: String,
+    pub file_path: String,
+}
 
 pub async fn connect_database() -> Result<DatabaseConnection, DbErr> {
     let url = std::env::var("DATABASE_URL")
@@ -107,10 +115,18 @@ pub async fn init_database(db: &DatabaseConnection) -> Result<(), DbErr> {
             student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
             title text NOT NULL,
             status text NOT NULL DEFAULT 'active',
+            active_lesson jsonb,
+            latest_infographic jsonb,
+            latest_stagegate jsonb,
+            latest_answer text,
             created_at timestamptz NOT NULL,
             updated_at timestamptz NOT NULL,
             UNIQUE (student_id)
         )"#,
+        "ALTER TABLE student_books ADD COLUMN IF NOT EXISTS active_lesson jsonb",
+        "ALTER TABLE student_books ADD COLUMN IF NOT EXISTS latest_infographic jsonb",
+        "ALTER TABLE student_books ADD COLUMN IF NOT EXISTS latest_stagegate jsonb",
+        "ALTER TABLE student_books ADD COLUMN IF NOT EXISTS latest_answer text",
         r#"CREATE TABLE IF NOT EXISTS student_book_entries (
             id uuid PRIMARY KEY,
             book_id uuid NOT NULL REFERENCES student_books(id) ON DELETE CASCADE,
@@ -125,6 +141,25 @@ pub async fn init_database(db: &DatabaseConnection) -> Result<(), DbErr> {
         )"#,
         "CREATE INDEX IF NOT EXISTS idx_student_book_entries_student_position ON student_book_entries (student_id, position)",
         "CREATE INDEX IF NOT EXISTS idx_student_book_entries_book_kind_created ON student_book_entries (book_id, entry_kind, created_at DESC)",
+        r#"CREATE TABLE IF NOT EXISTS infographic_voiceovers (
+            id uuid PRIMARY KEY,
+            student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+            cache_key text NOT NULL,
+            topic text NOT NULL,
+            title text,
+            alt text,
+            image_hash text NOT NULL,
+            image_length bigint NOT NULL,
+            explanation jsonb NOT NULL DEFAULT '{}'::jsonb,
+            speech_model text,
+            voice text,
+            content_type text NOT NULL,
+            file_path text NOT NULL,
+            created_at timestamptz NOT NULL,
+            updated_at timestamptz NOT NULL,
+            UNIQUE (student_id, cache_key)
+        )"#,
+        "CREATE INDEX IF NOT EXISTS idx_infographic_voiceovers_student_updated ON infographic_voiceovers (student_id, updated_at DESC)",
         r#"CREATE TABLE IF NOT EXISTS narrative_characters (
             id uuid PRIMARY KEY,
             student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
@@ -515,7 +550,7 @@ pub async fn book_state_for_student(
     book_state_for_book(db, &student, &book).await.map(Some)
 }
 
-pub async fn append_lesson_book_entry(
+pub async fn update_lesson_book_state(
     db: &DatabaseConnection,
     public_id: &str,
     topic: &str,
@@ -524,15 +559,25 @@ pub async fn append_lesson_book_entry(
 ) -> Result<StudentBookState, DbErr> {
     let student = get_or_seed_student_row(db, public_id).await?;
     let book = get_or_create_student_book(db, &student).await?;
-    let entry = append_book_entry(
+    let observed_at = now();
+    let mut active_book: student_book::ActiveModel = book.into();
+    active_book.active_lesson = Set(Some(lesson.clone()));
+    active_book.latest_infographic = Set(None);
+    active_book.latest_stagegate = Set(None);
+    active_book.latest_answer = Set(None);
+    active_book.updated_at = Set(observed_at);
+    let updated_book = active_book.update(db).await?;
+
+    award_xp_event(
         db,
-        &book,
         &student,
-        "lesson",
+        &lesson_xp_event_key(Uuid::new_v4()),
+        LESSON_STARTED_XP,
+        "lesson_started",
         Some(topic),
         lesson.get("stageLevel").and_then(Value::as_str),
         json!({
-            "lesson": lesson.clone(),
+            "bookId": updated_book.id,
             "request": {
                 "topic": request.topic.clone(),
                 "question": request.question.clone()
@@ -540,53 +585,128 @@ pub async fn append_lesson_book_entry(
         }),
     )
     .await?;
-    award_xp_event(
-        db,
-        &student,
-        &lesson_xp_event_key(entry.id),
-        LESSON_STARTED_XP,
-        "lesson_started",
-        Some(topic),
-        lesson.get("stageLevel").and_then(Value::as_str),
-        json!({
-            "bookId": book.id,
-            "bookEntryId": entry.id,
-            "position": entry.position
-        }),
-    )
-    .await?;
 
-    book_state_for_book(db, &student, &book).await
+    book_state_for_book(db, &student, &updated_book).await
 }
 
-pub async fn append_infographic_book_entry(
+pub async fn update_infographic_book_state(
     db: &DatabaseConnection,
     public_id: &str,
-    request: &InfographicRequest,
+    _request: &InfographicRequest,
     artifact: &Value,
 ) -> Result<StudentBookState, DbErr> {
     let student = get_or_seed_student_row(db, public_id).await?;
     let book = get_or_create_student_book(db, &student).await?;
-    append_book_entry(
-        db,
-        &book,
-        &student,
-        "infographic",
-        Some(&request.topic),
-        None,
-        json!({
-            "artifact": artifact.clone(),
-            "request": {
-                "topic": request.topic.clone(),
-                "lessonSummary": request.lesson_summary.clone(),
-                "infographicPrompt": request.infographic_prompt.clone(),
-                "size": request.size.clone()
-            }
-        }),
-    )
-    .await?;
+    let observed_at = now();
+    let mut active_book: student_book::ActiveModel = book.into();
+    active_book.latest_infographic = Set(Some(artifact.clone()));
+    active_book.updated_at = Set(observed_at);
+    let updated_book = active_book.update(db).await?;
 
-    book_state_for_book(db, &student, &book).await
+    book_state_for_book(db, &student, &updated_book).await
+}
+
+pub async fn find_infographic_voiceover(
+    db: &DatabaseConnection,
+    public_id: &str,
+    cache_key: &str,
+) -> Result<Option<InfographicVoiceoverRecord>, DbErr> {
+    let Some(student) = student::Entity::find()
+        .filter(student::Column::PublicId.eq(public_id))
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    let voiceover = infographic_voiceover::Entity::find()
+        .filter(infographic_voiceover::Column::StudentId.eq(student.id))
+        .filter(infographic_voiceover::Column::CacheKey.eq(cache_key))
+        .one(db)
+        .await?;
+
+    Ok(voiceover.map(|voiceover| InfographicVoiceoverRecord {
+        explanation: voiceover.explanation,
+        content_type: voiceover.content_type,
+        file_path: voiceover.file_path,
+    }))
+}
+
+pub async fn save_infographic_voiceover(
+    db: &DatabaseConnection,
+    public_id: &str,
+    request: &InfographicExplanationRequest,
+    cache_key: &str,
+    image_hash: &str,
+    image_length: i64,
+    explanation: &Value,
+    content_type: &str,
+    file_path: &str,
+) -> Result<InfographicVoiceoverRecord, DbErr> {
+    let student = get_or_seed_student_row(db, public_id).await?;
+    let observed_at = now();
+    let existing = infographic_voiceover::Entity::find()
+        .filter(infographic_voiceover::Column::StudentId.eq(student.id))
+        .filter(infographic_voiceover::Column::CacheKey.eq(cache_key))
+        .one(db)
+        .await?;
+
+    let model = match existing {
+        Some(existing) => {
+            let mut active: infographic_voiceover::ActiveModel = existing.into();
+            active.topic = Set(request.topic.clone());
+            active.title = Set(request.title.clone());
+            active.alt = Set(request.alt.clone());
+            active.image_hash = Set(image_hash.to_string());
+            active.image_length = Set(image_length);
+            active.explanation = Set(explanation.clone());
+            active.speech_model = Set(explanation
+                .get("speechModel")
+                .and_then(Value::as_str)
+                .map(ToString::to_string));
+            active.voice = Set(explanation
+                .get("voice")
+                .and_then(Value::as_str)
+                .map(ToString::to_string));
+            active.content_type = Set(content_type.to_string());
+            active.file_path = Set(file_path.to_string());
+            active.updated_at = Set(observed_at);
+            active.update(db).await?
+        }
+        None => {
+            infographic_voiceover::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                student_id: Set(student.id),
+                cache_key: Set(cache_key.to_string()),
+                topic: Set(request.topic.clone()),
+                title: Set(request.title.clone()),
+                alt: Set(request.alt.clone()),
+                image_hash: Set(image_hash.to_string()),
+                image_length: Set(image_length),
+                explanation: Set(explanation.clone()),
+                speech_model: Set(explanation
+                    .get("speechModel")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)),
+                voice: Set(explanation
+                    .get("voice")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)),
+                content_type: Set(content_type.to_string()),
+                file_path: Set(file_path.to_string()),
+                created_at: Set(observed_at),
+                updated_at: Set(observed_at),
+            }
+            .insert(db)
+            .await?
+        }
+    };
+
+    Ok(InfographicVoiceoverRecord {
+        explanation: model.explanation,
+        content_type: model.content_type,
+        file_path: model.file_path,
+    })
 }
 
 pub async fn append_stagegate_book_entry(
@@ -615,8 +735,14 @@ pub async fn append_stagegate_book_entry(
         }),
     )
     .await?;
+    let observed_at = now();
+    let mut active_book: student_book::ActiveModel = book.into();
+    active_book.latest_stagegate = Set(Some(result.clone()));
+    active_book.latest_answer = Set(Some(request.answer.clone()));
+    active_book.updated_at = Set(observed_at);
+    let updated_book = active_book.update(db).await?;
 
-    book_state_for_book(db, &student, &book).await
+    book_state_for_book(db, &student, &updated_book).await
 }
 
 pub async fn reset_student_learning_state(
@@ -650,6 +776,10 @@ pub async fn reset_student_learning_state(
         .await?;
     student_xp_event::Entity::delete_many()
         .filter(student_xp_event::Column::StudentId.eq(student_id))
+        .exec(&tx)
+        .await?;
+    infographic_voiceover::Entity::delete_many()
+        .filter(infographic_voiceover::Column::StudentId.eq(student_id))
         .exec(&tx)
         .await?;
     student_memory::Entity::delete_many()
@@ -950,6 +1080,10 @@ async fn get_or_create_student_book(
         student_id: Set(student.id),
         title: Set(format!("{}'s Primer", student.display_name)),
         status: Set("active".to_string()),
+        active_lesson: Set(None),
+        latest_infographic: Set(None),
+        latest_stagegate: Set(None),
+        latest_answer: Set(None),
         created_at: Set(observed_at),
         updated_at: Set(observed_at),
     }
@@ -1135,50 +1269,75 @@ fn book_state_from_rows(
     book: &student_book::Model,
     rows: Vec<student_book_entry::Model>,
 ) -> StudentBookState {
-    let entries = rows
+    let all_entries = rows
         .into_iter()
         .map(student_book_entry_record)
         .collect::<Vec<_>>();
-    let mut active_lesson = None;
-    let mut latest_infographic = None;
-    let mut latest_stagegate = None;
-    let mut latest_answer = None;
+    let has_current_state = book.active_lesson.is_some()
+        || book.latest_infographic.is_some()
+        || book.latest_stagegate.is_some()
+        || book.latest_answer.is_some();
+    let (active_lesson, latest_infographic, latest_stagegate, latest_answer) = if has_current_state
+    {
+        (
+            book.active_lesson.clone(),
+            book.latest_infographic.clone(),
+            book.latest_stagegate.clone(),
+            book.latest_answer.clone(),
+        )
+    } else {
+        let mut active_lesson = None;
+        let mut latest_infographic = None;
+        let mut latest_stagegate = None;
+        let mut latest_answer = None;
 
-    for entry in &entries {
-        match entry.kind.as_str() {
-            "lesson" => {
-                active_lesson = entry
-                    .payload
-                    .get("lesson")
-                    .cloned()
-                    .or_else(|| Some(entry.payload.clone()));
-                latest_infographic = None;
-                latest_stagegate = None;
-                latest_answer = None;
+        for entry in &all_entries {
+            match entry.kind.as_str() {
+                "lesson" => {
+                    active_lesson = entry
+                        .payload
+                        .get("lesson")
+                        .cloned()
+                        .or_else(|| Some(entry.payload.clone()));
+                    latest_infographic = None;
+                    latest_stagegate = None;
+                    latest_answer = None;
+                }
+                "infographic" => {
+                    latest_infographic = entry
+                        .payload
+                        .get("artifact")
+                        .cloned()
+                        .or_else(|| Some(entry.payload.clone()));
+                }
+                "stagegate" => {
+                    latest_stagegate = entry
+                        .payload
+                        .get("result")
+                        .cloned()
+                        .or_else(|| Some(entry.payload.clone()));
+                    latest_answer = entry
+                        .payload
+                        .get("request")
+                        .and_then(|request| request.get("answer"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                }
+                _ => {}
             }
-            "infographic" => {
-                latest_infographic = entry
-                    .payload
-                    .get("artifact")
-                    .cloned()
-                    .or_else(|| Some(entry.payload.clone()));
-            }
-            "stagegate" => {
-                latest_stagegate = entry
-                    .payload
-                    .get("result")
-                    .cloned()
-                    .or_else(|| Some(entry.payload.clone()));
-                latest_answer = entry
-                    .payload
-                    .get("request")
-                    .and_then(|request| request.get("answer"))
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string);
-            }
-            _ => {}
         }
-    }
+
+        (
+            active_lesson,
+            latest_infographic,
+            latest_stagegate,
+            latest_answer,
+        )
+    };
+    let entries = all_entries
+        .into_iter()
+        .filter(|entry| entry.kind == "stagegate")
+        .collect::<Vec<_>>();
 
     let has_passed_stagegate = latest_stagegate
         .as_ref()
@@ -1845,6 +2004,10 @@ mod tests {
             student_id,
             title: "Mina's Primer".to_string(),
             status: "active".to_string(),
+            active_lesson: None,
+            latest_infographic: None,
+            latest_stagegate: None,
+            latest_answer: None,
             created_at: observed_at,
             updated_at: observed_at,
         };
@@ -1905,7 +2068,8 @@ mod tests {
         let state = book_state_from_rows(&student, &book, rows);
 
         assert_eq!(state.student_id, "student-123");
-        assert_eq!(state.entries.len(), 3);
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].kind, "stagegate");
         assert_eq!(
             state.active_lesson.unwrap()["topic"],
             json!("reef currents")
@@ -1919,5 +2083,88 @@ mod tests {
             state.latest_answer.as_deref(),
             Some("Currents move when forces push water.")
         );
+    }
+
+    #[test]
+    fn current_book_state_keeps_non_stagegate_rows_out_of_the_visible_book() {
+        let observed_at = now();
+        let student_id = Uuid::new_v4();
+        let book_id = Uuid::new_v4();
+        let student = student::Model {
+            id: student_id,
+            public_id: "student-123".to_string(),
+            display_name: "Mina".to_string(),
+            age_years: Some(11),
+            age_band: "11-13".to_string(),
+            biography: Some("Loves tide pools.".to_string()),
+            interests: json!(["marine biology"]),
+            preferred_explanation_style: "visual".to_string(),
+            level_context: "middle school".to_string(),
+            suggested_topics: json!([]),
+            xp_total: 50,
+            created_at: observed_at,
+            updated_at: observed_at,
+        };
+        let book = student_book::Model {
+            id: book_id,
+            student_id,
+            title: "Mina's Primer".to_string(),
+            status: "active".to_string(),
+            active_lesson: Some(json!({
+                "topic": "basketball arcs",
+                "stageLevel": "intuition"
+            })),
+            latest_infographic: None,
+            latest_stagegate: Some(json!({
+                "passed": false,
+                "score": 0.4
+            })),
+            latest_answer: Some("It loops back.".to_string()),
+            created_at: observed_at,
+            updated_at: observed_at,
+        };
+        let rows = vec![
+            student_book_entry::Model {
+                id: Uuid::new_v4(),
+                book_id,
+                student_id,
+                entry_kind: "lesson".to_string(),
+                topic: Some("old lesson".to_string()),
+                stage_level: Some("intuition".to_string()),
+                position: 1,
+                payload: json!({ "lesson": { "topic": "old lesson" } }),
+                created_at: observed_at,
+            },
+            student_book_entry::Model {
+                id: Uuid::new_v4(),
+                book_id,
+                student_id,
+                entry_kind: "stagegate".to_string(),
+                topic: Some("basketball arcs".to_string()),
+                stage_level: Some("intuition".to_string()),
+                position: 2,
+                payload: json!({
+                    "request": {
+                        "answer": "It loops back."
+                    },
+                    "result": {
+                        "passed": false,
+                        "score": 0.4
+                    }
+                }),
+                created_at: observed_at,
+            },
+        ];
+
+        let state = book_state_from_rows(&student, &book, rows);
+
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].kind, "stagegate");
+        assert_eq!(
+            state.active_lesson.unwrap()["topic"],
+            json!("basketball arcs")
+        );
+        assert!(!state.has_passed_stagegate);
+        assert_eq!(state.latest_answer.as_deref(), Some("It loops back."));
     }
 }

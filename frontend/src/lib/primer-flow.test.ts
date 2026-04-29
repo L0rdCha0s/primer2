@@ -259,10 +259,10 @@ describe("memory contract normalization", () => {
 
 describe("persisted book contract normalization", () => {
   test("calculates the end page after persisted book entries", () => {
-    expect(staticBookPageCount).toBe(10);
-    expect(bookEndPageIndex(0)).toBe(9);
-    expect(bookEndPageIndex(1)).toBe(10);
-    expect(bookEndPageIndex(4)).toBe(13);
+    expect(staticBookPageCount).toBe(12);
+    expect(bookEndPageIndex(0)).toBe(11);
+    expect(bookEndPageIndex(1)).toBe(12);
+    expect(bookEndPageIndex(4)).toBe(15);
   });
 
   test("keeps stagegate attempts out of appended content pages", () => {
@@ -274,9 +274,9 @@ describe("persisted book contract normalization", () => {
 
     expect(entries.filter(isBookContentEntry)).toEqual([{ kind: "lesson" }]);
     expect(bookContentEntryCount(entries)).toBe(1);
-    expect(defaultBookPageIndex(entries)).toBe(9);
+    expect(defaultBookPageIndex(entries)).toBe(11);
     expect(defaultBookPageIndex([{ kind: "lesson" }, { kind: "infographic" }]))
-      .toBe(11);
+      .toBe(13);
   });
 
   test("normalizes persisted book entries and latest interaction state", () => {

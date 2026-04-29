@@ -442,21 +442,27 @@ pub async fn graph_for_student(
 }
 
 pub async fn delete_student_graph_projection(
-    conn: &impl ConnectionTrait,
+    db: &DatabaseConnection,
     student_id: Uuid,
 ) -> Result<(), DbErr> {
-    prepare_age(conn).await?;
+    let tx = db.begin().await?;
+    prepare_age(&tx).await?;
+    let cypher = delete_student_graph_projection_sql(student_id);
+    tx.query_all(raw_statement(&cypher)).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+fn delete_student_graph_projection_sql(student_id: Uuid) -> String {
     let query = delete_student_graph_projection_query(student_id);
-    let cypher = format!(
+    format!(
         r#"
         SELECT *
         FROM ag_catalog.cypher({graph}, {query}) AS (deleted ag_catalog.agtype)
         "#,
         graph = sql_string(GRAPH_NAME),
         query = sql_dollar_string(&query),
-    );
-    conn.execute(raw_statement(&cypher)).await?;
-    Ok(())
+    )
 }
 
 fn delete_student_graph_projection_query(student_id: Uuid) -> String {
@@ -1648,5 +1654,16 @@ mod tests {
         assert!(query.contains("WHERE n.student_id = '7854c3af-b0ff-42c8-9854-5bb14a37ea65'"));
         assert!(query.contains("DETACH DELETE n"));
         assert!(!query.contains("MATCH (n {"));
+    }
+
+    #[test]
+    fn graph_projection_delete_sql_uses_qualified_age_symbols() {
+        let sql = delete_student_graph_projection_sql(
+            Uuid::parse_str("7854c3af-b0ff-42c8-9854-5bb14a37ea65").unwrap(),
+        );
+
+        assert!(sql.contains("FROM ag_catalog.cypher('primer_memory'"));
+        assert!(sql.contains("AS (deleted ag_catalog.agtype)"));
+        assert!(sql.contains("WHERE n.student_id = '7854c3af-b0ff-42c8-9854-5bb14a37ea65'"));
     }
 }
