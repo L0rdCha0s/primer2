@@ -9,9 +9,17 @@ export type Stage = {
 
 export type StudentMemory = {
   id: string;
-  type: "preference" | "knowledge" | "misconception" | "interest";
+  type: "preference" | "knowledge" | "misconception" | "interest" | "history";
   content: string;
   tags: string[];
+  assertionId?: string;
+  subject?: string;
+  predicate?: string;
+  validFrom?: string;
+  validTo?: string;
+  knownFrom?: string;
+  knownTo?: string;
+  source?: string;
 };
 
 export type InfographicSpec = {

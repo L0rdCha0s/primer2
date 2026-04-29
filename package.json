@@ -3,10 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "db:up": "docker compose up -d db",
+    "db:migrate": "cargo run --manifest-path backend/migration/Cargo.toml -- up",
     "dev:frontend": "npm --prefix frontend run dev",
-    "dev:backend": "cargo run --manifest-path backend/Cargo.toml",
+    "dev:backend": "./run.sh",
     "build:frontend": "npm --prefix frontend run build",
     "lint:frontend": "npm --prefix frontend run lint",
-    "check:backend": "cargo check --manifest-path backend/Cargo.toml"
+    "check:backend": "cargo check --manifest-path backend/Cargo.toml",
+    "check:migration": "cargo check --manifest-path backend/migration/Cargo.toml"
   }
 }

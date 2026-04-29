@@ -14,6 +14,7 @@ import {
   Feather,
   Leaf,
   Lock,
+  LogOut,
   Map,
   Mic,
   Play,
@@ -24,6 +25,7 @@ import {
   Volume2,
   Waves,
 } from "lucide-react";
+import { AuthGate } from "@/components/AuthGate";
 import HTMLFlipBook from "react-pageflip";
 import {
   type InfographicSpec,
@@ -35,10 +37,19 @@ import {
   seededStagegateResult,
   stages,
   student,
-  themeBible,
   tutorScene,
   unlockedMemory,
 } from "@/lib/demo-data";
+import {
+  type AuthPayload,
+  type AuthSession,
+  type AuthenticatedStudent,
+  authHeaders,
+  apiBaseUrl,
+  clearStoredAuth,
+  readStoredAuth,
+  storeAuth,
+} from "@/lib/auth";
 import {
   type ComponentType,
   type CSSProperties,
@@ -98,11 +109,19 @@ type InfographicArtifact = {
 };
 
 type BackendMemory = {
+  assertionId?: string;
   memory_type?: StudentMemory["type"];
   memoryType?: StudentMemory["type"];
   content?: string;
   confidence?: number;
   tags?: string[];
+  subject?: string;
+  predicate?: string;
+  validFrom?: string;
+  validTo?: string;
+  knownFrom?: string;
+  knownTo?: string;
+  source?: string;
 };
 
 type BookPageProps = {
@@ -154,9 +173,6 @@ const iconMap: Record<
 };
 
 const pageTurnStyle: CSSProperties = {};
-const studentId = "mina-demo";
-const apiBaseUrl =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:4000";
 
 const initialLesson: PrimerLesson = {
   topic: "lightning",
@@ -181,6 +197,10 @@ const initialLesson: PrimerLesson = {
 
 export function PrimerBook() {
   const bookRef = useRef<FlipBookRef | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authenticatedStudent, setAuthenticatedStudent] =
+    useState<AuthenticatedStudent | null>(null);
+  const [session, setSession] = useState<AuthSession | null>(null);
   const [currentPage, setCurrentPage] = useState(0);
   const [topic, setTopic] = useState("lightning");
   const [lesson, setLesson] = useState<PrimerLesson>(initialLesson);
@@ -204,6 +224,37 @@ export function PrimerBook() {
     "I think the important idea is that a hidden cause builds up, then something visible happens when it crosses a limit.",
   );
   const [isNarrating, setIsNarrating] = useState(false);
+  const learnerName = authenticatedStudent?.displayName ?? student.displayName;
+
+  useEffect(() => {
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) {
+        return;
+      }
+
+      const stored = readStoredAuth();
+      if (stored?.student) {
+        setAuthenticatedStudent(stored.student);
+        setSession(stored.session);
+        setRemoteMemories(normalizeMemories(stored.student.memories));
+        if (stored.student.suggestedTopics.length > 0) {
+          setLesson((currentLesson) => ({
+            ...currentLesson,
+            suggestedTopics: stored.student.suggestedTopics,
+          }));
+        }
+        if (stored.student.interests.length > 0) {
+          setTopic(stored.student.interests[0]);
+        }
+      }
+      setAuthChecked(true);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -220,11 +271,17 @@ export function PrimerBook() {
           ...baseMemories,
           {
             ...unlockedMemory,
-            content: `Mina made progress on ${lesson.topic} at the ${lesson.stageLevel} level.`,
+            content: `${learnerName} made progress on ${lesson.topic} at the ${lesson.stageLevel} level.`,
           },
         ]
       : baseMemories;
-  }, [hasPassedStagegate, lesson.stageLevel, lesson.topic, remoteMemories]);
+  }, [
+    hasPassedStagegate,
+    learnerName,
+    lesson.stageLevel,
+    lesson.topic,
+    remoteMemories,
+  ]);
 
   const visibleStages = useMemo<Stage[]>(() => {
     if (!hasPassedStagegate) {
@@ -282,6 +339,10 @@ export function PrimerBook() {
   }
 
   async function startTopic(nextTopic = topic) {
+    if (!authenticatedStudent) {
+      return;
+    }
+
     const cleanTopic = nextTopic.trim();
     if (!cleanTopic) {
       return;
@@ -297,21 +358,31 @@ export function PrimerBook() {
     try {
       const response = await fetch(`${apiBaseUrl}/api/lesson/start`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders(session) },
         body: JSON.stringify({
-          studentId,
+          studentId: authenticatedStudent.studentId,
           topic: cleanTopic,
           question: `I want to explore ${cleanTopic}. Guide me at my current level.`,
         }),
       });
       const payload = await response.json();
+      if (payload.error || !payload.lesson) {
+        setRemoteMemories(normalizeMemories(payload.student?.memories));
+        setLessonStatus(
+          payload.error ?? "The Primer could not generate this lesson yet.",
+        );
+        void loadMemoryProfile(authenticatedStudent, session);
+        return;
+      }
+
       setLesson(normalizeLesson(payload.lesson, cleanTopic));
       setRemoteMemories(normalizeMemories(payload.student?.memories));
       setLessonStatus(
         payload.lesson?.aiMode === "openai_responses"
           ? "Guided by OpenAI Responses."
-          : "Using local fallback until backend/.env has OPENAI_API_KEY.",
+          : "Guided by the Primer.",
       );
+      void loadMemoryProfile(authenticatedStudent, session);
       goToPage(4);
     } catch (error) {
       setLessonStatus(`Could not reach backend: ${String(error)}`);
@@ -319,14 +390,18 @@ export function PrimerBook() {
   }
 
   async function generateInfographic() {
+    if (!authenticatedStudent) {
+      return;
+    }
+
     setInfographicStatus("Calling gpt-image-2 for an infographic...");
 
     try {
       const response = await fetch(`${apiBaseUrl}/api/artifact/infographic`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders(session) },
         body: JSON.stringify({
-          studentId,
+          studentId: authenticatedStudent.studentId,
           topic: lesson.topic,
           lessonSummary: lesson.plainExplanation,
           infographicPrompt: lesson.infographicPrompt,
@@ -348,12 +423,16 @@ export function PrimerBook() {
   }
 
   async function submitStagegate() {
+    if (!authenticatedStudent) {
+      return;
+    }
+
     try {
       const response = await fetch(`${apiBaseUrl}/api/tutor/stagegate`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders(session) },
         body: JSON.stringify({
-          studentId,
+          studentId: authenticatedStudent.studentId,
           topic: lesson.topic,
           answer,
           stageLevel: lesson.stageLevel,
@@ -363,13 +442,89 @@ export function PrimerBook() {
       setStagegateResult(normalizeStagegateResult(payload.result));
       setRemoteMemories(normalizeMemories(payload.student?.memories));
       setHasPassedStagegate(Boolean(payload.result?.passed));
-    } catch {
-      setHasPassedStagegate(true);
-      setStagegateResult(seededStagegateResult);
+      void loadMemoryProfile(authenticatedStudent, session);
+    } catch (error) {
+      setHasPassedStagegate(false);
+      setStagegateResult({
+        ...seededStagegateResult,
+        passed: false,
+        score: 0,
+        rubric: {
+          accuracy: 0,
+          causalReasoning: 0,
+          vocabulary: 0,
+          transfer: 0,
+        },
+        masteryEvidence: [],
+        gaps: ["The backend stagegate assessor was unavailable."],
+        feedbackToStudent: `Could not reach backend: ${String(error)}`,
+      });
     }
 
     window.setTimeout(flipNext, 250);
   }
+
+  function handleAuthenticated(payload: AuthPayload) {
+    if (!payload.student) {
+      return;
+    }
+
+    const studentProfile = payload.student;
+    const nextSession = payload.session ?? null;
+    setAuthenticatedStudent(studentProfile);
+    setSession(nextSession);
+    setRemoteMemories(normalizeMemories(studentProfile.memories));
+    if (studentProfile.suggestedTopics.length > 0) {
+      setLesson((currentLesson) => ({
+        ...currentLesson,
+        suggestedTopics: studentProfile.suggestedTopics,
+      }));
+    }
+    if (studentProfile.interests.length > 0) {
+      setTopic(studentProfile.interests[0]);
+    }
+    setMemoryProfileStatus("Loading memory graph...");
+    storeAuth({ student: studentProfile, session: nextSession });
+    void loadMemoryProfile(studentProfile, nextSession);
+  }
+
+  function handleLogout() {
+    clearStoredAuth();
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+    setAuthenticatedStudent(null);
+    setSession(null);
+    setRemoteMemories(null);
+    setMemoryProfile(null);
+    setMemoryProfileStatus("Loading memory graph...");
+    setCurrentPage(0);
+    setTopic("lightning");
+    setLesson(initialLesson);
+    setHasAsked(false);
+    setHasGeneratedInfographic(false);
+    setHasPassedStagegate(false);
+    setInfographicArtifact(null);
+    setLessonStatus("Choose a topic and ask the Primer.");
+    setInfographicStatus("No generated infographic yet.");
+  }
+
+  if (!authChecked) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-[#111515] text-stone-100">
+        <div className="inline-flex items-center gap-2 text-sm uppercase text-cyan-50/70">
+          <BookOpen className="h-4 w-4" />
+          Opening PrimerLab
+        </div>
+      </main>
+    );
+  }
+
+  if (!authenticatedStudent) {
+    return <AuthGate onAuthenticated={handleAuthenticated} />;
+  }
+
+  const learner = authenticatedStudent;
 
   return (
     <main className="min-h-screen overflow-hidden bg-[#111515] text-stone-100">
@@ -383,12 +538,22 @@ export function PrimerBook() {
               PrimerLab student view
             </p>
             <h1 className="mt-1 text-2xl font-semibold text-stone-50 sm:text-3xl">
-              Mina&apos;s Clockwork Reef Primer
+              {learner.displayName}&apos;s Clockwork Reef Primer
             </h1>
           </div>
-          <div className="flex items-center gap-2 rounded-full border border-cyan-100/15 bg-cyan-50/10 px-3 py-2 text-sm text-cyan-50 shadow-2xl shadow-black/20">
-            <BookOpen className="h-4 w-4" />
-            <span>Real book mode</span>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-2 rounded-full border border-cyan-100/15 bg-cyan-50/10 px-3 py-2 text-sm text-cyan-50 shadow-2xl shadow-black/20">
+              <BookOpen className="h-4 w-4" />
+              <span>Real book mode</span>
+            </div>
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="inline-flex h-10 items-center gap-2 rounded-full border border-cyan-100/15 bg-black/18 px-3 text-sm text-cyan-50/78 transition hover:text-cyan-50"
+            >
+              <LogOut className="h-4 w-4" />
+              Sign out
+            </button>
           </div>
         </header>
 
@@ -426,11 +591,11 @@ export function PrimerBook() {
                 }
               >
                 <BookPage density="hard" tone="cover">
-                  <CoverPage />
+                  <CoverPage learner={learner} />
                 </BookPage>
 
                 <BookPage pageNumber={1}>
-                  <WelcomePage memories={visibleMemories} />
+                  <WelcomePage learner={learner} memories={visibleMemories} />
                 </BookPage>
 
                 <BookPage pageNumber={2}>
@@ -519,9 +684,13 @@ export function PrimerBook() {
           </section>
 
           <aside className="flex flex-col gap-4 rounded-[8px] border border-cyan-100/10 bg-[#0d1414]/76 p-4 shadow-2xl shadow-black/30">
+            <StudentProfilePanel learner={learner} />
             <ProgressPanel stages={visibleStages} />
             <MemoryPanel memories={visibleMemories} />
-            <ContinuityPanel />
+            <ContinuityPanel
+              profile={memoryProfile}
+              status={memoryProfileStatus}
+            />
           </aside>
         </div>
       </div>
@@ -529,7 +698,7 @@ export function PrimerBook() {
   );
 }
 
-function CoverPage() {
+function CoverPage({ learner }: { learner: AuthenticatedStudent }) {
   return (
     <div className="flex h-full flex-col justify-between text-stone-50">
       <div>
@@ -541,8 +710,8 @@ function CoverPage() {
           The Clockwork Reef
         </h2>
         <p className="mt-5 max-w-xs text-base leading-7 text-cyan-50/78">
-          A living lesson book for Mina, where charged pearls, storm gates, and
-          reef currents explain electricity.
+          A living lesson book for {learner.displayName}, where interests steer
+          examples, gates, and the next thing to explore.
         </p>
       </div>
 
@@ -560,16 +729,26 @@ function CoverPage() {
   );
 }
 
-function WelcomePage({ memories: currentMemories }: { memories: StudentMemory[] }) {
+function WelcomePage({
+  learner,
+  memories: currentMemories,
+}: {
+  learner: AuthenticatedStudent;
+  memories: StudentMemory[];
+}) {
+  const interestText =
+    learner.interests.length > 0
+      ? learner.interests.join(", ")
+      : "visual puzzles, ocean analogies, and sketchable explanations";
+
   return (
     <div className="flex h-full flex-col">
       <Kicker icon={Compass}>Welcome back</Kicker>
       <h2 className="mt-4 text-4xl font-semibold leading-tight text-stone-950">
-        Welcome back, {student.displayName}.
+        Welcome back, {learner.displayName}.
       </h2>
       <p className="mt-4 text-lg leading-8 text-stone-700">
-        The Reef remembers that you like visual puzzles, ocean analogies, and
-        explanations you can sketch.
+        The Reef remembers what you care about: {interestText}.
       </p>
 
       <div className="mt-7 space-y-3">
@@ -591,7 +770,9 @@ function WelcomePage({ memories: currentMemories }: { memories: StudentMemory[] 
 
       <div className="mt-7 rounded-[8px] bg-[#173b3b] p-4 text-stone-50">
         <p className="text-xs uppercase text-cyan-100/75">Today&apos;s quest</p>
-        <p className="mt-2 text-xl font-semibold">{student.activeQuest}</p>
+        <p className="mt-2 text-xl font-semibold">
+          Connect the next lesson to {learner.interests[0] ?? "your interests"}.
+        </p>
       </div>
     </div>
   );
@@ -1025,6 +1206,37 @@ function UnlockPage({
   );
 }
 
+function StudentProfilePanel({ learner }: { learner: AuthenticatedStudent }) {
+  return (
+    <section className="rounded-[8px] border border-cyan-100/10 bg-cyan-50/6 px-3 py-3">
+      <h3 className="text-sm font-semibold uppercase text-cyan-50/80">
+        Student profile
+      </h3>
+      <div className="mt-3 flex items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-stone-100">
+            {learner.displayName}
+          </p>
+          <p className="mt-1 text-xs text-stone-400">
+            Age {learner.age ?? learner.ageBand}
+          </p>
+        </div>
+        <StatusBadge status="available" />
+      </div>
+      <div className="mt-3 flex flex-wrap gap-2">
+        {learner.interests.map((interest) => (
+          <span
+            key={interest}
+            className="rounded-full border border-[#d8b86a]/35 px-2.5 py-1 text-xs text-[#f4d98e]"
+          >
+            {interest}
+          </span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function ProgressPanel({ stages: currentStages }: { stages: Stage[] }) {
   return (
     <section>
@@ -1067,6 +1279,12 @@ function MemoryPanel({ memories: currentMemories }: { memories: StudentMemory[] 
             <p className="mt-1 text-sm leading-6 text-stone-200">
               {memory.content}
             </p>
+            {memory.predicate || memory.knownFrom ? (
+              <p className="mt-2 text-[11px] uppercase text-stone-500">
+                {memory.predicate ? memory.predicate.replaceAll("_", " ") : null}
+                {memory.knownFrom ? ` · known ${formatMemoryDate(memory.knownFrom)}` : null}
+              </p>
+            ) : null}
           </div>
         ))}
       </div>
@@ -1074,19 +1292,48 @@ function MemoryPanel({ memories: currentMemories }: { memories: StudentMemory[] 
   );
 }
 
-function ContinuityPanel() {
+function ContinuityPanel({
+  profile,
+  status,
+}: {
+  profile: StudentMemoryProfile | null;
+  status: string;
+}) {
   return (
     <section className="mt-auto rounded-[8px] border border-cyan-100/10 bg-black/18 p-3">
       <h3 className="text-sm font-semibold uppercase text-cyan-50/80">
-        Theme bible
+        Memory graph
       </h3>
-      <p className="mt-2 text-sm leading-6 text-stone-300">
-        {themeBible.worldSummary}
-      </p>
-      <p className="mt-3 text-xs uppercase text-stone-500">Guide</p>
-      <p className="mt-1 text-sm text-stone-200">
-        {themeBible.guide.name}, {themeBible.guide.role}
-      </p>
+      <p className="mt-2 text-xs uppercase text-stone-500">{status}</p>
+      {profile ? (
+        <>
+          <p className="mt-2 text-sm text-stone-200">
+            {profile.entity.canonicalName} · {profile.subjectFacts.length} facts
+          </p>
+          <div className="mt-3 space-y-2">
+            {profile.timeline.slice(0, 3).map((fact) => (
+              <div key={fact.assertionId} className="border-l border-cyan-100/20 pl-3">
+                <p className="text-xs uppercase text-[#d8b86a]">
+                  {fact.predicate.replaceAll("_", " ")}
+                </p>
+                <p className="mt-1 text-sm leading-5 text-stone-300">
+                  {fact.content}
+                </p>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : (
+        <>
+          <p className="mt-2 text-sm leading-6 text-stone-300">
+            {themeBible.worldSummary}
+          </p>
+          <p className="mt-3 text-xs uppercase text-stone-500">Guide</p>
+          <p className="mt-1 text-sm text-stone-200">
+            {themeBible.guide.name}, {themeBible.guide.role}
+          </p>
+        </>
+      )}
     </section>
   );
 }
@@ -1225,23 +1472,108 @@ function normalizeMemories(value: unknown): StudentMemory[] | null {
   }
 
   const normalized = value
-    .map((item, index) => {
+    .map((item, index): StudentMemory | null => {
       const memory = asRecord(item) as BackendMemory | null;
       const content = memory?.content;
       if (!content) {
         return null;
       }
 
-      return {
-        id: `${content}-${index}`,
+      const normalizedMemory: StudentMemory = {
+        id: memory.assertionId ?? `${content}-${index}`,
         type: memory.memory_type ?? memory.memoryType ?? "knowledge",
         content,
         tags: Array.isArray(memory.tags) ? memory.tags : [],
-      } satisfies StudentMemory;
+        assertionId: memory.assertionId,
+        subject: memory.subject,
+        predicate: memory.predicate,
+        validFrom: memory.validFrom,
+        validTo: memory.validTo,
+        knownFrom: memory.knownFrom,
+        knownTo: memory.knownTo,
+        source: memory.source,
+      };
+      return normalizedMemory;
     })
     .filter((memory): memory is StudentMemory => memory !== null);
 
   return normalized.length > 0 ? normalized : null;
+}
+
+function normalizeMemoryProfile(
+  value: unknown,
+  learner: Pick<AuthenticatedStudent, "displayName" | "studentId">,
+): StudentMemoryProfile | null {
+  const record = asRecord(value);
+  const entity = asRecord(record?.entity);
+  if (!record || !entity) {
+    return null;
+  }
+
+  const profile = {
+    entity: {
+      entityId: stringField(entity, "entityId") ?? "",
+      kind: stringField(entity, "kind") ?? "student",
+      canonicalName: stringField(entity, "canonicalName") ?? learner.displayName,
+      identityKey: stringField(entity, "identityKey") ?? learner.studentId,
+    },
+    subjectFacts: normalizeMemoryAssertions(record.subjectFacts, learner.displayName),
+    inboundFacts: normalizeMemoryAssertions(record.inboundFacts, learner.displayName),
+    timeline: normalizeMemoryAssertions(record.timeline, learner.displayName),
+    validAsOf: stringField(record, "validAsOf") ?? "",
+    knownAsOf: stringField(record, "knownAsOf") ?? "",
+  } satisfies StudentMemoryProfile;
+
+  return profile.entity.entityId ? profile : null;
+}
+
+function normalizeMemoryAssertions(
+  value: unknown,
+  fallbackSubject: string,
+): MemoryAssertionRecord[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item): MemoryAssertionRecord | null => {
+      const record = asRecord(item);
+      const assertionId = stringField(record, "assertionId");
+      const predicate = stringField(record, "predicate");
+      const content = stringField(record, "content");
+      if (!assertionId || !predicate || !content) {
+        return null;
+      }
+
+      return {
+        assertionId,
+        subject: stringField(record, "subject") ?? fallbackSubject,
+        predicate,
+        object: stringField(record, "object"),
+        content,
+        memoryType: stringField(record, "memoryType") ?? "knowledge",
+        confidence: numberField(record, "confidence") ?? 0,
+        salience: numberField(record, "salience") ?? 0,
+        tags: stringArrayField(record, "tags") ?? [],
+        validFrom: stringField(record, "validFrom"),
+        knownFrom: stringField(record, "knownFrom"),
+        observedAt: stringField(record, "observedAt") ?? "",
+        source: stringField(record, "source"),
+      };
+    })
+    .filter((item): item is MemoryAssertionRecord => item !== null);
+}
+
+function formatMemoryDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "recently";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+  }).format(date);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

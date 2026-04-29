@@ -1,41 +1,70 @@
 # PrimerLab
 
-PrimerLab is a hackathon MVP for an adaptive story tutor inspired by The Primer. The app is split into two deployable parts:
+PrimerLab is a hackathon MVP for an adaptive story tutor inspired by The Primer.
 
 - `frontend/`: Next.js App Router, TypeScript, Tailwind, `react-pageflip`
-- `backend/`: Rust API scaffold using Poem
+- `backend/`: Rust API using Poem, SeaORM, and Postgres
+- `docker/postgres/`: Postgres 16 image with pgvector and Apache AGE
 
-## Run Locally
+## Local Infrastructure
 
-Frontend:
+Start Postgres:
 
 ```bash
-npm --prefix frontend run dev
+docker compose up -d db
 ```
 
-Backend:
+The database is exposed at `127.0.0.1:5432` with:
+
+```text
+DATABASE_URL=postgres://primerlab:primerlab@127.0.0.1:5432/primerlab
+```
+
+The Docker image is based on `pgvector/pgvector:pg16`, builds Apache AGE into the image, and initializes:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS age;
+SELECT create_graph('primer_memory');
+```
+
+## Backend
+
+Copy or edit `backend/.env`:
+
+```bash
+OPENAI_API_KEY=
+OPENAI_TEXT_MODEL=gpt-5.5
+OPENAI_IMAGE_MODEL=gpt-image-2
+BIND_ADDR=127.0.0.1:4000
+DATABASE_URL=postgres://primerlab:primerlab@127.0.0.1:5432/primerlab
+```
+
+Run migrations:
+
+```bash
+cargo run --manifest-path backend/migration/Cargo.toml -- up
+```
+
+Run the API:
 
 ```bash
 cargo run --manifest-path backend/Cargo.toml
 ```
 
-The backend binds to `127.0.0.1:4000` by default. Override it with:
+Or start Postgres, wait for it, migrate, and run the API:
 
 ```bash
-BIND_ADDR=127.0.0.1:4100 cargo run --manifest-path backend/Cargo.toml
+./run.sh
 ```
 
-## OpenAI Configuration
-
-Put the API key in `backend/.env`:
+## Frontend
 
 ```bash
-OPENAI_API_KEY=sk-...
-OPENAI_TEXT_MODEL=gpt-5.5
-OPENAI_IMAGE_MODEL=gpt-image-2
+npm --prefix frontend run dev
 ```
 
-The backend loads `backend/.env`, calls the Responses API for lesson guidance and stagegate grading, and calls the image generation API with `gpt-image-2` for infographics. Per-student progress is stored locally in `backend/data/students.json` by default.
+The frontend expects the API at `http://127.0.0.1:4000` unless `NEXT_PUBLIC_API_BASE_URL` is set.
 
 ## Verification
 
@@ -43,4 +72,5 @@ The backend loads `backend/.env`, calls the Responses API for lesson guidance an
 npm --prefix frontend run lint
 npm --prefix frontend run build
 cargo check --manifest-path backend/Cargo.toml
+cargo check --manifest-path backend/migration/Cargo.toml
 ```

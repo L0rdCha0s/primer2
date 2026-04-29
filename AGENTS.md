@@ -12,7 +12,7 @@ We are building PrimerLab, a hackathon MVP for an adaptive story-driven tutor in
 - Run frontend commands from `frontend/` or with `npm --prefix frontend`.
 - The primary student surface is a real-book style `react-pageflip` view.
 - Render lesson text, memory state, stagegates, and infographics inside book pages.
-- Use deterministic React/HTML/SVG for infographic text instead of generated images.
+- Infographic generation is a backend tool call using OpenAI image generation (`gpt-image-2`) with graceful fallback if no key is present.
 - Keep demo seed data in `frontend/src/lib/demo-data.ts`.
 - This repo uses a current Next.js version. Before changing framework behavior, read the relevant local docs in `frontend/node_modules/next/dist/docs/`.
 
@@ -23,15 +23,20 @@ We are building PrimerLab, a hackathon MVP for an adaptive story-driven tutor in
 - Return typed or schema-stable JSON. The demo path must keep working without live AI credentials.
 - Do not expose OpenAI API keys to frontend code.
 - Load OpenAI credentials from `backend/.env`.
+- Start local infrastructure with `docker compose up -d db` or `./run.sh`.
+- PostgreSQL must have `vector` and `age` extensions available; Docker builds a Postgres 16 image from `pgvector/pgvector:pg16` and compiles Apache AGE.
+- Use SeaORM for student/auth/memory/progress persistence.
+- Use the migration crate at `backend/migration` for schema changes.
 - Use OpenAI Responses API for topic guidance, adaptive communication, memory-aware lesson planning, and stagegate grading.
 - Use the image generation API with `gpt-image-2` for generated infographic artifacts.
-- Persist per-student progress/memory in the backend. The local MVP store is `backend/data/students.json`.
+- Persist per-student progress/memory in Postgres; do not reintroduce JSON-file persistence for learner state.
 
 ## Done When
 
 - `npm --prefix frontend run lint` passes.
 - `npm --prefix frontend run build` passes.
 - `cargo check --manifest-path backend/Cargo.toml` passes.
+- `cargo check --manifest-path backend/migration/Cargo.toml` passes.
 - Main demo path works: load Mina, page through the book, view the lightning infographic, submit the stagegate, and see Level 2 unlock.
 
 ## Not Negotiable
