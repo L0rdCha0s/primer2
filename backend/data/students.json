@@ -1,0 +1,49 @@
+{
+  "students": {
+    "mina-demo": {
+      "student_id": "mina-demo",
+      "display_name": "Mina",
+      "age_band": "11-13",
+      "interests": ["marine biology", "drawing", "puzzles"],
+      "preferred_explanation_style": "visual, story-first, ocean-current analogies",
+      "level_context": "early middle-school science",
+      "memories": [
+        {
+          "memory_type": "preference",
+          "content": "Learner likes visual puzzles and diagram-first explanations.",
+          "confidence": 0.9,
+          "tags": ["style", "visual"]
+        },
+        {
+          "memory_type": "preference",
+          "content": "Ocean-current analogies help the learner compare invisible forces.",
+          "confidence": 0.84,
+          "tags": ["analogy", "electricity"]
+        },
+        {
+          "memory_type": "misconception",
+          "content": "Learner may confuse voltage with current.",
+          "confidence": 0.74,
+          "tags": ["electricity", "misconception"]
+        }
+      ],
+      "progress": [
+        {
+          "topic": "energy",
+          "level": "intuition",
+          "mastery_score": 0.81,
+          "status": "passed",
+          "evidence": ["Passed Energy: Intuition in the seeded demo state."],
+          "updated_at_epoch": 0
+        }
+      ],
+      "suggested_topics": [
+        "lightning",
+        "coral reef ecosystems",
+        "fractions through music",
+        "photosynthesis"
+      ],
+      "updated_at_epoch": 0
+    }
+  }
+}
