@@ -1,5 +1,6 @@
 use crate::domain::{
-    InfographicRequest, LessonStartRequest, NarrationRequest, StagegateRequest, StudentRecord,
+    InfographicRequest, LessonStartRequest, NarrationRequest, NarrativeCharacter, StagegateRequest,
+    StudentRecord,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
@@ -34,6 +35,18 @@ impl OpenAiClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests(api_key: Option<&str>) -> Self {
+        Self {
+            api_key: api_key.map(ToString::to_string),
+            http: reqwest::Client::new(),
+            image_model: "gpt-image-2".to_string(),
+            speech_model: "gpt-4o-mini-tts".to_string(),
+            speech_voice: "fable".to_string(),
+            text_model: "gpt-5.5".to_string(),
+        }
+    }
+
     pub fn has_api_key(&self) -> bool {
         self.api_key.is_some()
     }
@@ -57,31 +70,50 @@ impl OpenAiClient {
     pub async fn guide_lesson(
         &self,
         student: &StudentRecord,
+        narrative_characters: &[NarrativeCharacter],
         request: &LessonStartRequest,
     ) -> Result<Value, String> {
         let Some(api_key) = self.api_key.as_deref() else {
-            return Err(
-                "OpenAI API key is required to generate adaptive lessons. Set OPENAI_API_KEY in backend/.env.".to_string(),
-            );
+            return Ok(profile_bootstrap_lesson(
+                student,
+                narrative_characters,
+                request,
+                "missing_openai_api_key",
+                &self.text_model,
+            ));
         };
 
-        let system_prompt = r#"You are PrimerLab, an adaptive educational story tutor.
+        let system_prompt = r#"You are Primer, an adaptive educational story tutor.
 
 You decide how to guide the learner, but only use memory and progress for educational personalization.
 Keep the lesson age-appropriate, accurate, concise, and stage-gated.
-Let the learner choose topics, then shape the path using their memories, current mastery, and level.
+If the user did not request a concrete topic, choose the most engaging starting point from the signup biography, interests, age band, memories, and progress.
 If this is the learner's first lesson, use the signup biography as the primary personalization source for the opening topic, examples, story motif, communication style, and stagegate prompt.
+When you choose the opening topic, set `topic` to a concrete concept or question that can be taught now; do not return a vague label like "personalized lesson".
+Use supplied narrativeCharacters when they fit the topic. Preserve their names, roles, biography facts, voice, relationships, and visual motifs exactly unless the lesson itself adds a new compatible detail.
+Prefer reusing a relevant existing character over introducing a new one. Only introduce or update characters that appear in storyScene.
+Return narrativeCharacters as the complete list of characters used or materially updated by this lesson. Do not include the learner as a narrative character.
 Prefer interaction context from the student's question over canned curriculum. Ask the next useful check-for-understanding question inside the lesson.
 Do not invent memories. Do not store sensitive personal data.
 Return only JSON that matches the provided schema."#;
 
+        let requested_topic = clean_optional(request.topic.as_deref());
+        let is_first_lesson = student.progress.is_empty();
+        let should_choose_starting_point = requested_topic.is_none() || is_first_lesson;
         let user_payload = json!({
             "student": student,
             "signupBiography": student.biography.clone(),
-            "isFirstLesson": student.progress.is_empty(),
-            "requestedTopic": request.topic,
+            "narrativeCharacters": narrative_characters,
+            "characterPolicy": {
+                "reuseRule": "Use relevant stored character biographies to keep recurring story characters consistent across lessons.",
+                "updateRule": "When a character appears, return an updated biography that preserves stable facts and adds only lesson-derived changes.",
+                "retrievalHint": "Choose characters whose topicAffinities, role, currentBiography, or lastSeenTopic fit the requested topic."
+            },
+            "isFirstLesson": is_first_lesson,
+            "shouldChooseStartingPointFromProfile": should_choose_starting_point,
+            "requestedTopic": requested_topic,
             "studentQuestion": request.question,
-            "task": "Respond to the student's interaction, choose the right learning level, teach the requested topic through the persistent story world, recommend next topics, create a stagegate prompt, and create an image-generation prompt for an infographic. For the first lesson, ground the story and examples in the signup biography without adding facts that are not present."
+            "task": "Create the student's opening engagement path. If requestedTopic is absent or this is the first lesson, select the best starting concept from the signup biography and interests. Teach through a coherent story frame, recommend next topics, create a stagegate prompt, and create an image-generation prompt for an infographic. Ground personalization in supplied profile facts only."
         });
 
         self.responses_json(
@@ -111,7 +143,7 @@ Return only JSON that matches the provided schema."#;
             );
         };
 
-        let system_prompt = r#"You are PrimerLab's stagegate assessor.
+        let system_prompt = r#"You are Primer's stagegate assessor.
 
 Grade fairly against the rubric. Do not pass vague answers.
 Use the learner's memory and progress only to choose helpful feedback.
@@ -346,6 +378,163 @@ Return only JSON that matches the provided schema."#;
     }
 }
 
+fn clean_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn profile_bootstrap_lesson(
+    student: &StudentRecord,
+    narrative_characters: &[NarrativeCharacter],
+    request: &LessonStartRequest,
+    ai_mode: &str,
+    model: &str,
+) -> Value {
+    let topic = starter_topic(student, request);
+    let anchor = starter_anchor(student);
+    let biography = student
+        .biography
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("the learner's signup profile");
+    let suggestions = suggested_starter_topics(student, &topic);
+    let character_scene = narrative_characters
+        .first()
+        .map(|character| {
+            format!(
+                "{character_name} returns with the same role and biography already established for this learner: {biography}",
+                character_name = character.name.as_str(),
+                biography = character.current_biography.as_str()
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "{name} opens the Primer to a page built from their signup profile.",
+                name = student.display_name
+            )
+        });
+    let used_characters = narrative_characters
+        .first()
+        .map(|character| {
+            json!({
+                "name": character.name.clone(),
+                "role": character.role.as_deref().unwrap_or("recurring story guide"),
+                "biography": character.current_biography.clone(),
+                "topicAffinities": character.topic_affinities.clone(),
+                "consistencyNotes": character.consistency_notes.clone(),
+                "usedInScene": true,
+                "revisionNote": "Reused by the local fallback lesson generator without changing established biography."
+            })
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    json!({
+        "topic": topic,
+        "stageLevel": "intuition",
+        "communicationStyle": format!(
+            "Visual, story-first explanations anchored in {anchor}, with short checks before adding detail."
+        ),
+        "storyScene": format!(
+            "{character_scene} The page chooses {anchor} as the doorway, then turns one visible pattern from that profile detail into a question that can be tested, sketched, and explained."
+        ),
+        "plainExplanation": format!(
+            "A useful first lesson starts with something the learner already cares about. From the biography: {biography}. The Primer turns that into a concrete concept, asks what changes, what stays the same, and what cause might explain the pattern."
+        ),
+        "analogy": format!(
+            "Treat {anchor} like a map: first notice landmarks, then draw arrows between causes and effects, then test whether the arrows explain what happens next."
+        ),
+        "checkForUnderstanding": format!(
+            "What is one pattern you notice in {anchor}, and what cause might explain it?"
+        ),
+        "suggestedTopics": suggestions,
+        "stagegatePrompt": format!(
+            "Explain the core idea behind {anchor} in your own words, then connect it to one detail from your biography or interests."
+        ),
+        "infographicPrompt": format!(
+            "Create an age-appropriate infographic for {name} about {anchor}. Use only profile-grounded motifs, clear labels, a simple cause-and-effect flow, and no tiny text.",
+            name = student.display_name
+        ),
+        "keyTerms": [
+            {
+                "term": "Observation",
+                "definition": "Something you can notice, describe, or measure."
+            },
+            {
+                "term": "Pattern",
+                "definition": "A repeated relationship that helps predict what may happen next."
+            },
+            {
+                "term": "Model",
+                "definition": "A simplified explanation of how causes connect to effects."
+            }
+        ],
+        "narrativeCharacters": used_characters,
+        "aiMode": ai_mode,
+        "model": model
+    })
+}
+
+fn starter_topic(student: &StudentRecord, request: &LessonStartRequest) -> String {
+    if let Some(topic) = clean_optional(request.topic.as_deref()) {
+        return topic;
+    }
+
+    match student.interests.first() {
+        Some(interest) => format!("patterns and causes in {interest}"),
+        None => "patterns and causes from your biography".to_string(),
+    }
+}
+
+fn starter_anchor(student: &StudentRecord) -> String {
+    student
+        .interests
+        .first()
+        .cloned()
+        .or_else(|| {
+            student
+                .biography
+                .as_deref()
+                .and_then(|bio| bio.split(|ch| matches!(ch, '.' | ',' | ';')).next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "the learner's interests".to_string())
+}
+
+fn suggested_starter_topics(student: &StudentRecord, current_topic: &str) -> Vec<String> {
+    let mut topics = Vec::new();
+    push_unique_topic(&mut topics, current_topic.to_string());
+    for topic in &student.suggested_topics {
+        push_unique_topic(&mut topics, topic.clone());
+    }
+    for interest in &student.interests {
+        push_unique_topic(&mut topics, format!("systems inside {interest}"));
+        push_unique_topic(&mut topics, format!("evidence and patterns in {interest}"));
+    }
+    for fallback in [
+        "cause and effect in everyday systems",
+        "building models from observations",
+        "how evidence changes an explanation",
+    ] {
+        push_unique_topic(&mut topics, fallback.to_string());
+    }
+    topics.truncate(5);
+    topics
+}
+
+fn push_unique_topic(topics: &mut Vec<String>, topic: String) {
+    let clean = topic.trim();
+    if clean.is_empty() || topics.iter().any(|item| item.eq_ignore_ascii_case(clean)) {
+        return;
+    }
+    topics.push(clean.to_string());
+}
+
 fn trim_speech_input(text: &str) -> String {
     text.trim()
         .chars()
@@ -413,7 +602,8 @@ fn lesson_schema() -> Value {
             "suggestedTopics",
             "stagegatePrompt",
             "infographicPrompt",
-            "keyTerms"
+            "keyTerms",
+            "narrativeCharacters"
         ],
         "properties": {
             "topic": { "type": "string" },
@@ -442,6 +632,40 @@ fn lesson_schema() -> Value {
                     "properties": {
                         "term": { "type": "string" },
                         "definition": { "type": "string" }
+                    }
+                }
+            },
+            "narrativeCharacters": {
+                "type": "array",
+                "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "name",
+                        "role",
+                        "biography",
+                        "topicAffinities",
+                        "consistencyNotes",
+                        "usedInScene",
+                        "revisionNote"
+                    ],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "role": { "type": "string" },
+                        "biography": { "type": "string" },
+                        "topicAffinities": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": { "type": "string" }
+                        },
+                        "consistencyNotes": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": { "type": "string" }
+                        },
+                        "usedInScene": { "type": "boolean" },
+                        "revisionNote": { "type": "string" }
                     }
                 }
             }
@@ -503,4 +727,212 @@ fn stagegate_schema() -> Value {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{ConceptProgress, StudentMemory};
+
+    fn student_record() -> StudentRecord {
+        StudentRecord {
+            student_id: "student-123".to_string(),
+            display_name: "Mina".to_string(),
+            age: Some(12),
+            age_band: "11-13".to_string(),
+            biography: Some(
+                "Mina loves marine biology, drawing diagrams, and puzzles.".to_string(),
+            ),
+            interests: vec!["marine biology".to_string(), "drawing".to_string()],
+            preferred_explanation_style: "visual".to_string(),
+            level_context: "early middle-school science".to_string(),
+            memories: vec![StudentMemory {
+                assertion_id: Some("memory-1".to_string()),
+                memory_type: "preference".to_string(),
+                content: "Learner likes diagram-first explanations.".to_string(),
+                confidence: 0.9,
+                tags: vec!["style".to_string(), "visual".to_string()],
+                subject: Some("Mina".to_string()),
+                predicate: Some("prefers".to_string()),
+                valid_from: None,
+                valid_to: None,
+                known_from: None,
+                known_to: None,
+                source: Some("test".to_string()),
+            }],
+            progress: vec![ConceptProgress {
+                topic: "energy".to_string(),
+                level: "intuition".to_string(),
+                mastery_score: 0.81,
+                status: "passed".to_string(),
+                evidence: vec!["Passed Energy: Intuition.".to_string()],
+            }],
+            suggested_topics: vec!["coral reef systems".to_string()],
+        }
+    }
+
+    #[test]
+    fn infographic_prompt_uses_profile_and_memory_context() {
+        let student = student_record();
+        let prompt = build_infographic_prompt(
+            &student,
+            &InfographicRequest {
+                student_id: Some(student.student_id.clone()),
+                topic: "lightning".to_string(),
+                lesson_summary: Some("charges separate and move suddenly".to_string()),
+                infographic_prompt: None,
+                size: None,
+            },
+        );
+
+        assert!(prompt.contains("Topic: lightning"));
+        assert!(prompt.contains("charges separate and move suddenly"));
+        assert!(prompt.contains("Mina loves marine biology"));
+        assert!(prompt.contains("Learner likes diagram-first explanations"));
+        assert!(!prompt.contains("gpt-image-2"));
+    }
+
+    #[tokio::test]
+    async fn guide_lesson_without_key_returns_profile_bootstrap_lesson() {
+        let client = OpenAiClient::for_tests(None);
+        let student = student_record();
+        let lesson = client
+            .guide_lesson(
+                &student,
+                &LessonStartRequest {
+                    student_id: Some(student.student_id.clone()),
+                    topic: None,
+                    question: Some("Choose a first lesson.".to_string()),
+                },
+            )
+            .await
+            .expect("fallback lesson should be available without credentials");
+
+        assert_eq!(lesson["aiMode"], "missing_openai_api_key");
+        assert_eq!(lesson["stageLevel"], "intuition");
+        assert_eq!(lesson["topic"], "patterns and causes in marine biology");
+        assert_eq!(lesson["keyTerms"].as_array().unwrap().len(), 3);
+        assert!(
+            lesson["stagegatePrompt"]
+                .as_str()
+                .unwrap()
+                .contains("marine biology")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_topic_survives_profile_bootstrap_lesson() {
+        let client = OpenAiClient::for_tests(None);
+        let student = student_record();
+        let lesson = client
+            .guide_lesson(
+                &student,
+                &LessonStartRequest {
+                    student_id: Some(student.student_id.clone()),
+                    topic: Some(" lightning ".to_string()),
+                    question: None,
+                },
+            )
+            .await
+            .expect("fallback lesson should be available without credentials");
+
+        assert_eq!(lesson["topic"], "lightning");
+        assert!(
+            lesson["suggestedTopics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|topic| topic == "lightning")
+        );
+    }
+
+    #[tokio::test]
+    async fn media_tools_return_schema_stable_fallbacks_without_key() {
+        let client = OpenAiClient::for_tests(None);
+        let student = student_record();
+        let infographic = client
+            .generate_infographic(
+                &student,
+                &InfographicRequest {
+                    student_id: Some(student.student_id.clone()),
+                    topic: "reef currents".to_string(),
+                    lesson_summary: None,
+                    infographic_prompt: Some("Show arrows and labels.".to_string()),
+                    size: Some("1024x1024".to_string()),
+                },
+            )
+            .await
+            .expect("infographic fallback should be successful");
+        let narration = client
+            .generate_narration(&NarrationRequest {
+                student_id: Some(student.student_id.clone()),
+                topic: Some("reef currents".to_string()),
+                text: "Tell the story.".to_string(),
+                instructions: None,
+            })
+            .await
+            .expect("narration fallback should be successful");
+
+        assert_eq!(infographic["aiMode"], "missing_openai_api_key");
+        assert_eq!(infographic["generated"], false);
+        assert!(
+            infographic["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("Show arrows and labels")
+        );
+        assert_eq!(narration["aiMode"], "missing_openai_api_key");
+        assert_eq!(narration["generated"], false);
+        assert_eq!(narration["voice"], "fable");
+    }
+
+    #[tokio::test]
+    async fn stagegate_grading_requires_openai_key() {
+        let client = OpenAiClient::for_tests(None);
+        let student = student_record();
+        let error = client
+            .grade_stagegate(
+                &student,
+                &StagegateRequest {
+                    student_id: Some(student.student_id.clone()),
+                    topic: "lightning".to_string(),
+                    answer: "Charges separate and then move.".to_string(),
+                    stage_level: Some("intuition".to_string()),
+                },
+            )
+            .await
+            .expect_err("stagegate grading should not invent a pass without credentials");
+
+        assert!(error.contains("OpenAI API key is required to grade stagegates"));
+    }
+
+    #[test]
+    fn extracts_response_text_from_supported_payload_shapes() {
+        assert_eq!(
+            extract_response_text(&json!({ "output_text": "{\"ok\":true}" })),
+            Some("{\"ok\":true}".to_string())
+        );
+        assert_eq!(
+            extract_response_text(&json!({
+                "output": [
+                    {
+                        "content": [
+                            { "type": "output_text", "text": "{\"lesson\":\"ready\"}" }
+                        ]
+                    }
+                ]
+            })),
+            Some("{\"lesson\":\"ready\"}".to_string())
+        );
+        assert_eq!(extract_response_text(&json!({ "output": [] })), None);
+    }
+
+    #[test]
+    fn speech_input_is_trimmed_and_limited_by_characters() {
+        let input = format!("  {}  ", "a".repeat(OPENAI_SPEECH_INPUT_LIMIT + 20));
+        let trimmed = trim_speech_input(&input);
+
+        assert_eq!(trimmed.chars().count(), OPENAI_SPEECH_INPUT_LIMIT);
+        assert!(trimmed.chars().all(|ch| ch == 'a'));
+    }
 }

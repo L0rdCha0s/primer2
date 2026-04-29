@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "PrimerLab",
+  title: "Primer",
   description: "Adaptive story tutor prototype with a page-flipping book view.",
 };
 

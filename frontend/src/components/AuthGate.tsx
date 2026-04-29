@@ -83,7 +83,7 @@ export function AuthGate({ onAuthenticated }: AuthGateProps) {
         <div className="mb-7 text-center">
           <div className="inline-flex items-center gap-2 text-xs uppercase text-cyan-50/78">
             <BookOpen className="h-3.5 w-3.5" />
-            PrimerLab
+            Primer
           </div>
           <h1 className="mt-4 text-3xl font-semibold leading-tight text-stone-50">
             {isSignup ? "Create student profile" : "Welcome back"}

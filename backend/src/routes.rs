@@ -122,8 +122,25 @@ async fn start_lesson_impl(state: &AppState, request: LessonStartRequest) -> Val
         Ok(student) => student,
         Err(error) => return json!({ "error": error.to_string() }),
     };
+    let character_lookup_topic = request.topic.as_deref().or(request.question.as_deref());
+    let narrative_characters =
+        match db::relevant_narrative_characters(&state.db, &student_id, character_lookup_topic)
+            .await
+        {
+            Ok(characters) => characters,
+            Err(error) => {
+                println!(
+                    "[primerlab-api] character lookup failed for student={student_id}: {error}"
+                );
+                Vec::new()
+            }
+        };
 
-    let lesson = match state.openai.guide_lesson(&student, &request).await {
+    let lesson = match state
+        .openai
+        .guide_lesson(&student, &narrative_characters, &request)
+        .await
+    {
         Ok(lesson) => lesson,
         Err(error) => {
             return json!({
@@ -136,9 +153,13 @@ async fn start_lesson_impl(state: &AppState, request: LessonStartRequest) -> Val
         }
     };
 
+    let lesson_topic = lesson
+        .get("topic")
+        .and_then(Value::as_str)
+        .or(request.topic.as_deref())
+        .unwrap_or("personalized starting point");
     let updated_student =
-        match db::update_progress_after_lesson(&state.db, &student_id, &request.topic, &lesson)
-            .await
+        match db::update_progress_after_lesson(&state.db, &student_id, lesson_topic, &lesson).await
         {
             Ok(student) => student,
             Err(_) => student,

@@ -1,9 +1,12 @@
 use crate::{
     domain::{
-        ConceptProgress, DEFAULT_STUDENT_PUBLIC_ID, RegisterRequest, StagegateRequest,
-        StudentMemory, StudentRecord,
+        ConceptProgress, NarrativeCharacter, RegisterRequest, StagegateRequest, StudentMemory,
+        StudentRecord,
     },
-    entities::{concept_progress, local_user, student, student_memory},
+    entities::{
+        concept_progress, local_user, narrative_character, narrative_character_biography, student,
+        student_memory,
+    },
     memory,
 };
 use argon2::{
@@ -13,7 +16,7 @@ use argon2::{
 use chrono::{DateTime, FixedOffset, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend, DbErr,
-    EntityTrait, QueryFilter, Set, Statement,
+    EntityTrait, QueryFilter, QueryOrder, Set, Statement,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -80,6 +83,36 @@ pub async fn init_database(db: &DatabaseConnection) -> Result<(), DbErr> {
             updated_at timestamptz NOT NULL,
             UNIQUE (student_id, topic, level)
         )"#,
+        r#"CREATE TABLE IF NOT EXISTS narrative_characters (
+            id uuid PRIMARY KEY,
+            student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+            name text NOT NULL,
+            normalized_name text NOT NULL,
+            role text,
+            current_biography text NOT NULL,
+            topic_affinities jsonb NOT NULL DEFAULT '[]'::jsonb,
+            consistency_notes jsonb NOT NULL DEFAULT '[]'::jsonb,
+            status text NOT NULL DEFAULT 'active',
+            introduced_at timestamptz NOT NULL,
+            last_seen_at timestamptz NOT NULL,
+            last_seen_topic text,
+            created_at timestamptz NOT NULL,
+            updated_at timestamptz NOT NULL,
+            UNIQUE (student_id, normalized_name)
+        )"#,
+        "CREATE INDEX IF NOT EXISTS idx_narrative_characters_student_seen ON narrative_characters (student_id, last_seen_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_narrative_characters_topic_affinities ON narrative_characters USING gin (topic_affinities)",
+        r#"CREATE TABLE IF NOT EXISTS narrative_character_biographies (
+            id uuid PRIMARY KEY,
+            character_id uuid NOT NULL REFERENCES narrative_characters(id) ON DELETE CASCADE,
+            student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+            biography text NOT NULL,
+            source_topic text,
+            revision_note text,
+            created_at timestamptz NOT NULL
+        )"#,
+        "CREATE INDEX IF NOT EXISTS idx_narrative_character_bios_character_created ON narrative_character_biographies (character_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_narrative_character_bios_student_created ON narrative_character_biographies (student_id, created_at DESC)",
     ] {
         db.execute(Statement::from_string(DbBackend::Postgres, sql.to_string()))
             .await?;
@@ -88,63 +121,6 @@ pub async fn init_database(db: &DatabaseConnection) -> Result<(), DbErr> {
     memory::init_schema(db).await?;
 
     Ok(())
-}
-
-pub async fn seed_demo_student(db: &DatabaseConnection) -> Result<StudentRecord, DbErr> {
-    let student = get_or_create_student(
-        db,
-        DEFAULT_STUDENT_PUBLIC_ID,
-        "Mina",
-        Some(12),
-        "11-13",
-        Some("Mina is curious about the ocean, likes drawing careful diagrams, and enjoys puzzle-like explanations that reveal hidden mechanisms.".to_string()),
-        vec![
-            "marine biology".to_string(),
-            "drawing".to_string(),
-            "puzzles".to_string(),
-        ],
-    )
-    .await?;
-
-    seed_memory(
-        db,
-        &student,
-        "preference",
-        "Learner likes visual puzzles and diagram-first explanations.",
-        0.9,
-        json!(["style", "visual"]),
-    )
-    .await?;
-    seed_memory(
-        db,
-        &student,
-        "preference",
-        "Ocean-current analogies help the learner compare invisible forces.",
-        0.84,
-        json!(["analogy", "electricity"]),
-    )
-    .await?;
-    seed_memory(
-        db,
-        &student,
-        "misconception",
-        "Learner may confuse voltage with current.",
-        0.74,
-        json!(["electricity", "misconception"]),
-    )
-    .await?;
-    seed_progress(
-        db,
-        student.id,
-        "energy",
-        "intuition",
-        0.81,
-        "passed",
-        json!(["Passed Energy: Intuition in the seeded demo state."]),
-    )
-    .await?;
-
-    student_record(db, &student).await
 }
 
 pub async fn list_students(db: &DatabaseConnection) -> Result<Vec<StudentRecord>, DbErr> {
@@ -178,7 +154,8 @@ pub async fn get_or_seed_student(
         return Ok(student);
     }
 
-    let row = get_or_create_student(db, public_id, "Mina", None, "11-13", None, vec![]).await?;
+    let row =
+        get_or_create_student(db, public_id, "Guest learner", None, "11-13", None, vec![]).await?;
     student_record(db, &row).await
 }
 
@@ -203,11 +180,11 @@ pub async fn register_local_user(
     let public_id = format!("student-{}", Uuid::new_v4());
     let age_years = validate_signup_age(request.age)?;
     let biography = clean_biography(request.biography).ok_or_else(|| {
-        "Add a short student biography so PrimerLab can guide the first lesson.".to_string()
+        "Add a short student biography so Primer can guide the first lesson.".to_string()
     })?;
     let interests = clean_interests(request.interests);
     if interests.is_empty() {
-        return Err("Add at least one interest so PrimerLab can personalize lessons.".to_string());
+        return Err("Add at least one interest so Primer can personalize lessons.".to_string());
     }
     let display_name = request
         .display_name
@@ -364,6 +341,7 @@ pub async fn update_progress_after_lesson(
     }
 
     memory::record_lesson_started(db, &student, topic, lesson).await?;
+    upsert_lesson_characters_for_student(db, &student, topic, lesson).await?;
 
     student_record(db, &get_or_seed_student_row(db, public_id).await?).await
 }
@@ -454,6 +432,224 @@ pub async fn update_progress_after_stagegate(
     student_record(db, &student).await
 }
 
+pub async fn relevant_narrative_characters(
+    db: &DatabaseConnection,
+    public_id: &str,
+    topic: Option<&str>,
+) -> Result<Vec<NarrativeCharacter>, DbErr> {
+    let student = get_or_seed_student_row(db, public_id).await?;
+    relevant_narrative_characters_for_student(db, &student, topic).await
+}
+
+async fn relevant_narrative_characters_for_student(
+    db: &DatabaseConnection,
+    student: &student::Model,
+    topic: Option<&str>,
+) -> Result<Vec<NarrativeCharacter>, DbErr> {
+    let rows = narrative_character::Entity::find()
+        .filter(narrative_character::Column::StudentId.eq(student.id))
+        .filter(narrative_character::Column::Status.eq("active"))
+        .order_by_desc(narrative_character::Column::LastSeenAt)
+        .all(db)
+        .await?;
+    let terms = topic_terms(topic);
+    let mut scored_rows = rows
+        .into_iter()
+        .map(|row| (character_relevance_score(&row, &terms), row))
+        .collect::<Vec<_>>();
+
+    scored_rows.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.last_seen_at.cmp(&left.1.last_seen_at))
+            .then_with(|| left.1.name.cmp(&right.1.name))
+    });
+
+    let has_topic_match = !terms.is_empty() && scored_rows.iter().any(|(score, _)| *score > 0);
+    Ok(scored_rows
+        .into_iter()
+        .filter(|(score, _)| !has_topic_match || *score > 0)
+        .take(4)
+        .map(|(_, row)| narrative_character_record(row))
+        .collect())
+}
+
+async fn upsert_lesson_characters_for_student(
+    db: &DatabaseConnection,
+    student: &student::Model,
+    topic: &str,
+    lesson: &Value,
+) -> Result<(), DbErr> {
+    let Some(characters) = lesson.get("narrativeCharacters").and_then(Value::as_array) else {
+        return Ok(());
+    };
+
+    for character in characters {
+        if character
+            .get("usedInScene")
+            .and_then(Value::as_bool)
+            .is_some_and(|used| !used)
+        {
+            continue;
+        }
+
+        let Some(name) = clean_character_text(character.get("name").and_then(Value::as_str), 80)
+        else {
+            continue;
+        };
+        let normalized_name = normalize_character_name(&name);
+        if normalized_name.is_empty()
+            || normalized_name == normalize_character_name(&student.display_name)
+            || matches!(normalized_name.as_str(), "student" | "learner" | "you")
+        {
+            continue;
+        }
+
+        let Some(biography) =
+            clean_character_text(character.get("biography").and_then(Value::as_str), 1600)
+        else {
+            continue;
+        };
+        let role = clean_character_text(character.get("role").and_then(Value::as_str), 120);
+        let mut topic_affinities = clean_character_array(character.get("topicAffinities"), 10, 80);
+        push_unique_clean_string(&mut topic_affinities, topic, 80);
+        let consistency_notes = clean_character_array(character.get("consistencyNotes"), 10, 200);
+        let revision_note =
+            clean_character_text(character.get("revisionNote").and_then(Value::as_str), 240);
+
+        upsert_narrative_character(
+            db,
+            student,
+            &name,
+            &normalized_name,
+            role,
+            &biography,
+            topic_affinities,
+            consistency_notes,
+            topic,
+            revision_note,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn upsert_narrative_character(
+    db: &DatabaseConnection,
+    student: &student::Model,
+    name: &str,
+    normalized_name: &str,
+    role: Option<String>,
+    biography: &str,
+    topic_affinities: Vec<String>,
+    consistency_notes: Vec<String>,
+    topic: &str,
+    revision_note: Option<String>,
+) -> Result<(), DbErr> {
+    let observed_at = now();
+    let existing = narrative_character::Entity::find()
+        .filter(narrative_character::Column::StudentId.eq(student.id))
+        .filter(narrative_character::Column::NormalizedName.eq(normalized_name))
+        .one(db)
+        .await?;
+
+    match existing {
+        Some(row) => {
+            let character_id = row.id;
+            let bio_changed = row.current_biography.trim() != biography.trim();
+            let next_role = role.or_else(|| row.role.clone());
+            let merged_topic_affinities =
+                merge_character_arrays(row.topic_affinities.clone(), topic_affinities, 12);
+            let merged_consistency_notes =
+                merge_character_arrays(row.consistency_notes.clone(), consistency_notes, 12);
+            let mut active: narrative_character::ActiveModel = row.into();
+            active.name = Set(name.to_string());
+            active.role = Set(next_role);
+            active.current_biography = Set(biography.to_string());
+            active.topic_affinities = Set(json!(merged_topic_affinities));
+            active.consistency_notes = Set(json!(merged_consistency_notes));
+            active.status = Set("active".to_string());
+            active.last_seen_at = Set(observed_at);
+            active.last_seen_topic = Set(Some(topic.to_string()));
+            active.updated_at = Set(observed_at);
+            active.update(db).await?;
+
+            if bio_changed {
+                insert_character_biography(
+                    db,
+                    character_id,
+                    student.id,
+                    biography,
+                    Some(topic),
+                    revision_note.as_deref(),
+                    observed_at,
+                )
+                .await?;
+            }
+        }
+        None => {
+            let character_id = Uuid::new_v4();
+            narrative_character::ActiveModel {
+                id: Set(character_id),
+                student_id: Set(student.id),
+                name: Set(name.to_string()),
+                normalized_name: Set(normalized_name.to_string()),
+                role: Set(role),
+                current_biography: Set(biography.to_string()),
+                topic_affinities: Set(json!(topic_affinities)),
+                consistency_notes: Set(json!(consistency_notes)),
+                status: Set("active".to_string()),
+                introduced_at: Set(observed_at),
+                last_seen_at: Set(observed_at),
+                last_seen_topic: Set(Some(topic.to_string())),
+                created_at: Set(observed_at),
+                updated_at: Set(observed_at),
+            }
+            .insert(db)
+            .await?;
+
+            insert_character_biography(
+                db,
+                character_id,
+                student.id,
+                biography,
+                Some(topic),
+                revision_note.as_deref(),
+                observed_at,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn insert_character_biography(
+    db: &DatabaseConnection,
+    character_id: Uuid,
+    student_id: Uuid,
+    biography: &str,
+    source_topic: Option<&str>,
+    revision_note: Option<&str>,
+    created_at: DateTime<FixedOffset>,
+) -> Result<(), DbErr> {
+    narrative_character_biography::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        character_id: Set(character_id),
+        student_id: Set(student_id),
+        biography: Set(biography.to_string()),
+        source_topic: Set(source_topic.map(ToString::to_string)),
+        revision_note: Set(revision_note.map(ToString::to_string)),
+        created_at: Set(created_at),
+    }
+    .insert(db)
+    .await?;
+
+    Ok(())
+}
+
 async fn get_or_create_student(
     db: &DatabaseConnection,
     public_id: &str,
@@ -513,7 +709,7 @@ async fn get_or_seed_student_row(
     {
         return Ok(row);
     }
-    get_or_create_student(db, public_id, "Mina", None, "11-13", None, vec![]).await
+    get_or_create_student(db, public_id, "Guest learner", None, "11-13", None, vec![]).await
 }
 
 async fn seed_memory(
@@ -534,42 +730,6 @@ async fn seed_memory(
         &format!("student-memory:{}:{content}", student.public_id),
     )
     .await
-}
-
-async fn seed_progress(
-    db: &DatabaseConnection,
-    student_id: Uuid,
-    topic: &str,
-    level: &str,
-    mastery_score: f64,
-    status: &str,
-    evidence: Value,
-) -> Result<(), DbErr> {
-    if concept_progress::Entity::find()
-        .filter(concept_progress::Column::StudentId.eq(student_id))
-        .filter(concept_progress::Column::Topic.eq(topic))
-        .filter(concept_progress::Column::Level.eq(level))
-        .one(db)
-        .await?
-        .is_some()
-    {
-        return Ok(());
-    }
-
-    concept_progress::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        student_id: Set(student_id),
-        topic: Set(topic.to_string()),
-        level: Set(level.to_string()),
-        mastery_score: Set(mastery_score),
-        status: Set(status.to_string()),
-        evidence: Set(evidence),
-        updated_at: Set(now()),
-    }
-    .insert(db)
-    .await?;
-
-    Ok(())
 }
 
 async fn student_record(
@@ -658,7 +818,7 @@ fn validate_signup_age(age: Option<u8>) -> Result<Option<u8>, String> {
         return Err("Age is required.".to_string());
     };
     if !(5..=18).contains(&age) {
-        return Err("Age must be between 5 and 18 for this student demo.".to_string());
+        return Err("Age must be between 5 and 18 for this student profile.".to_string());
     }
 
     Ok(Some(age))
@@ -727,7 +887,7 @@ fn level_context_for_age(age: Option<u8>, age_band: &str) -> String {
 
 fn preferred_style_for_interests(interests: &[String]) -> String {
     if interests.is_empty() {
-        return "visual, story-first, ocean-current analogies".to_string();
+        return "visual, story-first explanations".to_string();
     }
 
     format!(
@@ -738,10 +898,10 @@ fn preferred_style_for_interests(interests: &[String]) -> String {
 
 fn suggested_topics_for_interests(interests: &[String]) -> Vec<String> {
     let defaults = [
-        "lightning",
-        "coral reef ecosystems",
-        "fractions through music",
-        "photosynthesis",
+        "cause and effect in everyday systems",
+        "building models from observations",
+        "how evidence changes an explanation",
+        "patterns that predict what happens next",
     ];
     let mut topics: Vec<String> = interests
         .iter()
@@ -788,6 +948,245 @@ fn string_array(value: Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn narrative_character_record(character: narrative_character::Model) -> NarrativeCharacter {
+    NarrativeCharacter {
+        character_id: character.id.to_string(),
+        name: character.name,
+        role: character.role,
+        current_biography: character.current_biography,
+        topic_affinities: string_array(character.topic_affinities),
+        consistency_notes: string_array(character.consistency_notes),
+        introduced_at: character.introduced_at.to_rfc3339(),
+        last_seen_at: character.last_seen_at.to_rfc3339(),
+        last_seen_topic: character.last_seen_topic,
+    }
+}
+
+fn character_relevance_score(character: &narrative_character::Model, terms: &[String]) -> i32 {
+    if terms.is_empty() {
+        return 1;
+    }
+
+    let topic_affinities = string_array(character.topic_affinities.clone());
+    let haystack = format!(
+        "{} {} {} {} {}",
+        character.name,
+        character.role.as_deref().unwrap_or_default(),
+        character.current_biography,
+        topic_affinities.join(" "),
+        character.last_seen_topic.as_deref().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+
+    terms
+        .iter()
+        .map(|term| {
+            let affinity_score = topic_affinities
+                .iter()
+                .filter(|affinity| affinity.to_ascii_lowercase().contains(term))
+                .count() as i32
+                * 3;
+            let text_score = if haystack.contains(term) { 1 } else { 0 };
+            affinity_score + text_score
+        })
+        .sum()
+}
+
+fn topic_terms(topic: Option<&str>) -> Vec<String> {
+    let mut terms = Vec::new();
+    for term in topic
+        .unwrap_or_default()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(|term| term.trim().to_ascii_lowercase())
+        .filter(|term| term.len() >= 3)
+    {
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+fn clean_character_text(value: Option<&str>, max_chars: usize) -> Option<String> {
+    let text = value?
+        .trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        return None;
+    }
+
+    Some(text.chars().take(max_chars).collect())
+}
+
+fn clean_character_array(value: Option<&Value>, max_items: usize, max_chars: usize) -> Vec<String> {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut output = Vec::new();
+    for item in items {
+        let Some(text) = clean_character_text(item.as_str(), max_chars) else {
+            continue;
+        };
+        push_unique_string(&mut output, text);
+        if output.len() >= max_items {
+            break;
+        }
+    }
+    output
+}
+
+fn merge_character_arrays(existing: Value, incoming: Vec<String>, max_items: usize) -> Vec<String> {
+    let mut merged = string_array(existing)
+        .into_iter()
+        .filter_map(|item| clean_character_text(Some(&item), 200))
+        .collect::<Vec<_>>();
+
+    for item in incoming {
+        push_unique_string(&mut merged, item);
+        if merged.len() >= max_items {
+            break;
+        }
+    }
+
+    merged
+}
+
+fn push_unique_clean_string(items: &mut Vec<String>, value: &str, max_chars: usize) {
+    if let Some(clean) = clean_character_text(Some(value), max_chars) {
+        push_unique_string(items, clean);
+    }
+}
+
+fn push_unique_string(items: &mut Vec<String>, value: String) {
+    if value.trim().is_empty() || items.iter().any(|item| item.eq_ignore_ascii_case(&value)) {
+        return;
+    }
+    items.push(value);
+}
+
+fn normalize_character_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 fn now() -> DateTime<FixedOffset> {
     Utc::now().fixed_offset()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signup_age_validation_requires_supported_student_age() {
+        assert_eq!(validate_signup_age(Some(5)).unwrap(), Some(5));
+        assert_eq!(validate_signup_age(Some(18)).unwrap(), Some(18));
+        assert_eq!(validate_signup_age(None).unwrap_err(), "Age is required.");
+        assert_eq!(
+            validate_signup_age(Some(4)).unwrap_err(),
+            "Age must be between 5 and 18 for this student profile."
+        );
+        assert_eq!(
+            validate_signup_age(Some(19)).unwrap_err(),
+            "Age must be between 5 and 18 for this student profile."
+        );
+    }
+
+    #[test]
+    fn profile_text_cleaners_trim_dedupe_and_bound_inputs() {
+        let long_interest = "x".repeat(80);
+        let interests = clean_interests(vec![
+            " marine biology, drawing ,, Marine Biology ".to_string(),
+            long_interest,
+            "puzzles".to_string(),
+        ]);
+
+        assert_eq!(interests.len(), 4);
+        assert_eq!(interests[0], "marine biology");
+        assert_eq!(interests[1], "drawing");
+        assert_eq!(interests[2].chars().count(), 48);
+        assert_eq!(interests[3], "puzzles");
+
+        assert_eq!(
+            clean_biography(Some("  Loves   tide pools\nand machines.  ".to_string())).unwrap(),
+            "Loves tide pools and machines."
+        );
+        assert_eq!(clean_biography(Some("   ".to_string())), None);
+        assert_eq!(
+            clean_biography(Some("a".repeat(1300)))
+                .unwrap()
+                .chars()
+                .count(),
+            1200
+        );
+    }
+
+    #[test]
+    fn profile_defaults_create_age_and_interest_sensitive_learning_context() {
+        assert_eq!(age_band_for_age(Some(6)), "5-7");
+        assert_eq!(age_band_for_age(Some(12)), "11-13");
+        assert_eq!(age_band_for_age(None), "11-13");
+        assert_eq!(
+            level_context_for_age(Some(15), "14-18"),
+            "high-school learner"
+        );
+        assert_eq!(level_context_for_age(None, "custom"), "custom learner");
+
+        let interests = vec!["marine biology".to_string(), "drawing".to_string()];
+        assert_eq!(
+            preferred_style_for_interests(&interests),
+            "visual, story-first explanations anchored in marine biology and drawing"
+        );
+        assert_eq!(
+            suggested_topics_for_interests(&interests),
+            vec![
+                "science in marine biology",
+                "science in drawing",
+                "cause and effect in everyday systems",
+                "building models from observations",
+            ]
+        );
+    }
+
+    #[test]
+    fn password_hashes_verify_only_the_original_secret() {
+        let hash = hash_password("correct horse battery staple").unwrap();
+
+        assert_ne!(hash, "correct horse battery staple");
+        assert!(verify_password("correct horse battery staple", &hash).unwrap());
+        assert!(!verify_password("wrong password", &hash).unwrap());
+    }
+
+    #[test]
+    fn character_helpers_normalize_topics_and_arrays_for_memory_updates() {
+        assert_eq!(
+            topic_terms(Some("Marine-biology, marine biology, AI!")),
+            vec!["marine", "biology"]
+        );
+        assert_eq!(
+            clean_character_text(Some("  Tala   the reef guide  "), 12).unwrap(),
+            "Tala the ree"
+        );
+        assert_eq!(
+            clean_character_array(
+                Some(&json!([" Tala ", "", 42, "Tala", "Storm guide"])),
+                4,
+                20,
+            ),
+            vec!["Tala", "Storm guide"]
+        );
+        assert_eq!(
+            merge_character_arrays(json!(["Tala", "Reef guide"]), vec![
+                "tala".to_string(),
+                "Storm guide".to_string(),
+            ], 3),
+            vec!["Tala", "Reef guide", "Storm guide"]
+        );
+    }
 }

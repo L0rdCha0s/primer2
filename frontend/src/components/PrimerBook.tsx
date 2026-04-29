@@ -40,19 +40,6 @@ import {
 import { AuthGate } from "@/components/AuthGate";
 import HTMLFlipBook from "react-pageflip";
 import {
-  type InfographicSpec,
-  type Stage,
-  type StagegateResult,
-  type StudentMemory,
-  lightningInfographic,
-  memories,
-  seededStagegateResult,
-  stages,
-  student,
-  tutorScene,
-  unlockedMemory,
-} from "@/lib/demo-data";
-import {
   type AuthPayload,
   type AuthSession,
   type AuthenticatedStudent,
@@ -63,9 +50,30 @@ import {
   storeAuth,
 } from "@/lib/auth";
 import {
+  type LessonStartPayload,
+  type MemoryGraphNodeRecord,
+  type PrimerLesson,
+  type Stage,
+  type StagegateResult,
+  type StudentMemory,
+  type StudentMemoryGraph,
+  buildLessonStartBody,
+  emptyStagegateResult,
+  firstTopicHint,
+  initialLesson,
+  mergeMemoryGraph,
+  normalizeLesson,
+  normalizeMemoryGraph,
+  normalizeMemories,
+  normalizeStagegateResult,
+  stagesForStagegate,
+} from "@/lib/primer-flow";
+import {
   type ComponentType,
   type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
   type ReactNode,
+  type TouchEvent as ReactTouchEvent,
   forwardRef,
   useEffect,
   useMemo,
@@ -91,25 +99,6 @@ type PageFlipEvent<T> = {
   data: T;
 };
 
-type PrimerLesson = {
-  topic: string;
-  stageLevel: "intuition" | "mechanism" | "transfer";
-  communicationStyle: string;
-  storyScene: string;
-  plainExplanation: string;
-  analogy: string;
-  checkForUnderstanding: string;
-  suggestedTopics: string[];
-  stagegatePrompt: string;
-  infographicPrompt: string;
-  keyTerms: Array<{
-    term: string;
-    definition: string;
-  }>;
-  aiMode?: string;
-  model?: string;
-};
-
 type InfographicArtifact = {
   aiMode?: string;
   generated?: boolean;
@@ -129,57 +118,6 @@ type NarrationPayload = {
   message?: string;
   model?: string;
   voice?: string;
-};
-
-type BackendMemory = {
-  assertionId?: string;
-  memory_type?: StudentMemory["type"];
-  memoryType?: StudentMemory["type"];
-  content?: string;
-  confidence?: number;
-  tags?: string[];
-  subject?: string;
-  predicate?: string;
-  validFrom?: string;
-  validTo?: string;
-  knownFrom?: string;
-  knownTo?: string;
-  source?: string;
-};
-
-type MemoryGraphNodeRecord = {
-  id: string;
-  nodeType: string;
-  kind: string;
-  label: string;
-  summary?: string | null;
-  expanded: boolean;
-  factCount: number;
-};
-
-type MemoryGraphEdgeRecord = {
-  id: string;
-  source: string;
-  target: string;
-  label: string;
-  assertionId: string;
-  predicate: string;
-  content: string;
-  memoryType: string;
-  confidence: number;
-  observedAt: string;
-  validFrom?: string | null;
-  knownFrom?: string | null;
-};
-
-type StudentMemoryGraph = {
-  studentId: string;
-  rootNodeId: string;
-  selectedNodeId: string;
-  nodes: MemoryGraphNodeRecord[];
-  edges: MemoryGraphEdgeRecord[];
-  validAsOf: string;
-  knownAsOf: string;
 };
 
 type MemoryNodeData = Record<string, unknown> & {
@@ -221,7 +159,7 @@ const BookPage = forwardRef<HTMLDivElement, BookPageProps>(
           {children}
           {typeof pageNumber === "number" ? (
             <div className="mt-auto flex items-center justify-between border-t border-stone-300/70 pt-3 text-[11px] uppercase text-stone-500">
-              <span>The Clockwork Reef</span>
+              <span>Primer</span>
               <span>{pageNumber}</span>
             </div>
           ) : null}
@@ -233,44 +171,40 @@ const BookPage = forwardRef<HTMLDivElement, BookPageProps>(
 
 BookPage.displayName = "BookPage";
 
-const iconMap: Record<
-  InfographicSpec["panels"][number]["icon"],
-  ComponentType<{ className?: string; strokeWidth?: number }>
-> = {
-  atom: Atom,
-  bolt: Bolt,
-  brain: Brain,
-  cloud: Cloud,
-  gear: Cog,
-  leaf: Leaf,
-  magnifier: Search,
-  map: MapIcon,
-  spark: Sparkles,
-  water: Waves,
+type PageFlipGestureEvent =
+  | ReactMouseEvent<HTMLElement>
+  | ReactTouchEvent<HTMLElement>;
+
+function stopPageFlipGesture(event: PageFlipGestureEvent) {
+  event.stopPropagation();
+}
+
+const pageFlipInteractiveHandlers = {
+  onMouseDownCapture: stopPageFlipGesture,
+  onTouchStartCapture: stopPageFlipGesture,
 };
 
 const pageTurnStyle: CSSProperties = {};
 
-const initialLesson: PrimerLesson = {
-  topic: "lightning",
-  stageLevel: "intuition",
-  communicationStyle: "Visual, story-first, ocean-current analogies.",
-  storyScene: tutorScene.storyScene,
-  plainExplanation: tutorScene.plainExplanation,
-  analogy: tutorScene.analogy,
-  checkForUnderstanding: tutorScene.check,
-  suggestedTopics: [
-    "coral reef ecosystems",
-    "fractions through music",
-    "photosynthesis",
-    "magnetism",
-  ],
-  stagegatePrompt:
-    "Explain the most important idea in your own words, then connect it to one new example.",
-  infographicPrompt:
-    "Create an age-appropriate Clockwork Reef infographic explaining lightning.",
-  keyTerms: lightningInfographic.keyTerms,
-};
+const termIcons = [Atom, Sparkles, Cog, Brain, MapIcon, Leaf, Search];
+
+async function requestLessonStart(
+  learner: AuthenticatedStudent,
+  session: AuthSession | null,
+  nextTopic?: string,
+  signal?: AbortSignal,
+): Promise<LessonStartPayload> {
+  const body = buildLessonStartBody(learner, nextTopic);
+
+  const response = await fetch(`${apiBaseUrl}/api/lesson/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders(session) },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  return (await response.json()) as LessonStartPayload;
+}
 
 async function fetchStudentMemoryGraph(
   learner: AuthenticatedStudent,
@@ -297,12 +231,13 @@ async function fetchStudentMemoryGraph(
 export function PrimerBook() {
   const bookRef = useRef<FlipBookRef | null>(null);
   const narrationAudioRef = useRef<HTMLAudioElement | null>(null);
+  const bootstrappedStudentIdRef = useRef<string | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [authenticatedStudent, setAuthenticatedStudent] =
     useState<AuthenticatedStudent | null>(null);
   const [session, setSession] = useState<AuthSession | null>(null);
   const [currentPage, setCurrentPage] = useState(0);
-  const [topic, setTopic] = useState("lightning");
+  const [topic, setTopic] = useState("");
   const [lesson, setLesson] = useState<PrimerLesson>(initialLesson);
   const [remoteMemories, setRemoteMemories] = useState<StudentMemory[] | null>(
     null,
@@ -321,7 +256,7 @@ export function PrimerBook() {
   const [hasGeneratedInfographic, setHasGeneratedInfographic] = useState(false);
   const [hasPassedStagegate, setHasPassedStagegate] = useState(false);
   const [lessonStatus, setLessonStatus] = useState(
-    "Choose a topic and ask the Primer.",
+    "The Primer will choose a starting point from the student profile.",
   );
   const [infographicStatus, setInfographicStatus] = useState(
     "No generated infographic yet.",
@@ -329,16 +264,13 @@ export function PrimerBook() {
   const [infographicArtifact, setInfographicArtifact] =
     useState<InfographicArtifact | null>(null);
   const [stagegateResult, setStagegateResult] =
-    useState<StagegateResult>(seededStagegateResult);
-  const [answer, setAnswer] = useState(
-    "I think the important idea is that a hidden cause builds up, then something visible happens when it crosses a limit.",
-  );
+    useState<StagegateResult>(emptyStagegateResult);
+  const [answer, setAnswer] = useState("");
   const [isNarrating, setIsNarrating] = useState(false);
   const [isNarrationLoading, setIsNarrationLoading] = useState(false);
   const [narrationStatus, setNarrationStatus] = useState(
     "OpenAI narration is ready.",
   );
-  const learnerName = authenticatedStudent?.displayName ?? student.displayName;
 
   useEffect(() => {
     let cancelled = false;
@@ -369,6 +301,70 @@ export function PrimerBook() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    const learner = authenticatedStudent;
+    if (!learner) {
+      return;
+    }
+
+    if (bootstrappedStudentIdRef.current === learner.studentId) {
+      return;
+    }
+
+    bootstrappedStudentIdRef.current = learner.studentId;
+    const controller = new AbortController();
+    let cancelled = false;
+
+    setHasAsked(true);
+    setHasGeneratedInfographic(false);
+    setHasPassedStagegate(false);
+    setInfographicArtifact(null);
+    setStagegateResult(emptyStagegateResult);
+    setAnswer("");
+    setLessonStatus("Asking OpenAI Responses to choose the opening path...");
+
+    void requestLessonStart(learner, session, undefined, controller.signal)
+      .then((payload) => {
+        if (cancelled) {
+          return;
+        }
+
+        setRemoteMemories(normalizeMemories(payload.student?.memories));
+        if (payload.error || !payload.lesson) {
+          setLessonStatus(
+            payload.error ?? "The Primer could not generate an opening lesson yet.",
+          );
+          return;
+        }
+
+        const normalizedLesson = normalizeLesson(
+          payload.lesson,
+          firstTopicHint(learner),
+        );
+        setLesson(normalizedLesson);
+        setTopic(normalizedLesson.topic);
+        setLessonStatus(
+          normalizedLesson.aiMode === "openai_responses"
+            ? "Opening path generated by OpenAI Responses."
+            : "Opening path generated from the student profile.",
+        );
+      })
+      .catch((error) => {
+        if (!cancelled && error instanceof DOMException && error.name === "AbortError") {
+          return;
+        }
+
+        if (!cancelled) {
+          setLessonStatus(`Could not reach backend: ${String(error)}`);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [authenticatedStudent, session]);
 
   useEffect(() => {
     return () => {
@@ -437,40 +433,11 @@ export function PrimerBook() {
   }
 
   const visibleMemories = useMemo<StudentMemory[]>(() => {
-    const baseMemories = remoteMemories ?? memories;
-    return hasPassedStagegate
-      ? [
-          ...baseMemories,
-          {
-            ...unlockedMemory,
-            content: `${learnerName} made progress on ${lesson.topic} at the ${lesson.stageLevel} level.`,
-          },
-        ]
-      : baseMemories;
-  }, [
-    hasPassedStagegate,
-    learnerName,
-    lesson.stageLevel,
-    lesson.topic,
-    remoteMemories,
-  ]);
+    return remoteMemories ?? [];
+  }, [remoteMemories]);
 
   const visibleStages = useMemo<Stage[]>(() => {
-    if (!hasPassedStagegate) {
-      return stages;
-    }
-
-    return stages.map((stage) => {
-      if (stage.level === "intuition") {
-        return { ...stage, status: "passed" };
-      }
-
-      if (stage.level === "mechanism") {
-        return { ...stage, status: "available" };
-      }
-
-      return stage;
-    });
+    return stagesForStagegate(hasPassedStagegate);
   }, [hasPassedStagegate]);
 
   const pageCount = 10;
@@ -598,9 +565,6 @@ export function PrimerBook() {
     }
 
     const cleanTopic = nextTopic.trim();
-    if (!cleanTopic) {
-      return;
-    }
 
     stopNarration("OpenAI narration is ready.");
     setTopic(cleanTopic);
@@ -611,16 +575,11 @@ export function PrimerBook() {
     setHasPassedStagegate(false);
 
     try {
-      const response = await fetch(`${apiBaseUrl}/api/lesson/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders(session) },
-        body: JSON.stringify({
-          studentId: authenticatedStudent.studentId,
-          topic: cleanTopic,
-          question: `I want to explore ${cleanTopic}. Guide me at my current level.`,
-        }),
-      });
-      const payload = await response.json();
+      const payload = await requestLessonStart(
+        authenticatedStudent,
+        session,
+        cleanTopic || undefined,
+      );
       if (payload.error || !payload.lesson) {
         setRemoteMemories(normalizeMemories(payload.student?.memories));
         setLessonStatus(
@@ -632,10 +591,15 @@ export function PrimerBook() {
         return;
       }
 
-      setLesson(normalizeLesson(payload.lesson, cleanTopic));
+      const normalizedLesson = normalizeLesson(
+        payload.lesson,
+        cleanTopic || firstTopicHint(authenticatedStudent),
+      );
+      setLesson(normalizedLesson);
+      setTopic(normalizedLesson.topic);
       setRemoteMemories(normalizeMemories(payload.student?.memories));
       setLessonStatus(
-        payload.lesson?.aiMode === "openai_responses"
+        normalizedLesson.aiMode === "openai_responses"
           ? "Guided by OpenAI Responses."
           : "Guided by the Primer.",
       );
@@ -702,7 +666,7 @@ export function PrimerBook() {
         setRemoteMemories(normalizeMemories(payload.student?.memories));
         setHasPassedStagegate(false);
         setStagegateResult({
-          ...seededStagegateResult,
+          ...emptyStagegateResult,
           passed: false,
           score: 0,
           rubric: {
@@ -732,7 +696,7 @@ export function PrimerBook() {
     } catch (error) {
       setHasPassedStagegate(false);
       setStagegateResult({
-        ...seededStagegateResult,
+        ...emptyStagegateResult,
         passed: false,
         score: 0,
         rubric: {
@@ -775,6 +739,7 @@ export function PrimerBook() {
   function handleLogout() {
     clearStoredAuth();
     stopNarration("OpenAI narration is ready.");
+    bootstrappedStudentIdRef.current = null;
     setAuthenticatedStudent(null);
     setSession(null);
     setRemoteMemories(null);
@@ -783,13 +748,15 @@ export function PrimerBook() {
     setMemoryGraphStatus("Memory graph not loaded.");
     setSelectedMemoryNodeId(null);
     setCurrentPage(0);
-    setTopic("lightning");
+    setTopic("");
     setLesson(initialLesson);
     setHasAsked(false);
     setHasGeneratedInfographic(false);
     setHasPassedStagegate(false);
     setInfographicArtifact(null);
-    setLessonStatus("Choose a topic and ask the Primer.");
+    setStagegateResult(emptyStagegateResult);
+    setAnswer("");
+    setLessonStatus("The Primer will choose a starting point from the student profile.");
     setInfographicStatus("No generated infographic yet.");
   }
 
@@ -798,7 +765,7 @@ export function PrimerBook() {
       <main className="flex min-h-screen items-center justify-center bg-[#111515] text-stone-100">
         <div className="inline-flex items-center gap-2 text-sm uppercase text-cyan-50/70">
           <BookOpen className="h-4 w-4" />
-          Opening PrimerLab
+          Opening Primer
         </div>
       </main>
     );
@@ -865,13 +832,13 @@ export function PrimerBook() {
             useMouseEvents
             swipeDistance={28}
             showPageCorners
-            disableFlipByClick={false}
+            disableFlipByClick
             onFlip={(event: PageFlipEvent<number>) =>
               setCurrentPage(Number(event.data))
             }
           >
                 <BookPage density="hard" tone="cover">
-                  <CoverPage learner={learner} />
+                  <CoverPage learner={learner} lesson={lesson} />
                 </BookPage>
 
                 <BookPage pageNumber={1}>
@@ -902,7 +869,6 @@ export function PrimerBook() {
                   <InfographicPage
                     artifact={infographicArtifact}
                     infographicStatus={infographicStatus}
-                    infographic={lightningInfographic}
                     lesson={lesson}
                     hasGeneratedInfographic={hasGeneratedInfographic}
                     onGenerate={() => void generateInfographic()}
@@ -978,7 +944,13 @@ export function PrimerBook() {
   );
 }
 
-function CoverPage({ learner }: { learner: AuthenticatedStudent }) {
+function CoverPage({
+  learner,
+  lesson,
+}: {
+  learner: AuthenticatedStudent;
+  lesson: PrimerLesson;
+}) {
   return (
     <div className="flex h-full flex-col justify-between text-stone-50">
       <div>
@@ -987,11 +959,11 @@ function CoverPage({ learner }: { learner: AuthenticatedStudent }) {
           Adaptive story tutor
         </div>
         <h2 className="mt-8 max-w-[12ch] text-5xl font-semibold leading-[1.02] sm:text-6xl">
-          The Clockwork Reef
+          Primer
         </h2>
         <p className="mt-5 max-w-xs text-base leading-7 text-cyan-50/78">
-          A living lesson book for {learner.displayName}, where interests steer
-          examples, gates, and the next thing to explore.
+          A living lesson book for {learner.displayName}, opening on{" "}
+          {lesson.topic}.
         </p>
       </div>
 
@@ -1019,7 +991,7 @@ function WelcomePage({
   const interestText =
     learner.interests.length > 0
       ? learner.interests.join(", ")
-      : "visual puzzles, ocean analogies, and sketchable explanations";
+      : "the profile details from signup";
 
   return (
     <div className="flex h-full flex-col">
@@ -1028,7 +1000,7 @@ function WelcomePage({
         Welcome back, {learner.displayName}.
       </h2>
       <p className="mt-4 text-lg leading-8 text-stone-700">
-        The Reef remembers what you care about: {interestText}.
+        The Primer remembers what you care about: {interestText}.
       </p>
 
       <div className="mt-7 space-y-3">
@@ -1061,9 +1033,9 @@ function WelcomePage({
 function StageMapPage({ stages: currentStages }: { stages: Stage[] }) {
   return (
     <div className="flex h-full flex-col">
-      <Kicker icon={MapIcon}>Storm Gate map</Kicker>
+      <Kicker icon={MapIcon}>Stage map</Kicker>
       <h2 className="mt-4 text-3xl font-semibold text-stone-950">
-        Three levels guard the chamber.
+        Three levels guide this path.
       </h2>
       <div className="mt-7 space-y-4">
         {currentStages.map((stage, index) => (
@@ -1106,8 +1078,8 @@ function StageMapPage({ stages: currentStages }: { stages: Stage[] }) {
       </div>
 
       <div className="mt-auto rounded-[8px] border border-[#d8b86a]/50 bg-[#fff8df] p-4 text-[#514010]">
-        Passing Level 1 unlocks the Mechanism Chamber without changing the
-        story world.
+        Passing Level 1 unlocks the mechanism view without losing the story
+        thread.
       </div>
     </div>
   );
@@ -1138,21 +1110,24 @@ function AskPage({
       </h2>
       <div className="mt-6 rounded-[8px] border border-stone-300 bg-white/62 p-4">
         <label
+          {...pageFlipInteractiveHandlers}
           htmlFor="topic"
           className="text-xs uppercase text-stone-500"
         >
           Student topic
         </label>
         <input
+          {...pageFlipInteractiveHandlers}
           id="topic"
           value={topic}
           onChange={(event) => onTopicChange(event.target.value)}
           className="mt-3 h-12 w-full rounded-[8px] border border-stone-300 bg-white px-4 text-base font-semibold text-stone-900 outline-none focus:border-[#1e6f73] focus:ring-2 focus:ring-[#1e6f73]/20"
-          placeholder="Try lightning, coral reefs, fractions..."
+          placeholder="Leave blank for a profile-based starting point"
         />
       </div>
       <div className="mt-5 grid gap-3">
         <button
+          {...pageFlipInteractiveHandlers}
           type="button"
           onClick={onAsk}
           className="inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#1e6f73] px-5 text-sm font-semibold text-white transition hover:bg-[#195e61]"
@@ -1169,6 +1144,7 @@ function AskPage({
         <div className="mt-3 flex flex-wrap gap-2">
           {suggestedTopics.map((suggestedTopic) => (
             <button
+              {...pageFlipInteractiveHandlers}
               key={suggestedTopic}
               type="button"
               onClick={() => onChooseTopic(suggestedTopic)}
@@ -1215,14 +1191,12 @@ function StoryPage({ lesson }: { lesson: PrimerLesson }) {
 function InfographicPage({
   artifact,
   infographicStatus,
-  infographic,
   lesson,
   hasGeneratedInfographic,
   onGenerate,
 }: {
   artifact: InfographicArtifact | null;
   infographicStatus: string;
-  infographic: InfographicSpec;
   lesson: PrimerLesson;
   hasGeneratedInfographic: boolean;
   onGenerate: () => void;
@@ -1234,6 +1208,7 @@ function InfographicPage({
       <div className="flex items-start justify-between gap-3">
         <Kicker icon={Sparkles}>AI infographic tool</Kicker>
         <button
+          {...pageFlipInteractiveHandlers}
           type="button"
           onClick={onGenerate}
           className="rounded-full bg-[#d8b86a] px-3 py-1.5 text-xs font-semibold text-[#1c211d]"
@@ -1265,12 +1240,12 @@ function InfographicPage({
             </p>
           </div>
           <div className="mt-4 grid grid-cols-2 gap-3">
-            {infographic.panels.slice(0, 4).map((panel, index) => {
-              const Icon = iconMap[panel.icon];
+            {lesson.keyTerms.slice(0, 4).map((term, index) => {
+              const Icon = termIcons[index % termIcons.length];
 
               return (
                 <div
-                  key={panel.heading}
+                  key={term.term}
                   className="min-h-[112px] rounded-[8px] border border-stone-300 bg-white/70 p-3"
                 >
                   <div className="flex items-center justify-between">
@@ -1282,7 +1257,10 @@ function InfographicPage({
                     </span>
                   </div>
                   <p className="mt-2 text-sm font-semibold leading-5 text-stone-950">
-                    {panel.heading}
+                    {term.term}
+                  </p>
+                  <p className="mt-1 line-clamp-2 text-xs leading-5 text-stone-600">
+                    {term.definition}
                   </p>
                 </div>
               );
@@ -1317,6 +1295,7 @@ function VoiceoverPage({
         {lesson.plainExplanation}
       </p>
       <button
+        {...pageFlipInteractiveHandlers}
         type="button"
         onClick={onPlayNarration}
         disabled={isNarrationLoading}
@@ -1425,11 +1404,13 @@ function StagegatePage({
         {lesson.stagegatePrompt}
       </p>
       <textarea
+        {...pageFlipInteractiveHandlers}
         value={answer}
         onChange={(event) => onAnswerChange(event.target.value)}
         className="mt-5 min-h-[150px] resize-none rounded-[8px] border border-stone-300 bg-white/70 p-4 text-sm leading-6 text-stone-800 outline-none focus:border-[#1e6f73] focus:ring-2 focus:ring-[#1e6f73]/20"
       />
       <button
+        {...pageFlipInteractiveHandlers}
         type="button"
         onClick={onSubmit}
         className="mt-5 inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[#d8b86a] px-5 text-sm font-semibold text-[#1c211d] transition hover:bg-[#e5c879]"
@@ -1466,12 +1447,12 @@ function UnlockPage({
         Unlock result
       </Kicker>
       <h2 className="mt-5 text-4xl font-semibold leading-tight">
-        {hasPassed ? "The Storm Gate opens." : "The Storm Gate is waiting."}
+        {hasPassed ? "The next level opens." : "The next level is waiting."}
       </h2>
       <p className="mt-4 text-base leading-7 text-cyan-50/78">
         {hasPassed
           ? result.feedbackToStudent
-          : "Submit the stagegate page to unlock the next chamber and add a new visible memory."}
+          : "Submit the stagegate page to unlock the next level and add a new visible memory."}
       </p>
 
       <div className="mt-6 space-y-3">
@@ -1484,7 +1465,8 @@ function UnlockPage({
         <p className="text-xs uppercase text-cyan-100/75">New memory</p>
         <p className="mt-2 text-sm leading-6">
           {hasPassed
-            ? unlockedMemory.content
+            ? (result.newMemories?.[0]?.content ??
+              "Primer recorded this learning step in memory.")
             : "No new mastery memory has been added yet."}
         </p>
       </div>
@@ -1492,7 +1474,7 @@ function UnlockPage({
       <div className="mt-auto rounded-[8px] bg-[#d8b86a] p-4 text-[#1c211d]">
         <p className="text-xs uppercase">Unlocked</p>
         <p className="mt-1 text-lg font-semibold">
-          {hasPassed ? "Level 2: The Mechanism Chamber" : "Pass Level 1 first"}
+          {hasPassed ? "Level 2: Mechanism" : "Pass Level 1 first"}
         </p>
       </div>
     </div>
@@ -1654,41 +1636,6 @@ function RubricBar({ label, value }: { label: string; value: number }) {
   );
 }
 
-function mergeMemoryGraph(
-  currentGraph: StudentMemoryGraph | null,
-  nextGraph: StudentMemoryGraph,
-): StudentMemoryGraph {
-  if (!currentGraph) {
-    return nextGraph;
-  }
-
-  const nodes = new Map(
-    currentGraph.nodes.map((node) => [node.id, node] as const),
-  );
-  const edges = new Map(
-    currentGraph.edges.map((edge) => [edge.id, edge] as const),
-  );
-  for (const node of nextGraph.nodes) {
-    const existing = nodes.get(node.id);
-    nodes.set(node.id, {
-      ...existing,
-      ...node,
-      expanded: Boolean(existing?.expanded || node.expanded),
-      factCount: Math.max(existing?.factCount ?? 0, node.factCount),
-    });
-  }
-  for (const edge of nextGraph.edges) {
-    edges.set(edge.id, edge);
-  }
-
-  return {
-    ...nextGraph,
-    rootNodeId: currentGraph.rootNodeId,
-    nodes: [...nodes.values()],
-    edges: [...edges.values()],
-  };
-}
-
 function toMemoryFlowNodes(
   graph: StudentMemoryGraph,
   selectedNodeId: string | null,
@@ -1793,261 +1740,4 @@ function preserveDraggedPositions(
     ...node,
     position: positions.get(node.id) ?? node.position,
   }));
-}
-
-function normalizeMemoryGraph(value: unknown): StudentMemoryGraph | null {
-  const record = asRecord(value);
-  if (!record) {
-    return null;
-  }
-
-  const nodes = Array.isArray(record.nodes)
-    ? record.nodes
-        .map(normalizeMemoryGraphNode)
-        .filter((node): node is MemoryGraphNodeRecord => node !== null)
-    : [];
-  const edges = Array.isArray(record.edges)
-    ? record.edges
-        .map(normalizeMemoryGraphEdge)
-        .filter((edge): edge is MemoryGraphEdgeRecord => edge !== null)
-    : [];
-  const studentId = stringField(record, "studentId");
-  const rootNodeId = stringField(record, "rootNodeId");
-  const selectedNodeId = stringField(record, "selectedNodeId") ?? rootNodeId;
-  if (!studentId || !rootNodeId || !selectedNodeId) {
-    return null;
-  }
-
-  return {
-    studentId,
-    rootNodeId,
-    selectedNodeId,
-    nodes,
-    edges,
-    validAsOf: stringField(record, "validAsOf") ?? "",
-    knownAsOf: stringField(record, "knownAsOf") ?? "",
-  };
-}
-
-function normalizeMemoryGraphNode(value: unknown): MemoryGraphNodeRecord | null {
-  const record = asRecord(value);
-  const id = stringField(record, "id");
-  const label = stringField(record, "label");
-  if (!id || !label) {
-    return null;
-  }
-
-  return {
-    id,
-    nodeType: stringField(record, "nodeType") ?? "entity",
-    kind: stringField(record, "kind") ?? "memory",
-    label,
-    summary: stringField(record, "summary"),
-    expanded: booleanField(record, "expanded") ?? false,
-    factCount: numberField(record, "factCount") ?? 0,
-  };
-}
-
-function normalizeMemoryGraphEdge(value: unknown): MemoryGraphEdgeRecord | null {
-  const record = asRecord(value);
-  const id = stringField(record, "id");
-  const source = stringField(record, "source");
-  const target = stringField(record, "target");
-  if (!id || !source || !target) {
-    return null;
-  }
-
-  return {
-    id,
-    source,
-    target,
-    label: stringField(record, "label") ?? "",
-    assertionId: stringField(record, "assertionId") ?? id,
-    predicate: stringField(record, "predicate") ?? "",
-    content: stringField(record, "content") ?? "",
-    memoryType: stringField(record, "memoryType") ?? "memory",
-    confidence: numberField(record, "confidence") ?? 0,
-    observedAt: stringField(record, "observedAt") ?? "",
-    validFrom: stringField(record, "validFrom"),
-    knownFrom: stringField(record, "knownFrom"),
-  };
-}
-
-function normalizeLesson(value: unknown, fallbackTopic: string): PrimerLesson {
-  const record = asRecord(value);
-  if (!record) {
-    return { ...initialLesson, topic: fallbackTopic };
-  }
-
-  const stageLevel = stringField(record, "stageLevel");
-  const normalizedStage =
-    stageLevel === "mechanism" || stageLevel === "transfer"
-      ? stageLevel
-      : "intuition";
-
-  return {
-    topic: stringField(record, "topic") ?? fallbackTopic,
-    stageLevel: normalizedStage,
-    communicationStyle:
-      stringField(record, "communicationStyle") ??
-      initialLesson.communicationStyle,
-    storyScene: stringField(record, "storyScene") ?? initialLesson.storyScene,
-    plainExplanation:
-      stringField(record, "plainExplanation") ?? initialLesson.plainExplanation,
-    analogy: stringField(record, "analogy") ?? initialLesson.analogy,
-    checkForUnderstanding:
-      stringField(record, "checkForUnderstanding") ??
-      initialLesson.checkForUnderstanding,
-    suggestedTopics:
-      stringArrayField(record, "suggestedTopics") ??
-      initialLesson.suggestedTopics,
-    stagegatePrompt:
-      stringField(record, "stagegatePrompt") ?? initialLesson.stagegatePrompt,
-    infographicPrompt:
-      stringField(record, "infographicPrompt") ??
-      initialLesson.infographicPrompt,
-    keyTerms: keyTermsField(record, "keyTerms") ?? initialLesson.keyTerms,
-    aiMode: stringField(record, "aiMode"),
-    model: stringField(record, "model"),
-  };
-}
-
-function normalizeStagegateResult(value: unknown): StagegateResult {
-  const record = asRecord(value);
-  if (!record) {
-    return seededStagegateResult;
-  }
-
-  const fallback = asRecord(record.fallback);
-  if (fallback) {
-    return normalizeStagegateResult(fallback);
-  }
-
-  const rubric = asRecord(record.rubric);
-
-  return {
-    passed: booleanField(record, "passed") ?? false,
-    score: numberField(record, "score") ?? 0,
-    rubric: {
-      accuracy: numberField(rubric, "accuracy") ?? 0,
-      causalReasoning: numberField(rubric, "causalReasoning") ?? 0,
-      vocabulary: numberField(rubric, "vocabulary") ?? 0,
-      transfer: numberField(rubric, "transfer") ?? 0,
-    },
-    masteryEvidence: stringArrayField(record, "masteryEvidence") ?? [],
-    gaps: stringArrayField(record, "gaps") ?? [],
-    feedbackToStudent:
-      stringField(record, "feedbackToStudent") ??
-      "The Primer could not grade this answer yet.",
-    nextLevelUnlocked: nextLevelField(record, "nextLevelUnlocked"),
-  };
-}
-
-function normalizeMemories(value: unknown): StudentMemory[] | null {
-  if (!Array.isArray(value)) {
-    return null;
-  }
-
-  const normalized = value
-    .map((item, index): StudentMemory | null => {
-      const memory = asRecord(item) as BackendMemory | null;
-      const content = memory?.content;
-      if (!content) {
-        return null;
-      }
-
-      const normalizedMemory: StudentMemory = {
-        id: memory.assertionId ?? `${content}-${index}`,
-        type: memory.memory_type ?? memory.memoryType ?? "knowledge",
-        content,
-        tags: Array.isArray(memory.tags) ? memory.tags : [],
-        assertionId: memory.assertionId,
-        subject: memory.subject,
-        predicate: memory.predicate,
-        validFrom: memory.validFrom,
-        validTo: memory.validTo,
-        knownFrom: memory.knownFrom,
-        knownTo: memory.knownTo,
-        source: memory.source,
-      };
-      return normalizedMemory;
-    })
-    .filter((memory): memory is StudentMemory => memory !== null);
-
-  return normalized.length > 0 ? normalized : null;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object"
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
-function stringField(
-  record: Record<string, unknown> | null,
-  key: string,
-): string | undefined {
-  const value = record?.[key];
-  return typeof value === "string" ? value : undefined;
-}
-
-function booleanField(
-  record: Record<string, unknown> | null,
-  key: string,
-): boolean | undefined {
-  const value = record?.[key];
-  return typeof value === "boolean" ? value : undefined;
-}
-
-function numberField(
-  record: Record<string, unknown> | null,
-  key: string,
-): number | undefined {
-  const value = record?.[key];
-  return typeof value === "number" ? value : undefined;
-}
-
-function stringArrayField(
-  record: Record<string, unknown> | null,
-  key: string,
-): string[] | undefined {
-  const value = record?.[key];
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-
-  return value.filter((item): item is string => typeof item === "string");
-}
-
-function keyTermsField(
-  record: Record<string, unknown> | null,
-  key: string,
-): PrimerLesson["keyTerms"] | undefined {
-  const value = record?.[key];
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-
-  const terms = value
-    .map((item) => {
-      const term = asRecord(item);
-      const termName = stringField(term, "term");
-      const definition = stringField(term, "definition");
-      return termName && definition ? { term: termName, definition } : null;
-    })
-    .filter(
-      (term): term is PrimerLesson["keyTerms"][number] => term !== null,
-    );
-
-  return terms.length > 0 ? terms : undefined;
-}
-
-function nextLevelField(
-  record: Record<string, unknown>,
-  key: string,
-): StagegateResult["nextLevelUnlocked"] {
-  const value = record[key];
-  return value === "mechanism" || value === "transfer" || value === "complete"
-    ? value
-    : undefined;
 }

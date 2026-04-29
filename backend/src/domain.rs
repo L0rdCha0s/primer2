@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const DEFAULT_STUDENT_PUBLIC_ID: &str = "mina-demo";
+pub const DEFAULT_STUDENT_PUBLIC_ID: &str = "guest-student";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,6 +18,20 @@ pub struct StudentRecord {
     pub memories: Vec<StudentMemory>,
     pub progress: Vec<ConceptProgress>,
     pub suggested_topics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NarrativeCharacter {
+    pub character_id: String,
+    pub name: String,
+    pub role: Option<String>,
+    pub current_biography: String,
+    pub topic_affinities: Vec<String>,
+    pub consistency_notes: Vec<String>,
+    pub introduced_at: String,
+    pub last_seen_at: String,
+    pub last_seen_topic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,7 +85,7 @@ pub struct LoginRequest {
 #[serde(rename_all = "camelCase")]
 pub struct LessonStartRequest {
     pub student_id: Option<String>,
-    pub topic: String,
+    pub topic: Option<String>,
     pub question: Option<String>,
 }
 

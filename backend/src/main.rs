@@ -3,16 +3,17 @@ mod domain;
 mod entities;
 mod memory;
 mod openai;
+mod request_logging;
 mod routes;
 
 use openai::OpenAiClient;
 use poem::{EndpointExt, Server, listener::TcpListener, middleware::Cors};
 use sea_orm::DatabaseConnection;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: DatabaseConnection,
+    pub db: Arc<DatabaseConnection>,
     pub openai: OpenAiClient,
 }
 
@@ -22,22 +23,23 @@ async fn main() -> Result<(), std::io::Error> {
 
     let db = db::connect_database()
         .await
-        .expect("failed to connect to PrimerLab Postgres; run `docker compose up -d db`");
+        .expect("failed to connect to Primer Postgres; run `docker compose up -d db`");
     db::init_database(&db)
         .await
-        .expect("failed to initialize PrimerLab database schema and extensions");
-    db::seed_demo_student(&db)
-        .await
-        .expect("failed to seed demo student");
+        .expect("failed to initialize Primer database schema and extensions");
 
     let state = AppState {
-        db,
+        db: Arc::new(db),
         openai: OpenAiClient::from_env(),
     };
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:4000".to_string());
-    let app = routes::api_routes().with(Cors::new()).data(state);
+    let app = routes::api_routes()
+        .with(Cors::new())
+        .around(request_logging::log_request_to_stdout)
+        .data(state);
 
     println!("primerlab-api listening on http://{bind_addr}");
+    println!("primerlab-api request logging enabled on stdout");
     Server::new(TcpListener::bind(bind_addr)).run(app).await
 }
 
