@@ -81,6 +81,7 @@ import {
   normalizeMemoryGraph,
   normalizeMemories,
   normalizeStagegateResult,
+  openingProfileHint,
   stagesForStagegate,
   staticBookPageCount,
   visibleBookContentPages,
@@ -595,9 +596,7 @@ export function PrimerBook() {
             suggestedTopics: stored.student.suggestedTopics,
           }));
         }
-        if (stored.student.interests.length > 0) {
-          setTopic(stored.student.interests[0]);
-        }
+        setTopic("");
       }
       setAuthChecked(true);
     });
@@ -644,14 +643,20 @@ export function PrimerBook() {
           return null;
         }
 
-        const restoredStudent =
-          syncAuthenticatedStudentSnapshot(savedPayload.student) ?? learner;
+        const savedStudent = normalizeAuthenticatedStudent(savedPayload.student);
+        if (savedStudent) {
+          // Keep the refreshed DB profile without aborting the bootstrap lesson request.
+          storeAuth({ student: savedStudent, session });
+          setRemoteMemories(normalizeMemories(savedStudent.memories));
+        }
+        const restoredStudent = savedStudent ?? learner;
 
         if (
           hydratePersistedBook(savedPayload.book, restoredStudent, {
             turnToEnd: true,
           })
         ) {
+          syncAuthenticatedStudentSnapshot(savedPayload.student);
           setLessonStatus("Restored the saved Primer book from the database.");
           return null;
         }
@@ -918,10 +923,7 @@ export function PrimerBook() {
       }>;
     }>(
       (current, page, index) => {
-        const lessonCount =
-          page.kind === "lesson"
-            ? current.lessonCount + 1
-            : current.lessonCount;
+        const lessonCount = current.lessonCount + 1;
 
         return {
           lessonCount,
@@ -1671,7 +1673,7 @@ export function PrimerBook() {
       setMemoryGraphStatus("Memory graph not loaded.");
       setSelectedMemoryNodeId(null);
       setCurrentPage(0);
-      setTopic(resetStudent.interests[0] ?? "");
+      setTopic("");
       setLesson(initialLesson);
       setBookLessons([]);
       setReportCard(null);
@@ -1768,9 +1770,7 @@ export function PrimerBook() {
         suggestedTopics: studentProfile.suggestedTopics,
       }));
     }
-    if (studentProfile.interests.length > 0) {
-      setTopic(studentProfile.interests[0]);
-    }
+    setTopic("");
   }
 
   function handleLogout() {
@@ -1833,6 +1833,11 @@ export function PrimerBook() {
   }
 
   const learner = authenticatedStudent;
+  const lessonGenerationTopicHint = lessonStatus
+    .toLowerCase()
+    .includes("opening path")
+    ? openingProfileHint(learner)
+    : topic || lesson.topic || firstTopicHint(learner);
 
   return (
     <main className="relative min-h-[100svh] overflow-hidden bg-[#111515] text-stone-100">
@@ -1901,7 +1906,7 @@ export function PrimerBook() {
             <LessonGenerationOverlay
               learnerName={learner.displayName}
               status={lessonStatus}
-              topicHint={topic || lesson.topic || firstTopicHint(learner)}
+              topicHint={lessonGenerationTopicHint}
             />
           ) : null}
           <HTMLFlipBook
@@ -2086,8 +2091,6 @@ export function PrimerBook() {
                         page={page}
                         fallbackTopic={firstTopicHint(learner)}
                         lessonOrdinal={lessonOrdinal}
-                        onImageLoad={() => scheduleBookLayoutRefresh(pageIndex)}
-                        onOpenInfographic={openInfographicImage}
                       />
                     </BookPage>
                   ),
@@ -2926,31 +2929,16 @@ function PersistedBookPage({
   page,
   fallbackTopic,
   lessonOrdinal,
-  onImageLoad,
-  onOpenInfographic,
 }: {
   page: StudentBookContentPage;
   fallbackTopic: string;
   lessonOrdinal: number;
-  onImageLoad: () => void;
-  onOpenInfographic: (image: EnlargedInfographic) => void;
 }) {
-  if (page.kind === "lesson") {
-    return (
-      <LessonHistoryPage
-        page={page}
-        fallbackTopic={fallbackTopic}
-        lessonOrdinal={lessonOrdinal}
-      />
-    );
-  }
-
   return (
-    <InfographicHistoryPage
-      artifact={artifactFromBookPage(page)}
+    <LessonHistoryPage
       page={page}
-      onImageLoad={onImageLoad}
-      onOpenInfographic={onOpenInfographic}
+      fallbackTopic={fallbackTopic}
+      lessonOrdinal={lessonOrdinal}
     />
   );
 }
@@ -3017,66 +3005,12 @@ function LessonHistoryPage({
   );
 }
 
-function InfographicHistoryPage({
-  artifact,
-  page,
-  onImageLoad,
-  onOpenInfographic,
-}: {
-  artifact: InfographicArtifact | null;
-  page: StudentBookContentPage;
-  onImageLoad: () => void;
-  onOpenInfographic: (image: EnlargedInfographic) => void;
-}) {
-  const imageSrc = artifactImageSrc(artifact);
-  const topic = page.topic ?? "saved lesson";
-
-  return (
-    <div className="flex h-full flex-col overflow-hidden">
-      <Kicker icon={Sparkles}>Saved infographic</Kicker>
-      <h2 className="mt-3 text-3xl font-semibold leading-tight text-stone-950">
-        {topic}
-      </h2>
-      <p className="mt-2 text-xs uppercase text-stone-500">
-        Saved {savedEntryLabel(page.createdAt)}
-      </p>
-      <p className="mt-4 text-sm leading-6 text-stone-600">
-        {artifact?.generated
-          ? `Generated with ${artifact.model ?? "gpt-image-2"}.`
-          : (artifact?.message ?? "The saved infographic used the fallback path.")}
-      </p>
-      {imageSrc ? (
-        <InfographicImageButton
-          alt={`Saved infographic for ${topic}`}
-          className="mt-4 block aspect-square w-full overflow-hidden rounded-[8px] border border-stone-300 bg-white"
-          imageClassName="h-full w-full object-cover"
-          onImageLoad={onImageLoad}
-          onOpen={onOpenInfographic}
-          src={imageSrc}
-          title={`${topic} infographic`}
-        />
-      ) : (
-        <div className="mt-4 flex aspect-square w-full items-center justify-center rounded-[8px] border border-stone-300 bg-white/55 text-[#1e6f73]">
-          <Sparkles className="h-10 w-10" />
-        </div>
-      )}
-    </div>
-  );
-}
-
 function lessonFromBookPage(
   page: StudentBookContentPage,
   fallbackTopic: string,
 ) {
   const payloadLesson = recordValue(page.payload)?.lesson ?? page.payload;
   return normalizeLesson(payloadLesson, page.topic ?? fallbackTopic);
-}
-
-function artifactFromBookPage(
-  page: StudentBookContentPage,
-): InfographicArtifact | null {
-  const payloadArtifact = recordValue(page.payload)?.artifact ?? page.payload;
-  return recordValue(payloadArtifact) as InfographicArtifact | null;
 }
 
 function savedEntryLabel(value: string) {

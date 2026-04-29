@@ -15,6 +15,7 @@ import {
   normalizeMemories,
   normalizeMemoryGraph,
   normalizeStagegateResult,
+  openingProfileHint,
   stagesForStagegate,
   staticBookPageCount,
   visibleBookContentPages,
@@ -46,6 +47,20 @@ describe("lesson start flow", () => {
   test("uses the first learner interest as the opening fallback topic hint", () => {
     expect(firstTopicHint(learner)).toBe("marine biology");
     expect(firstTopicHint({ interests: [] })).toBe("personalized starting point");
+  });
+
+  test("summarizes profile interests for the opening generation hint", () => {
+    expect(openingProfileHint(learner)).toBe(
+      "Profile interests: marine biology and drawing",
+    );
+    expect(
+      openingProfileHint({
+        interests: ["basketball", "maths", "entrepreneurship"],
+      }),
+    ).toBe("Profile interests: basketball, maths, and entrepreneurship");
+    expect(openingProfileHint({ interests: [] })).toBe(
+      "Profile-guided starting point",
+    );
   });
 });
 
@@ -266,7 +281,7 @@ describe("persisted book contract normalization", () => {
     expect(bookEndPageIndex(4)).toBe(13);
   });
 
-  test("keeps stagegate attempts out of appended content pages", () => {
+  test("keeps stagegate attempts and infographics out of appended content pages", () => {
     const pages = [
       { kind: "lesson" },
       { kind: "stagegate" },
@@ -277,10 +292,10 @@ describe("persisted book contract normalization", () => {
     expect(bookContentPageCount(pages)).toBe(1);
     expect(defaultBookPageIndex(pages)).toBe(9);
     expect(defaultBookPageIndex([{ kind: "lesson" }, { kind: "infographic" }]))
-      .toBe(11);
+      .toBe(10);
   });
 
-  test("keeps all persisted lesson and infographic pages visible in order", () => {
+  test("keeps persisted infographics out of appended history pages", () => {
     const book = normalizeBookState({
       studentId: "student-123",
       bookId: "book-1",
@@ -342,11 +357,10 @@ describe("persisted book contract normalization", () => {
       topic: page.topic,
     }))).toEqual([
       { pageId: "lesson-page-1", kind: "lesson", topic: "reef currents" },
-      { pageId: "diagram-1", kind: "infographic", topic: "reef currents" },
       { pageId: "lesson-page-2", kind: "lesson", topic: "basketball arcs" },
     ]);
-    expect(bookContentPageCount(visiblePages)).toBe(3);
-    expect(defaultBookPageIndex(visiblePages)).toBe(12);
+    expect(bookContentPageCount(visiblePages)).toBe(2);
+    expect(defaultBookPageIndex(visiblePages)).toBe(11);
   });
 
   test("normalizes persisted book lessons, pages, and latest interaction state", () => {

@@ -97,7 +97,7 @@ export type StudentBookState = {
 };
 
 export const staticBookPageCount = 10;
-export type BookContentKind = "lesson" | "infographic";
+export type BookContentKind = "lesson";
 export type StudentBookContentPage = StudentBookPage & {
   kind: BookContentKind;
 };
@@ -113,7 +113,7 @@ export function bookEndPageIndex(entryCount: number): number {
 export function isBookContentPage<T extends Pick<StudentBookPage, "kind">>(
   page: T,
 ): page is T & { kind: BookContentKind } {
-  return page.kind === "lesson" || page.kind === "infographic";
+  return page.kind === "lesson";
 }
 
 export function bookContentPageCount(
@@ -302,6 +302,33 @@ export function buildLessonStartBody(
 
 export function firstTopicHint(learner: Pick<AuthenticatedStudent, "interests">) {
   return learner.interests[0] ?? "personalized starting point";
+}
+
+function readableList(values: string[]) {
+  if (values.length <= 1) {
+    return values[0] ?? "";
+  }
+
+  if (values.length === 2) {
+    return `${values[0]} and ${values[1]}`;
+  }
+
+  return `${values.slice(0, -1).join(", ")}, and ${values[values.length - 1]}`;
+}
+
+export function openingProfileHint(
+  learner: Pick<AuthenticatedStudent, "interests">,
+) {
+  const interests = learner.interests
+    .map((interest) => interest.trim())
+    .filter(Boolean)
+    .slice(0, 3);
+
+  if (interests.length === 0) {
+    return "Profile-guided starting point";
+  }
+
+  return `Profile interests: ${readableList(interests)}`;
 }
 
 export function stagesForStagegate(hasPassedStagegate: boolean): Stage[] {
